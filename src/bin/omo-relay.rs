@@ -6,7 +6,7 @@ use omo_bridge::orca::{
 };
 use omo_bridge::web_session::cleanup_expired_retained_sessions;
 use omo_bridge::{default_scope_dir, WorkspaceMux};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, LAST_EVENT_ID};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -235,7 +235,7 @@ async fn consume_events(
         request = request.header(AUTHORIZATION, format!("Bearer {token}"));
     }
     if *last_event_id > 0 {
-        request = request.header(LAST_EVENT_ID, last_event_id.to_string());
+        request = request.header("Last-Event-ID", last_event_id.to_string());
     }
     let response = request.send().await?.error_for_status()?;
     let content_type = response
