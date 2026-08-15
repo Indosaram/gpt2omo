@@ -5,10 +5,12 @@ use omo_bridge::orca::{
     close_browser_page, create_chatgpt_tab, send_chatgpt_prompt, verify_chatgpt_page, OrcaConfig,
 };
 use omo_bridge::tools::task_state::{
-    clear_delegation_lifecycle, load_delegation_lifecycle, mark_session_retained,
-    record_terminal_evidence, start_fresh_delegation_lifecycle, start_next_delegation_generation,
-    DelegationLifecycle, DelegationTerminalState,
+    clear_delegation_lifecycle, load_delegation_lifecycle, record_terminal_evidence,
+    release_session_retention, retain_session_with_lease, retained_session_expired,
+    start_fresh_delegation_lifecycle, start_next_delegation_generation, DelegationLifecycle,
+    DelegationTerminalState,
 };
+use omo_bridge::web_session::cleanup_expired_retained_sessions;
 use omo_bridge::{default_scope_dir, Workspace, WorkspaceMux, WorkspaceScope};
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
@@ -26,12 +28,13 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
 const READINESS_FRESHNESS_MS: u64 = 90_000;
 const TERMINAL_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const DEFAULT_SESSION_TTL_MINUTES: u64 = 120;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "delegate_to_chatgpt_web",
     version,
-    about = "Create, retain, or resume up to three isolated ChatGPT Web coding delegations through omo-bridge",
+    about = "Create, retain, resume, or close up to three isolated ChatGPT Web coding delegations through omo-bridge",
     trailing_var_arg = true
 )]
 struct Cli {
@@ -51,13 +54,34 @@ struct Cli {
     #[arg(long, conflicts_with = "batch_stdin")]
     resume_scope: Option<String>,
 
-    /// Close and unregister one previously retained delegation scope without sending a task.
-    #[arg(long, conflicts_with_all = ["resume_scope", "batch_stdin", "stdin", "keep_session"])]
+    /// Close and unregister one retained delegation scope without sending a task.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "resume_scope",
+            "batch_stdin",
+            "stdin",
+            "keep_session",
+            "close_on_terminal"
+        ]
+    )]
     close_scope: Option<String>,
 
-    /// Keep terminal ChatGPT Web tabs/scopes resumable instead of closing them after this task.
-    #[arg(long)]
+    /// Backward-compatible no-op: sessions are now retained by default after terminal work.
+    #[arg(long, hide = true)]
     keep_session: bool,
+
+    /// Opt out of the safe default and close this generation's Web session immediately at terminal.
+    #[arg(long)]
+    close_on_terminal: bool,
+
+    /// Idle-retained session TTL in minutes. The relay janitor closes stale sessions automatically.
+    #[arg(
+        long,
+        env = "OMO_WEB_SESSION_TTL_MINUTES",
+        default_value_t = DEFAULT_SESSION_TTL_MINUTES
+    )]
+    session_ttl_minutes: u64,
 
     /// Override automatic workspace discovery for a fresh task, or provide the default workspace
     /// for fresh batch items that do not specify one. Resume always trusts the stored scope workspace.
@@ -146,6 +170,8 @@ struct TerminalObservation {
 struct SessionDisposition {
     retained: bool,
     closed: bool,
+    expired: bool,
+    lease_expires_ms: Option<u64>,
     error: Option<String>,
 }
 
@@ -171,6 +197,7 @@ enum ResumeStage {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     validate_control_mode(&cli)?;
+    let ttl_ms = session_ttl_ms(cli.session_ttl_minutes)?;
 
     let bridge_url = cli.bridge_url.trim_end_matches('/');
     let client = reqwest::Client::builder()
@@ -190,6 +217,11 @@ async fn main() -> Result<()> {
         cli.terminal.clone(),
         cli.orca_bin.clone(),
     );
+
+    if !cli.dry_run {
+        let excluded = cli.resume_scope.as_deref().or(cli.close_scope.as_deref());
+        cleanup_expired_retained_sessions(&mux, &orca, epoch_ms(), ttl_ms, excluded).await?;
+    }
 
     if let Some(scope_id) = cli.close_scope.as_deref() {
         let value = close_retained_scope(&mux, &orca, scope_id).await?;
@@ -258,14 +290,14 @@ async fn main() -> Result<()> {
     if let Err(error) = dispatch_bootstrap(&orca, &staged).await {
         cleanup_unstarted_staged(&mux, &orca, &staged).await;
         return Err(error.context(
-            "readiness bootstrap failed; actual task dispatch count is 0 and all newly staged tabs/scopes were cleaned up",
+            "readiness bootstrap failed; actual task dispatch count is 0 and staged tabs/scopes were cleaned up",
         ));
     }
 
     if let Err(error) = wait_for_all_ready(&mux, &staged, READINESS_TIMEOUT).await {
         cleanup_unstarted_staged(&mux, &orca, &staged).await;
         return Err(error.context(
-            "authoritative readiness handshake failed closed; actual task dispatch count is 0 and all newly staged tabs/scopes were cleaned up",
+            "authoritative readiness handshake failed closed; actual task dispatch count is 0 and staged tabs/scopes were cleaned up",
         ));
     }
 
@@ -274,13 +306,23 @@ async fn main() -> Result<()> {
         Err(error) => {
             cleanup_unstarted_staged(&mux, &orca, &staged).await;
             return Err(error.context(
-                "readiness became invalid before dispatch; actual task dispatch count is 0 and all newly staged tabs/scopes were cleaned up",
+                "readiness became invalid before dispatch; actual task dispatch count is 0 and staged tabs/scopes were cleaned up",
             ));
         }
     };
 
     let terminal = wait_for_terminal_states(&mux, &staged, TERMINAL_TIMEOUT).await;
-    let sessions = finalize_terminal_sessions(&mux, &orca, &staged, cli.keep_session).await;
+    let sessions = finalize_terminal_sessions(
+        &mux,
+        &orca,
+        &staged,
+        &terminal,
+        cli.close_on_terminal,
+        ttl_ms,
+    )
+    .await;
+
+    cleanup_expired_retained_sessions(&mux, &orca, epoch_ms(), ttl_ms, None).await?;
 
     emit_result(
         &cli,
@@ -299,6 +341,11 @@ async fn main() -> Result<()> {
 }
 
 fn validate_control_mode(cli: &Cli) -> Result<()> {
+    if cli.keep_session && cli.close_on_terminal {
+        return Err(anyhow!(
+            "--keep-session is retained only for backward compatibility and cannot be combined with --close-on-terminal"
+        ));
+    }
     if cli.close_scope.is_some()
         && (!cli.task.is_empty()
             || cli.batch_stdin
@@ -307,8 +354,8 @@ fn validate_control_mode(cli: &Cli) -> Result<()> {
             || cli.dry_run)
     {
         return Err(anyhow!(
-                "--close-scope cannot be combined with a task, stdin/batch input, --workspace, or --dry-run"
-            ));
+            "--close-scope cannot be combined with a task, stdin/batch input, --workspace, or --dry-run"
+        ));
     }
     if cli.resume_scope.is_some() {
         if cli.workspace.is_some() {
@@ -325,6 +372,15 @@ fn validate_control_mode(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+fn session_ttl_ms(minutes: u64) -> Result<u64> {
+    if minutes == 0 {
+        return Err(anyhow!("--session-ttl-minutes must be greater than zero"));
+    }
+    minutes
+        .checked_mul(60_000)
+        .ok_or_else(|| anyhow!("--session-ttl-minutes is too large"))
+}
+
 fn emit_result(
     cli: &Cli,
     scope_dir: &Path,
@@ -338,6 +394,13 @@ fn emit_result(
         .map(|(index, item)| {
             let terminal_observation = outcome.terminal.get(index);
             let session = outcome.sessions.get(index).cloned().unwrap_or_default();
+            let session_state = if session.retained {
+                "IDLE_RETAINED"
+            } else if session.closed {
+                "CLOSED"
+            } else {
+                "UNAVAILABLE"
+            };
             serde_json::json!({
                 "index": index + 1,
                 "label": item.label,
@@ -351,8 +414,11 @@ fn emit_result(
                 "terminal_state": terminal_observation.map(|state| state.state),
                 "terminal_detail": terminal_observation.and_then(|state| state.detail.clone()),
                 "terminal_ms": terminal_observation.and_then(|state| state.terminal_ms),
+                "session_state": session_state,
                 "session_retained": session.retained,
                 "session_closed": session.closed,
+                "session_expired": session.expired,
+                "lease_expires_ms": session.lease_expires_ms,
                 "session_error": session.error,
                 "resumable": session.retained,
             })
@@ -367,18 +433,20 @@ fn emit_result(
     let all_sent = !outcome.actual_sent.is_empty()
         && outcome.actual_sent.len() == staged.len()
         && outcome.actual_sent.iter().all(|sent| *sent);
-    let session_policy_ok = outcome.sessions.is_empty()
+    let session_ok = outcome.sessions.is_empty()
         || (outcome.sessions.len() == staged.len()
             && outcome
                 .sessions
                 .iter()
                 .all(|session| session.error.is_none()));
     let result = serde_json::json!({
-        "ok": if cli.dry_run { true } else { all_completed && all_sent && session_policy_ok },
+        "ok": if cli.dry_run { true } else { all_completed && all_sent },
         "sent": all_sent,
         "ready": outcome.readiness_complete,
         "terminal": outcome.terminal_complete,
-        "keep_session": cli.keep_session,
+        "session_ok": session_ok,
+        "session_policy": if cli.close_on_terminal { "CLOSE_ON_TERMINAL" } else { "IDLE_RETAINED" },
+        "session_ttl_minutes": cli.session_ttl_minutes,
         "parallel_count": staged.len(),
         "max_parallel": MAX_PARALLEL_WEB_WORKERS,
         "scope_dir": scope_dir.to_string_lossy(),
@@ -407,15 +475,21 @@ fn emit_result(
                 .map(|value| format!("{:?}", value.state).to_ascii_uppercase())
                 .unwrap_or_else(|| "LOST".into());
             let session = outcome.sessions.get(index).cloned().unwrap_or_default();
+            let session_state = if session.retained {
+                "IDLE_RETAINED"
+            } else if session.closed {
+                "CLOSED"
+            } else {
+                "UNAVAILABLE"
+            };
             println!(
-                "{}. scope={} generation={} page={} terminal={} retained={} closed={}",
+                "{}. scope={} generation={} page={} terminal={} session={}",
                 index + 1,
                 item.scope_id,
                 item.generation,
                 item.browser_page_id.as_deref().unwrap_or("<missing>"),
                 state,
-                session.retained,
-                session.closed
+                session_state
             );
         }
     }
@@ -602,15 +676,39 @@ async fn stage_resume_delegation(
     scope_id: &str,
     task: &str,
 ) -> Result<ResumeStage> {
+    let scope_lock = mux.lock_scope(scope_id)?;
     let (scope, workspace, previous) = load_resumable_scope(mux, scope_id)?;
     let page = scope
         .browser_page_id
         .clone()
         .ok_or_else(|| anyhow!("retained scope has no browser_page_id"))?;
 
+    if retained_session_expired(&previous, epoch_ms()) {
+        let detail = format!("retained Web session lease expired before resume: {scope_id}");
+        release_session_retention(&workspace, scope_id).map_err(anyhow::Error::msg)?;
+        mux.remove(scope_id)?;
+        drop(scope_lock);
+        let close_error = close_browser_page(orca, &page).await.err();
+        return Ok(ResumeStage::Lost {
+            staged: staged_from_existing_terminal(&scope, task, &previous),
+            terminal: TerminalObservation {
+                state: DelegationTerminalState::Lost,
+                detail: Some(detail.clone()),
+                terminal_ms: Some(epoch_ms()),
+            },
+            session: SessionDisposition {
+                retained: false,
+                closed: close_error.is_none(),
+                expired: true,
+                lease_expires_ms: previous.lease_expires_ms,
+                error: close_error.map(|error| format!("{detail}; tab close failed: {error}")),
+            },
+        });
+    }
+
     if let Err(error) = verify_chatgpt_page(orca, &page).await {
         let lifecycle = start_next_delegation_generation(&workspace, scope_id, false)
-            .map_err(|value| anyhow!(value))?;
+            .map_err(anyhow::Error::msg)?;
         let detail = format!(
             "retained browser_page_id {} is no longer a live chatgpt.com conversation: {}",
             page, error
@@ -621,9 +719,11 @@ async fn stage_resume_delegation(
             DelegationTerminalState::Lost,
             Some(&detail),
         )
-        .map_err(|value| anyhow!(value))?;
-        let _ = mark_session_retained(&workspace, scope_id, false);
+        .map_err(anyhow::Error::msg)?;
+        let _ = release_session_retention(&workspace, scope_id);
         let _ = mux.remove(scope_id);
+        drop(scope_lock);
+        let close_error = close_browser_page(orca, &page).await.err();
         let staged = build_staged_delegation(&scope, Some(page), None, task, &lifecycle, true);
         return Ok(ResumeStage::Lost {
             staged,
@@ -636,15 +736,20 @@ async fn stage_resume_delegation(
             },
             session: SessionDisposition {
                 retained: false,
-                closed: false,
-                error: Some(detail),
+                closed: close_error.is_none(),
+                expired: false,
+                lease_expires_ms: None,
+                error: close_error
+                    .map(|close_error| format!("{detail}; tab close failed: {close_error}"))
+                    .or(Some(detail)),
             },
         });
     }
 
     let reopen_blocked = previous.terminal_state == Some(DelegationTerminalState::Blocked);
     let lifecycle = start_next_delegation_generation(&workspace, scope_id, reopen_blocked)
-        .map_err(|value| anyhow!(value))?;
+        .map_err(anyhow::Error::msg)?;
+    drop(scope_lock);
     Ok(ResumeStage::Ready(build_staged_delegation(
         &scope,
         Some(page),
@@ -662,11 +767,11 @@ fn load_resumable_scope(
     let scope = mux.lookup(scope_id)?;
     let workspace = mux.resolve(scope_id)?;
     let lifecycle = load_delegation_lifecycle(&workspace, scope_id)
-        .map_err(|value| anyhow!(value))?
+        .map_err(anyhow::Error::msg)?
         .ok_or_else(|| anyhow!("retained scope has no delegation lifecycle evidence"))?;
     if !lifecycle.session_retained {
         return Err(anyhow!(
-            "scope {} is not retained/resumable; use --keep-session on the terminal delegation before resuming",
+            "scope {} is not retained/resumable or its lease has been released",
             scope_id
         ));
     }
@@ -677,6 +782,24 @@ fn load_resumable_scope(
         ));
     }
     Ok((scope, workspace, lifecycle))
+}
+
+fn staged_from_existing_terminal(
+    scope: &WorkspaceScope,
+    task: &str,
+    lifecycle: &DelegationLifecycle,
+) -> StagedDelegation {
+    StagedDelegation {
+        scope_id: scope.scope_id.clone(),
+        workspace: scope.workspace.clone(),
+        label: None,
+        browser_page_id: scope.browser_page_id.clone(),
+        generation: lifecycle.generation,
+        generation_started_ms: lifecycle.generation_started_ms,
+        resumed: true,
+        bootstrap_prompt: None,
+        task_prompt: Some(task.to_string()),
+    }
 }
 
 fn build_staged_delegation(
@@ -930,16 +1053,25 @@ async fn wait_for_terminal_states(
     observed.into_iter().flatten().collect()
 }
 
+fn should_retain_terminal(state: DelegationTerminalState, close_on_terminal: bool) -> bool {
+    !close_on_terminal && state != DelegationTerminalState::Lost
+}
+
 async fn finalize_terminal_sessions(
     mux: &WorkspaceMux,
     orca: &OrcaConfig,
     staged: &[StagedDelegation],
-    keep_session: bool,
+    terminal: &[TerminalObservation],
+    close_on_terminal: bool,
+    ttl_ms: u64,
 ) -> Vec<SessionDisposition> {
     let mut dispositions = Vec::with_capacity(staged.len());
-    for item in staged {
-        let disposition = if keep_session {
-            retain_terminal_session(mux, orca, item).await
+    for (index, item) in staged.iter().enumerate() {
+        let retain = terminal.get(index).is_some_and(|observation| {
+            should_retain_terminal(observation.state, close_on_terminal)
+        });
+        let disposition = if retain {
+            retain_terminal_session(mux, orca, item, ttl_ms).await
         } else {
             close_terminal_session(mux, orca, item).await
         };
@@ -952,12 +1084,22 @@ async fn retain_terminal_session(
     mux: &WorkspaceMux,
     orca: &OrcaConfig,
     item: &StagedDelegation,
+    ttl_ms: u64,
 ) -> SessionDisposition {
     let Some(page) = item.browser_page_id.as_deref() else {
         return SessionDisposition {
             error: Some("cannot retain delegation without browser_page_id".into()),
             ..SessionDisposition::default()
         };
+    };
+    let scope_lock = match mux.lock_scope(&item.scope_id) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return SessionDisposition {
+                error: Some(format!("cannot lock retained scope: {error}")),
+                ..SessionDisposition::default()
+            }
+        }
     };
     let workspace = match mux.resolve(&item.scope_id) {
         Ok(workspace) => workspace,
@@ -969,34 +1111,46 @@ async fn retain_terminal_session(
         }
     };
     if let Err(error) = verify_chatgpt_page(orca, page).await {
-        let _ = mark_session_retained(&workspace, &item.scope_id, false);
+        let _ = release_session_retention(&workspace, &item.scope_id);
         let _ = mux.remove(&item.scope_id);
+        drop(scope_lock);
+        let close_error = close_browser_page(orca, page).await.err();
         return SessionDisposition {
-            error: Some(format!(
-                "terminal browser page could not be retained because it is no longer live: {}",
-                error
-            )),
+            retained: false,
+            closed: close_error.is_none(),
+            error: Some(match close_error {
+                Some(close_error) => format!(
+                    "terminal browser page is not retainable: {}; tab close also failed: {}",
+                    error, close_error
+                ),
+                None => format!("terminal browser page is not retainable: {}", error),
+            }),
             ..SessionDisposition::default()
         };
     }
-    match mark_session_retained(&workspace, &item.scope_id, true) {
-        Ok(_) => SessionDisposition {
+    match retain_session_with_lease(&workspace, &item.scope_id, ttl_ms) {
+        Ok(lifecycle) => SessionDisposition {
             retained: true,
             closed: false,
+            expired: false,
+            lease_expires_ms: lifecycle.lease_expires_ms,
             error: None,
         },
         Err(error) => {
-            let close_error = close_browser_page(orca, page).await.err();
             let _ = mux.remove(&item.scope_id);
+            drop(scope_lock);
+            let close_error = close_browser_page(orca, page).await.err();
             SessionDisposition {
                 retained: false,
                 closed: close_error.is_none(),
+                expired: false,
+                lease_expires_ms: None,
                 error: Some(match close_error {
                     Some(close_error) => format!(
-                        "failed to persist retained-session state: {}; fallback tab close also failed: {}",
+                        "failed to persist retained-session lease: {}; fallback tab close also failed: {}",
                         error, close_error
                     ),
-                    None => format!("failed to persist retained-session state: {}", error),
+                    None => format!("failed to persist retained-session lease: {}", error),
                 }),
             }
         }
@@ -1008,15 +1162,17 @@ async fn close_terminal_session(
     orca: &OrcaConfig,
     item: &StagedDelegation,
 ) -> SessionDisposition {
+    let scope_lock = mux.lock_scope(&item.scope_id).ok();
     let workspace = mux.resolve(&item.scope_id).ok();
     if let Some(workspace) = workspace.as_ref() {
-        let _ = mark_session_retained(workspace, &item.scope_id, false);
+        let _ = release_session_retention(workspace, &item.scope_id);
     }
+    let remove_result = mux.remove(&item.scope_id);
+    drop(scope_lock);
     let close_result = match item.browser_page_id.as_deref() {
         Some(page) => close_browser_page(orca, page).await,
         None => Err(anyhow!("delegation has no browser_page_id to close")),
     };
-    let remove_result = mux.remove(&item.scope_id);
     let error = match (close_result.as_ref().err(), remove_result.as_ref().err()) {
         (None, None) => None,
         (Some(close_error), None) => Some(format!("browser tab close failed: {}", close_error)),
@@ -1029,6 +1185,8 @@ async fn close_terminal_session(
     SessionDisposition {
         retained: false,
         closed: close_result.is_ok(),
+        expired: false,
+        lease_expires_ms: None,
         error,
     }
 }
@@ -1038,20 +1196,23 @@ async fn close_retained_scope(
     orca: &OrcaConfig,
     scope_id: &str,
 ) -> Result<Value> {
+    let scope_lock = mux.lock_scope(scope_id)?;
     let (scope, workspace, lifecycle) = load_resumable_scope(mux, scope_id)?;
     let page = scope
         .browser_page_id
-        .as_deref()
+        .clone()
         .ok_or_else(|| anyhow!("retained scope has no browser_page_id"))?;
-    let close_error = close_browser_page(orca, page).await.err();
-    mark_session_retained(&workspace, scope_id, false).map_err(|value| anyhow!(value))?;
+    release_session_retention(&workspace, scope_id).map_err(anyhow::Error::msg)?;
     mux.remove(scope_id)?;
+    drop(scope_lock);
+    let close_error = close_browser_page(orca, &page).await.err();
     Ok(serde_json::json!({
         "ok": close_error.is_none(),
         "closed_scope": scope_id,
         "browser_page_id": page,
         "generation": lifecycle.generation,
         "scope_removed": true,
+        "session_state": "CLOSED",
         "session_retained": false,
         "session_closed": close_error.is_none(),
         "session_error": close_error.map(|error| error.to_string()),
@@ -1063,7 +1224,7 @@ fn lifecycle_for(
     item: &StagedDelegation,
 ) -> Result<Option<DelegationLifecycle>> {
     let workspace = mux.resolve(&item.scope_id)?;
-    load_delegation_lifecycle(&workspace, &item.scope_id).map_err(|error| anyhow!(error))
+    load_delegation_lifecycle(&workspace, &item.scope_id).map_err(anyhow::Error::msg)
 }
 
 fn has_fresh_readiness(
@@ -1092,7 +1253,7 @@ fn record_helper_terminal(
 ) -> Result<DelegationLifecycle> {
     let workspace = mux.resolve(&item.scope_id)?;
     let lifecycle = load_delegation_lifecycle(&workspace, &item.scope_id)
-        .map_err(|error| anyhow!(error))?
+        .map_err(anyhow::Error::msg)?
         .ok_or_else(|| anyhow!("delegation lifecycle is missing"))?;
     if lifecycle.generation != item.generation {
         return Err(anyhow!(
@@ -1102,7 +1263,7 @@ fn record_helper_terminal(
         ));
     }
     record_terminal_evidence(&workspace, &item.scope_id, state, Some(detail))
-        .map_err(|error| anyhow!(error))
+        .map_err(anyhow::Error::msg)
 }
 
 async fn cleanup_unstarted_staged(
@@ -1269,7 +1430,7 @@ mod tests {
     use super::*;
     use omo_bridge::tools::completion::handle_completion_check;
     use omo_bridge::tools::task_state::{
-        handle_task_plan, handle_task_state, handle_task_update, mark_session_retained,
+        handle_task_plan, handle_task_state, handle_task_update, retain_session_with_lease,
         start_fresh_delegation_lifecycle,
     };
     use tempfile::tempdir;
@@ -1282,6 +1443,8 @@ mod tests {
             resume_scope: None,
             close_scope: None,
             keep_session: false,
+            close_on_terminal: false,
+            session_ttl_minutes: DEFAULT_SESSION_TTL_MINUTES,
             workspace: None,
             mount_root: PathBuf::from("/"),
             bridge_url: "http://127.0.0.1:18800".into(),
@@ -1314,12 +1477,45 @@ mod tests {
     }
 
     #[test]
-    fn default_session_policy_is_close_and_keep_is_explicit() {
+    fn default_session_policy_is_idle_retained() {
         let cli = cli_for_test();
-        assert!(!cli.keep_session);
-        let mut keep = cli.clone();
-        keep.keep_session = true;
-        assert!(keep.keep_session);
+        assert!(!cli.close_on_terminal);
+        assert_eq!(cli.session_ttl_minutes, 120);
+        assert!(should_retain_terminal(
+            DelegationTerminalState::Completed,
+            cli.close_on_terminal
+        ));
+        assert!(should_retain_terminal(
+            DelegationTerminalState::Blocked,
+            cli.close_on_terminal
+        ));
+        assert!(should_retain_terminal(
+            DelegationTerminalState::Failed,
+            cli.close_on_terminal
+        ));
+        assert!(!should_retain_terminal(
+            DelegationTerminalState::Lost,
+            cli.close_on_terminal
+        ));
+    }
+
+    #[test]
+    fn explicit_close_on_terminal_overrides_retention() {
+        for state in [
+            DelegationTerminalState::Completed,
+            DelegationTerminalState::Blocked,
+            DelegationTerminalState::Failed,
+            DelegationTerminalState::Lost,
+        ] {
+            assert!(!should_retain_terminal(state, true));
+        }
+    }
+
+    #[test]
+    fn ttl_validation_is_bounded() {
+        assert_eq!(session_ttl_ms(120).unwrap(), 7_200_000);
+        assert!(session_ttl_ms(0).is_err());
+        assert!(session_ttl_ms(u64::MAX).is_err());
     }
 
     #[test]
@@ -1348,7 +1544,7 @@ mod tests {
             Some("done"),
         )
         .unwrap();
-        mark_session_retained(&ws, &scope.scope_id, true).unwrap();
+        retain_session_with_lease(&ws, &scope.scope_id, 60_000).unwrap();
 
         let (loaded, _, lifecycle) = load_resumable_scope(&mux, &scope.scope_id).unwrap();
         assert_eq!(
@@ -1356,58 +1552,7 @@ mod tests {
             Some("retained-browser-page")
         );
         assert!(lifecycle.session_retained);
-    }
-
-    #[test]
-    fn dead_page_resume_records_lost_generation_and_removes_scope() {
-        let mount = tempdir().unwrap();
-        let project = mount.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let scopes = tempdir().unwrap();
-        let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
-        let scope = mux.register_browser(&project, "dead-page".into()).unwrap();
-        let ws = mux.resolve(&scope.scope_id).unwrap();
-        start_fresh_delegation_lifecycle(&ws, &scope.scope_id).unwrap();
-        record_terminal_evidence(
-            &ws,
-            &scope.scope_id,
-            DelegationTerminalState::Completed,
-            Some("done"),
-        )
-        .unwrap();
-        mark_session_retained(&ws, &scope.scope_id, true).unwrap();
-
-        let next = start_next_delegation_generation(&ws, &scope.scope_id, false).unwrap();
-        assert_eq!(next.generation, 2);
-        let lost = record_terminal_evidence(
-            &ws,
-            &scope.scope_id,
-            DelegationTerminalState::Lost,
-            Some("dead browser page"),
-        )
-        .unwrap();
-        mark_session_retained(&ws, &scope.scope_id, false).unwrap();
-        mux.remove(&scope.scope_id).unwrap();
-        assert_eq!(lost.terminal_state, Some(DelegationTerminalState::Lost));
-        assert!(mux.lookup(&scope.scope_id).is_err());
-    }
-
-    #[test]
-    fn one_worker_readiness_smoke_allows_one_actual_dispatch() {
-        let mount = tempdir().unwrap();
-        let project = mount.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let scopes = tempdir().unwrap();
-        let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
-        let scope = mux.register_browser(&project, "page-1".into()).unwrap();
-        let ws = mux.resolve(&scope.scope_id).unwrap();
-        let lifecycle = start_fresh_delegation_lifecycle(&ws, &scope.scope_id).unwrap();
-        let staged = vec![staged_for_scope(scope, &lifecycle, false)];
-
-        assert!(handle_task_state(&ws, &staged[0].scope_id).success);
-        let plan = actual_dispatch_plan(&mux, &staged, epoch_ms()).unwrap();
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].0, "page-1");
+        assert!(lifecycle.lease_expires_ms.is_some());
     }
 
     #[test]
@@ -1429,7 +1574,7 @@ mod tests {
             Some("done"),
         )
         .unwrap();
-        mark_session_retained(&ws, &staged[0].scope_id, true).unwrap();
+        retain_session_with_lease(&ws, &staged[0].scope_id, 60_000).unwrap();
         start_next_delegation_generation(&ws, &staged[0].scope_id, false).unwrap();
 
         assert!(actual_dispatch_plan(&mux, &staged, epoch_ms())

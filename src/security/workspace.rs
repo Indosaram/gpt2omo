@@ -3,7 +3,7 @@ use crate::security::PathPolicy;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -81,6 +81,16 @@ pub struct WorkspaceScope {
     pub browser_page_id: Option<String>,
     pub created_ms: u64,
     pub updated_ms: u64,
+}
+
+pub struct WorkspaceScopeLock {
+    file: File,
+}
+
+impl Drop for WorkspaceScopeLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +195,32 @@ impl WorkspaceMux {
         Ok(scope)
     }
 
+    pub fn list_scopes(&self) -> Result<Vec<WorkspaceScope>> {
+        let entries = match fs::read_dir(&self.scope_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(BridgeError::Io(error)),
+        };
+
+        let mut scopes = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(scope_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(scope_id).is_err() {
+                continue;
+            }
+            scopes.push(self.lookup(scope_id)?);
+        }
+        scopes.sort_by(|left, right| left.scope_id.cmp(&right.scope_id));
+        Ok(scopes)
+    }
+
     pub fn resolve(&self, scope_id: &str) -> Result<Workspace> {
         let scope = self.lookup(scope_id)?;
         Workspace::open(scope.workspace)
@@ -198,6 +234,23 @@ impl WorkspaceMux {
         Ok(scope)
     }
 
+    pub fn lock_scope(&self, scope_id: &str) -> Result<WorkspaceScopeLock> {
+        validate_scope_id(scope_id)?;
+        let file = self.open_lock_file(scope_id)?;
+        file.lock().map_err(BridgeError::Io)?;
+        Ok(WorkspaceScopeLock { file })
+    }
+
+    pub fn try_lock_scope(&self, scope_id: &str) -> Result<Option<WorkspaceScopeLock>> {
+        validate_scope_id(scope_id)?;
+        let file = self.open_lock_file(scope_id)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(WorkspaceScopeLock { file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(BridgeError::Io(error)),
+        }
+    }
+
     pub fn remove(&self, scope_id: &str) -> Result<()> {
         validate_scope_id(scope_id)?;
         match fs::remove_file(self.scope_path(scope_id)) {
@@ -205,6 +258,18 @@ impl WorkspaceMux {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(BridgeError::Io(error)),
         }
+    }
+
+    fn open_lock_file(&self, scope_id: &str) -> Result<File> {
+        let lock_dir = self.scope_dir.join(".locks");
+        fs::create_dir_all(&lock_dir)?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_dir.join(format!("{}.lock", scope_id)))
+            .map_err(BridgeError::Io)
     }
 
     fn ensure_within_mount(&self, workspace: &Path) -> Result<()> {
@@ -319,6 +384,37 @@ mod tests {
             mux.lookup(&b.scope_id).unwrap().browser_page_id.as_deref(),
             Some("page-b")
         );
+    }
+
+    #[test]
+    fn mux_lists_only_persisted_scope_files() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let state = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), state.path()).unwrap();
+        let first = mux.register_browser(&project, "page-a".into()).unwrap();
+        let second = mux.register_browser(&project, "page-b".into()).unwrap();
+        fs::write(state.path().join("not-a-scope.txt"), "ignore").unwrap();
+
+        let scopes = mux.list_scopes().unwrap();
+        assert_eq!(scopes.len(), 2);
+        assert!(scopes.iter().any(|scope| scope.scope_id == first.scope_id));
+        assert!(scopes.iter().any(|scope| scope.scope_id == second.scope_id));
+    }
+
+    #[test]
+    fn mux_scope_lock_can_be_acquired_and_released() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let state = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), state.path()).unwrap();
+        let scope = mux.register_browser(&project, "page".into()).unwrap();
+
+        let lock = mux.lock_scope(&scope.scope_id).unwrap();
+        drop(lock);
+        assert!(mux.try_lock_scope(&scope.scope_id).unwrap().is_some());
     }
 
     #[test]

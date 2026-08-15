@@ -56,6 +56,10 @@ pub struct DelegationLifecycle {
     pub terminal_detail: Option<String>,
     #[serde(default)]
     pub session_retained: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_since_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_ms: Option<u64>,
     pub updated_ms: u64,
 }
 
@@ -417,11 +421,52 @@ pub fn start_next_delegation_generation(
     Ok(lifecycle)
 }
 
+pub fn retain_session_with_lease(
+    ws: &Workspace,
+    scope_id: &str,
+    ttl_ms: u64,
+) -> std::result::Result<DelegationLifecycle, String> {
+    if ttl_ms == 0 {
+        return Err("Retained-session TTL must be greater than zero".to_string());
+    }
+    let mut lifecycle = load_delegation_lifecycle(ws, scope_id)?
+        .ok_or_else(|| "No delegation lifecycle exists".to_string())?;
+    if lifecycle.terminal_state.is_none() {
+        return Err(
+            "Cannot retain a delegation session before the generation is terminal".to_string(),
+        );
+    }
+    let now = now_ms();
+    lifecycle.session_retained = true;
+    lifecycle.retained_since_ms = Some(now);
+    lifecycle.lease_expires_ms = Some(now.saturating_add(ttl_ms));
+    lifecycle.updated_ms = now;
+    save_lifecycle(ws, scope_id, &lifecycle)?;
+    Ok(lifecycle)
+}
+
+pub fn release_session_retention(
+    ws: &Workspace,
+    scope_id: &str,
+) -> std::result::Result<DelegationLifecycle, String> {
+    let mut lifecycle = load_delegation_lifecycle(ws, scope_id)?
+        .ok_or_else(|| "No delegation lifecycle exists".to_string())?;
+    lifecycle.session_retained = false;
+    lifecycle.retained_since_ms = None;
+    lifecycle.lease_expires_ms = None;
+    lifecycle.updated_ms = now_ms();
+    save_lifecycle(ws, scope_id, &lifecycle)?;
+    Ok(lifecycle)
+}
+
 pub fn mark_session_retained(
     ws: &Workspace,
     scope_id: &str,
     retained: bool,
 ) -> std::result::Result<DelegationLifecycle, String> {
+    if !retained {
+        return release_session_retention(ws, scope_id);
+    }
     let mut lifecycle = load_delegation_lifecycle(ws, scope_id)?
         .ok_or_else(|| "No delegation lifecycle exists".to_string())?;
     if lifecycle.terminal_state.is_none() {
@@ -429,10 +474,20 @@ pub fn mark_session_retained(
             "Cannot change retained-session state before the generation is terminal".to_string(),
         );
     }
-    lifecycle.session_retained = retained;
-    lifecycle.updated_ms = now_ms();
+    let now = now_ms();
+    lifecycle.session_retained = true;
+    lifecycle.retained_since_ms = Some(now);
+    lifecycle.lease_expires_ms = None;
+    lifecycle.updated_ms = now;
     save_lifecycle(ws, scope_id, &lifecycle)?;
     Ok(lifecycle)
+}
+
+pub fn retained_session_expired(lifecycle: &DelegationLifecycle, now_ms: u64) -> bool {
+    lifecycle.session_retained
+        && lifecycle
+            .lease_expires_ms
+            .is_some_and(|expires_ms| now_ms >= expires_ms)
 }
 
 pub fn record_terminal_evidence(
@@ -496,6 +551,8 @@ fn new_lifecycle(scope_id: &str, generation: u64) -> DelegationLifecycle {
         terminal_ms: None,
         terminal_detail: None,
         session_retained: false,
+        retained_since_ms: None,
+        lease_expires_ms: None,
         updated_ms: now,
     }
 }
@@ -646,6 +703,35 @@ mod tests {
     }
 
     #[test]
+    fn retained_session_lease_records_and_expires() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        record_terminal_evidence(
+            &ws,
+            SCOPE_A,
+            DelegationTerminalState::Completed,
+            Some("done"),
+        )
+        .unwrap();
+        let retained = retain_session_with_lease(&ws, SCOPE_A, 10_000).unwrap();
+        assert!(retained.session_retained);
+        assert!(retained.retained_since_ms.is_some());
+        let expiry = retained.lease_expires_ms.unwrap();
+        assert!(!retained_session_expired(
+            &retained,
+            expiry.saturating_sub(1)
+        ));
+        assert!(retained_session_expired(&retained, expiry));
+
+        let released = release_session_retention(&ws, SCOPE_A).unwrap();
+        assert!(!released.session_retained);
+        assert!(released.retained_since_ms.is_none());
+        assert!(released.lease_expires_ms.is_none());
+    }
+
+    #[test]
     fn retained_terminal_session_starts_next_generation() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
@@ -658,13 +744,14 @@ mod tests {
             Some("done"),
         )
         .unwrap();
-        mark_session_retained(&ws, SCOPE_A, true).unwrap();
+        retain_session_with_lease(&ws, SCOPE_A, 10_000).unwrap();
 
         let next = start_next_delegation_generation(&ws, SCOPE_A, false).unwrap();
         assert_eq!(next.generation, 2);
         assert!(next.ready_ms.is_none());
         assert!(next.terminal_state.is_none());
         assert!(!next.session_retained);
+        assert!(next.lease_expires_ms.is_none());
     }
 
     #[test]
@@ -699,7 +786,7 @@ mod tests {
         );
         handle_task_update(&ws, SCOPE_A, "T1", "blocked", Some("service unavailable"));
         handle_task_update(&ws, SCOPE_A, "T2", "done", Some("finished"));
-        mark_session_retained(&ws, SCOPE_A, true).unwrap();
+        retain_session_with_lease(&ws, SCOPE_A, 10_000).unwrap();
 
         start_next_delegation_generation(&ws, SCOPE_A, true).unwrap();
         let state = load_task_state(&ws, SCOPE_A).unwrap().unwrap();
@@ -728,7 +815,7 @@ mod tests {
             Some("done"),
         )
         .unwrap();
-        mark_session_retained(&ws, SCOPE_A, true).unwrap();
+        retain_session_with_lease(&ws, SCOPE_A, 10_000).unwrap();
         start_next_delegation_generation(&ws, SCOPE_A, false).unwrap();
 
         let new_plan = handle_task_plan(&ws, SCOPE_A, "Follow-up", vec!["Do follow-up".into()]);

@@ -195,42 +195,47 @@ fn render_coordinator_prompt(delegate_bin: &Path) -> String {
 USER TASK:
 $ARGUMENTS
 
-Do not implement, edit, test, research, or debug the user's coding task yourself. Do not call Task/background/subagent/team tools and do not dispatch Anthropic, OMO, OpenCode, Codex, or other coding agents. Your only job is to decide whether this is a fresh Web delegation, a follow-up in a retained Web session, or a retained-session close request, then invoke the helper exactly once.
+Do not implement, edit, test, research, or debug the user's coding task yourself. Do not call Task/background/subagent/team tools and do not dispatch Anthropic, OMO, OpenCode, Codex, or other coding agents. Your only job is to choose a fresh Web delegation, resume an exact retained Web session, or explicitly close a retained session, then invoke the helper.
 
 ## Fresh fan-out policy — hard maximum 3
 
 Choose exactly 1, 2, or 3 workers for a fresh delegation.
 
 - Default to **1 worker**. Use one when the task is tightly coupled, mostly sequential, touches the same core files/state, or parallelism would create coordination risk.
-- Use **2 workers** only when there are two genuinely independent implementation tracks with clear ownership boundaries.
-- Use **3 workers** only when there are three genuinely independent tracks.
-- Never create a fourth worker. The helper independently rejects manifests containing more than 3 tasks.
-- Do not split merely to increase parallelism. Each worker task must be independently actionable and contain enough original acceptance criteria to finish its assigned slice.
-- OMO owns repository/worktree selection. For fresh tasks, omit `workspace` when the current worktree is correct; otherwise use the exact OMO-selected absolute workspace path. The bridge never creates or switches worktrees.
+- Use **2 workers** only for two genuinely independent implementation tracks with clear ownership boundaries.
+- Use **3 workers** only for three genuinely independent tracks.
+- Never create a fourth worker. The helper independently hard-rejects more than 3 tasks.
+- Do not split merely to increase parallelism.
+- OMO owns repository/worktree selection. The bridge never creates or switches worktrees.
 
 ## Fresh dispatch
 
-Construct one JSON manifest with **1–3** entries:
-
-```json
-{{"label":"short-label","task":"complete worker instruction","workspace":"/optional/absolute/path"}}
-```
-
-Invoke the helper exactly once:
+Construct one JSON manifest with **1–3** entries and invoke the helper once:
 
 ```bash
 cat <<'__OMO_DELEGATE_WEB_BATCH__' | {bin} --batch-stdin --json
-{{"tasks":[...1 to 3 task objects...]}}
+{{"tasks":[{{"label":"short-label","task":"complete worker instruction","workspace":"/optional/absolute/path"}}]}}
 __OMO_DELEGATE_WEB_BATCH__
 ```
 
-By default terminal workers are closed and their scopes are unregistered. If the user explicitly wants this exact ChatGPT Web conversation available for later follow-up, add `--keep-session` to the same fresh helper invocation. Do not add it merely by default.
+**Do not pre-decide that a terminal Web conversation is disposable.** By default the helper returns terminal work immediately but leaves every safely usable terminal browser conversation in `IDLE_RETAINED` with a bounded lease (default 120 minutes). The helper result exposes `session_state`, `session_retained`, `resumable`, and `lease_expires_ms`.
+
+Use `--close-on-terminal` only when the caller already knows before dispatch that no same-conversation follow-up can be useful. Do not add it merely to save tabs; TTL garbage collection exists for that purpose.
+
+## After a terminal result
+
+Task terminal state and browser-session lifetime are separate decisions.
+
+- `COMPLETED` means that generation's assigned coding task is authoritatively complete; it does **not** mean the ChatGPT conversation must be destroyed.
+- `BLOCKED` is terminal for that generation and is especially valuable to retain because a dependency may later be resolved.
+- A safely usable `FAILED` session may also remain retained for retry/recovery.
+- `LOST` is not resumable and is cleaned up rather than retained.
+
+When `session_state` is `IDLE_RETAINED`, keep the exact `scope_id` available. If USER TASK or a later user instruction needs follow-up in that conversation, resume it. Do not close a retained session simply because you have just received a terminal result. Explicitly close it only when the user asks to close/discard it or when OMO has concrete reason that the conversation must not be reused. Otherwise allow the bounded TTL janitor to reap it automatically.
 
 ## Resume an existing retained Web conversation
 
-When the user explicitly asks to continue/follow up in a prior Web session and a prior helper result in context has `session_retained:true` / `resumable:true`, reuse that exact `scope_id`. Do not create a fresh tab, do not pass `--workspace`, and do not invent or substitute a scope id.
-
-Invoke exactly once:
+When a previous helper result has `session_retained:true` / `resumable:true`, reuse that exact `scope_id`:
 
 ```bash
 cat <<'__OMO_DELEGATE_WEB_RESUME__' | {bin} --resume-scope '<exact-scope-id>' --stdin --json
@@ -238,29 +243,33 @@ cat <<'__OMO_DELEGATE_WEB_RESUME__' | {bin} --resume-scope '<exact-scope-id>' --
 __OMO_DELEGATE_WEB_RESUME__
 ```
 
-Add `--keep-session` to the resume invocation only if the user wants the same conversation retained again after this follow-up. The helper verifies that the stored `browser_page_id` is still the exact live `https://chatgpt.com` page before incrementing the internal lifecycle generation. A missing/dead/wrong page becomes authoritative `LOST`; the helper never silently opens a replacement conversation.
+Do not create a fresh tab, do not pass `--workspace`, and do not invent/substitute a scope id. Resume consumes the current idle lease, verifies the exact stored `browser_page_id`, and starts the next internal lifecycle generation in the same ChatGPT conversation. Its terminal result is retained again automatically with a fresh lease.
 
-A previously `COMPLETED` retained session may create a new task plan for the follow-up. A previously `BLOCKED` retained session reopens only blocked items as `in_progress` while preserving blocker notes, so the same plan can continue.
+A previously `COMPLETED` session may create a new follow-up plan. A previously `BLOCKED` session reopens only blocked items as `in_progress` and preserves blocker notes/context.
 
-## Close a retained session
+If the lease expired or the exact browser page is dead/wrong, the helper fails closed for resume and never silently opens a replacement conversation.
 
-If the user asks to discard/close a previously retained Web session, invoke:
+## Explicitly close a retained session
 
 ```bash
 {bin} --close-scope '<exact-scope-id>' --json
 ```
 
-This closes the stored tab and unregisters the scope. Do not send a coding task in the same invocation.
+This is a browser-session lifecycle decision, not a task-completion signal. Do not send a coding task in the same invocation.
 
-## Authoritative lifecycle
+## Automatic TTL cleanup
 
-Fresh and resumed generations both send a bootstrap-only prompt first. Each worker must successfully call scoped MCP `task_state`; the helper trusts only lifecycle evidence for the current generation. Actual task prompts are sent only after readiness succeeds. Any stale/unready worker makes fresh fan-out fail closed with zero actual task dispatches.
+`omo-relay` runs a periodic retained-session janitor. Default lease is 120 minutes; `OMO_WEB_SESSION_TTL_MINUTES` can override it. Helper invocations also opportunistically reap expired scopes. Scope-level filesystem locks serialize resume/close/GC so a janitor cannot close a scope that is simultaneously being resumed.
 
-After actual dispatch, the helper remains foreground until every worker has a terminal state. `COMPLETED` comes only from `completion_check.ready=true`; `BLOCKED` comes from task state/update evidence; transport/control-plane failures are `FAILED` or `LOST`. Textual READY/done/blocked/failed claims are never authoritative.
+TTL is a safety net, not evidence that a task completed and not a substitute for an explicit close when the user requests one.
 
-When helper JSON has `"terminal":true`, report each delegation's `scope_id`, `browser_page_id`, `generation`, `terminal_state`, `terminal_detail`, `session_retained`, `session_closed`, and `resumable`. `"ok":false` with `"terminal":true` is still an authoritative terminal batch result, not a reason to fall back to another coding agent.
+## Authoritative task lifecycle
 
-If the helper process itself fails before returning a terminal result, report the exact failure and stop. Never fall back to OMO/Anthropic subagents."#,
+Fresh and resumed generations send a bootstrap-only prompt first. Each worker must successfully call scoped MCP `task_state`; actual task prompts are sent only after authoritative readiness. `COMPLETED` comes only from `completion_check.ready=true`; `BLOCKED`, `FAILED`, and `LOST` are terminal. Textual READY/done/blocked/failed claims are never authoritative.
+
+When helper JSON has `"terminal":true`, report each delegation's `scope_id`, `browser_page_id`, `generation`, `terminal_state`, `terminal_detail`, `session_state`, `session_retained`, `lease_expires_ms`, and `resumable`. `"ok":false` with `"terminal":true` is still an authoritative terminal result, not a reason to fall back to another coding agent.
+
+If the helper process itself fails before a terminal result, report the exact failure. Never fall back to OMO/Anthropic subagents."#,
         bin = bin,
     )
 }
@@ -269,7 +278,7 @@ fn render_skill(delegate_bin: &Path) -> String {
     format!(
         r#"---
 name: delegate-web
-description: Use when delegating coding work to ChatGPT Web, retaining a completed Web conversation for follow-up, resuming an exact retained scope, or closing a retained Web session. Never uses OMO/Anthropic subagents and preserves OMO ownership of repo/worktree selection.
+description: Use when delegating coding work to ChatGPT Web, retaining terminal Web conversations for possible follow-up, resuming an exact retained scope, or explicitly closing one. Never uses OMO/Anthropic subagents and preserves OMO ownership of repo/worktree selection.
 compatibility: Requires omo-bridge, omo-relay, Orca browser access, and delegate_to_chatgpt_web.
 metadata:
   opencode/slash: "false"
@@ -277,21 +286,25 @@ metadata:
 
 # Delegate Web
 
-`/delegate-web` is a transport/orchestration surface, not a local coding workflow.
+`/delegate-web` separates **task terminal state** from **browser-session lifetime**.
 
 - Fresh work supports **1–3 parallel ChatGPT Web workers**; four or more are hard-rejected.
-- Fresh terminal sessions close by default. Use `{bin} --batch-stdin --json --keep-session` only when the user wants those exact conversations resumable later.
-- A retained helper result exposes `scope_id`, `browser_page_id`, `generation`, `session_retained:true`, and `resumable:true`.
+- Terminal Web sessions are **IDLE_RETAINED by default**, not closed. Default lease is 120 minutes.
+- `COMPLETED`, `BLOCKED`, and safely usable `FAILED` sessions can remain resumable; `LOST` is cleaned up.
+- Use `{bin} --close-on-terminal ...` only when the caller knows in advance that no same-conversation follow-up can be useful.
+- A retained result exposes `scope_id`, exact `browser_page_id`, `generation`, `session_state:IDLE_RETAINED`, `session_retained:true`, `lease_expires_ms`, and `resumable:true`.
 - Resume exactly one retained session with `{bin} --resume-scope '<scope-id>' --stdin --json`; never pass `--workspace` and never open a replacement tab.
-- Add `--keep-session` to a resume only when the user wants it retained again after the follow-up; otherwise the resumed session closes at its new terminal state.
-- Close a retained session explicitly with `{bin} --close-scope '<scope-id>' --json`.
-- Before resume, the helper verifies the stored `browser_page_id` is still a live `https://chatgpt.com` page. Dead/missing/wrong pages become `LOST` and are not silently replaced.
-- Resume increments an internal lifecycle generation. A prior `COMPLETED` plan may be replaced by a new follow-up plan; prior `BLOCKED` items are reopened as `in_progress` with notes preserved.
-- Fresh and resumed generations use bootstrap-only readiness and accept readiness only from successful scoped MCP `task_state` evidence for the current generation.
-- Authoritative `COMPLETED` requires `completion_check.ready=true`; `BLOCKED`, `FAILED`, and `LOST` are terminal too. Never trust textual lifecycle claims.
-- `omo-relay` keeps continuation routing bound to the exact stored `browser_page_id`; Orca generation/idle gating remains in the send path.
+- Resume verifies the exact stored ChatGPT page, consumes the prior idle lease, increments generation, and automatically obtains a fresh lease when that generation becomes terminal.
+- A prior `COMPLETED` plan may be replaced by a new follow-up plan; prior `BLOCKED` items are reopened as `in_progress` with notes preserved.
+- Explicitly close a retained session with `{bin} --close-scope '<scope-id>' --json` only when the session lifecycle should truly end.
+- Do not automatically close merely because a worker returned terminal. If reuse is uncertain, leave it retained; `omo-relay` periodically reaps expired leases.
+- `OMO_WEB_SESSION_TTL_MINUTES` controls the default TTL; helper invocations also opportunistically clean stale sessions.
+- Scope-level filesystem locks serialize resume/close/GC and prevent a TTL janitor from racing a resume.
+- Fresh and resumed generations accept readiness only from successful scoped MCP `task_state` evidence.
+- Authoritative `COMPLETED` requires `completion_check.ready=true`; never trust textual lifecycle claims.
+- `omo-relay` routes continuation to the exact stored `browser_page_id`; Orca idle/generation gating remains in the send path.
 - OMO decides repository/worktree selection for fresh work. The bridge never creates or chooses worktrees.
-- A returned `terminal=true` / `ok=false` result is authoritative, not a reason to fall back to another coding agent.
+- A returned `terminal=true` / `ok=false` result remains authoritative, not a reason to fall back to another coding agent.
 "#,
         bin = delegate_bin.display(),
     )
@@ -351,20 +364,21 @@ mod tests {
         assert!(prompt.contains("hard maximum 3"));
         assert!(prompt.contains("Choose exactly 1, 2, or 3 workers"));
         assert!(prompt.contains("--batch-stdin --json"));
-        assert!(prompt.contains("exactly once"));
         assert!(prompt.contains("Do not call Task/background/subagent/team tools"));
         assert!(prompt.contains("OMO owns repository/worktree selection"));
     }
 
     #[test]
-    fn coordinator_documents_keep_resume_and_close_session_modes() {
+    fn coordinator_documents_default_idle_retention_and_ttl() {
         let prompt = render_coordinator_prompt(Path::new("/tmp/delegate_to_chatgpt_web"));
-        assert!(prompt.contains("--keep-session"));
+        assert!(prompt.contains("IDLE_RETAINED"));
+        assert!(prompt.contains("default 120 minutes"));
+        assert!(prompt.contains("Do not pre-decide that a terminal Web conversation is disposable"));
+        assert!(prompt.contains("--close-on-terminal"));
         assert!(prompt.contains("--resume-scope '<exact-scope-id>'"));
         assert!(prompt.contains("--close-scope '<exact-scope-id>'"));
-        assert!(prompt.contains("session_retained:true"));
-        assert!(prompt.contains("never silently opens a replacement conversation"));
-        assert!(prompt.contains("internal lifecycle generation"));
+        assert!(prompt.contains("Scope-level filesystem locks"));
+        assert!(prompt.contains("TTL is a safety net"));
     }
 
     #[test]
@@ -395,11 +409,12 @@ mod tests {
         let skill = render_skill(Path::new("/tmp/delegate_to_chatgpt_web"));
         assert!(skill.contains("name: delegate-web"));
         assert!(skill.contains("**1–3 parallel ChatGPT Web workers**"));
-        assert!(skill.contains("--keep-session"));
+        assert!(skill.contains("IDLE_RETAINED by default"));
+        assert!(skill.contains("--close-on-terminal"));
         assert!(skill.contains("--resume-scope '<scope-id>'"));
         assert!(skill.contains("--close-scope '<scope-id>'"));
-        assert!(skill.contains("browser_page_id"));
-        assert!(skill.contains("lifecycle generation"));
+        assert!(skill.contains("lease_expires_ms"));
+        assert!(skill.contains("filesystem locks"));
         assert!(skill.contains("opencode/slash: \"false\""));
     }
 

@@ -4,21 +4,25 @@ use futures::StreamExt;
 use omo_bridge::orca::{
     resolve_terminal, resolve_terminal_for_marker, send_chatgpt_prompt, send_prompt, OrcaConfig,
 };
+use omo_bridge::web_session::cleanup_expired_retained_sessions;
 use omo_bridge::{default_scope_dir, WorkspaceMux};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tracing::{info, warn};
 use url::Url;
+
+const DEFAULT_SESSION_TTL_MINUTES: u64 = 120;
+const DEFAULT_SESSION_GC_INTERVAL_SECS: u64 = 60;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "omo-relay",
     version,
-    about = "Route omo-bridge continuation events back to each scoped ChatGPT Web conversation"
+    about = "Route omo-bridge continuation events and reap expired retained ChatGPT Web sessions"
 )]
 struct Cli {
     /// omo-bridge SSE event endpoint.
@@ -53,13 +57,29 @@ struct Cli {
     #[arg(long)]
     resolve_only: bool,
 
-    /// Observe continuation events but do not send them to ChatGPT Web/terminal.
+    /// Observe continuation events but do not send or mutate Web sessions.
     #[arg(long)]
     dry_run: bool,
 
     /// Delay before reconnecting a dropped SSE stream.
     #[arg(long, default_value_t = 1_000)]
     reconnect_ms: u64,
+
+    /// Idle-retained Web session TTL in minutes.
+    #[arg(
+        long,
+        env = "OMO_WEB_SESSION_TTL_MINUTES",
+        default_value_t = DEFAULT_SESSION_TTL_MINUTES
+    )]
+    session_ttl_minutes: u64,
+
+    /// Periodic retained-session garbage collection interval in seconds.
+    #[arg(
+        long,
+        env = "OMO_WEB_SESSION_GC_INTERVAL_SECS",
+        default_value_t = DEFAULT_SESSION_GC_INTERVAL_SECS
+    )]
+    session_gc_interval_secs: u64,
 }
 
 impl Cli {
@@ -112,13 +132,35 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let ttl_ms = session_ttl_ms(cli.session_ttl_minutes)?;
+    if cli.session_gc_interval_secs == 0 {
+        return Err(anyhow!(
+            "--session-gc-interval-secs must be greater than zero"
+        ));
+    }
+
     let port = events_port(&cli.events_url)?;
     let scope_dir = cli
         .scope_dir
         .clone()
         .unwrap_or_else(|| default_scope_dir(port));
     let mux = WorkspaceMux::new(&cli.mount_root, &scope_dir)?;
-    info!(scope_dir = %scope_dir.display(), "relay using multiplexed workspace scopes");
+    info!(
+        scope_dir = %scope_dir.display(),
+        session_ttl_minutes = cli.session_ttl_minutes,
+        session_gc_interval_secs = cli.session_gc_interval_secs,
+        "relay using multiplexed workspace scopes"
+    );
+
+    if !cli.dry_run {
+        run_session_gc(&mux, &orca, ttl_ms).await;
+        spawn_session_janitor(
+            mux.clone(),
+            orca.clone(),
+            ttl_ms,
+            cli.session_gc_interval_secs,
+        );
+    }
 
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -131,6 +173,39 @@ async fn main() -> Result<()> {
             Err(error) => warn!(error = %error, "event stream failed; reconnecting"),
         }
         sleep(Duration::from_millis(cli.reconnect_ms.max(100))).await;
+    }
+}
+
+fn spawn_session_janitor(mux: WorkspaceMux, orca: OrcaConfig, ttl_ms: u64, interval_secs: u64) {
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(interval_secs)).await;
+            run_session_gc(&mux, &orca, ttl_ms).await;
+        }
+    });
+}
+
+async fn run_session_gc(mux: &WorkspaceMux, orca: &OrcaConfig, ttl_ms: u64) {
+    match cleanup_expired_retained_sessions(mux, orca, epoch_ms(), ttl_ms, None).await {
+        Ok(cleaned) => {
+            for session in cleaned {
+                if let Some(error) = session.close_error {
+                    warn!(
+                        scope_id = %session.scope_id,
+                        browser_page_id = ?session.browser_page_id,
+                        error = %error,
+                        "expired retained Web scope was removed but browser tab close failed"
+                    );
+                } else {
+                    info!(
+                        scope_id = %session.scope_id,
+                        browser_page_id = ?session.browser_page_id,
+                        "expired retained Web session closed"
+                    );
+                }
+            }
+        }
+        Err(error) => warn!(error = %error, "retained Web session garbage collection failed"),
     }
 }
 
@@ -342,6 +417,22 @@ fn events_port(events_url: &str) -> Result<u16> {
         .ok_or_else(|| anyhow!("events URL has no resolvable port: {events_url}"))
 }
 
+fn session_ttl_ms(minutes: u64) -> Result<u64> {
+    if minutes == 0 {
+        return Err(anyhow!("--session-ttl-minutes must be greater than zero"));
+    }
+    minutes
+        .checked_mul(60_000)
+        .ok_or_else(|| anyhow!("--session-ttl-minutes is too large"))
+}
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +491,15 @@ mod tests {
     #[test]
     fn derives_scope_port_from_events_url() {
         assert_eq!(events_port("http://127.0.0.1:18800/events").unwrap(), 18800);
+    }
+
+    #[test]
+    fn relay_uses_same_two_hour_default_session_ttl() {
+        assert_eq!(DEFAULT_SESSION_TTL_MINUTES, 120);
+        assert_eq!(
+            session_ttl_ms(DEFAULT_SESSION_TTL_MINUTES).unwrap(),
+            7_200_000
+        );
+        assert!(session_ttl_ms(0).is_err());
     }
 }

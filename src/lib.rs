@@ -5,6 +5,7 @@ pub mod orca;
 pub mod security;
 pub mod server;
 pub mod tools;
+pub mod web_session;
 
 pub use cli::Cli;
 pub use error::{BridgeError, Result};
