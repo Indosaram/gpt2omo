@@ -1,5 +1,5 @@
 use clap::Parser;
-use omo_bridge::{create_router, AppState, Cli, EventBus, Workspace};
+use omo_bridge::{create_router, default_scope_dir, AppState, Cli, EventBus, WorkspaceMux};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
@@ -14,18 +14,30 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let ws = Workspace::open(&cli.workspace)?;
-    info!("Mounted workspace at: {}", ws.root().display());
+    let addr: SocketAddr = cli.bind.parse()?;
+    let scope_dir = cli
+        .scope_dir
+        .clone()
+        .unwrap_or_else(|| default_scope_dir(addr.port()));
+    let workspaces = WorkspaceMux::new(&cli.mount_root, &scope_dir)?;
 
-    let events = Arc::new(EventBus::new(ws.root().to_string_lossy().to_string()));
+    info!(
+        "Mounted filesystem root at: {}",
+        workspaces.mount_root().display()
+    );
+    info!("Workspace scope directory: {}", scope_dir.display());
+    info!("Workspace mode: multiplexed_scopes");
+
+    let events = Arc::new(EventBus::new(
+        workspaces.mount_root().to_string_lossy().to_string(),
+    ));
     let state = AppState {
-        workspace: Arc::new(ws),
+        workspace: Arc::new(workspaces),
         cli: Arc::new(cli.clone()),
         events,
     };
 
     let router = create_router(state);
-    let addr: SocketAddr = cli.bind.parse()?;
     info!("omo-bridge listening on http://{}", addr);
     info!("event stream available at http://{}/events", addr);
 

@@ -1,29 +1,41 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::StreamExt;
+use omo_bridge::orca::{resolve_terminal, resolve_terminal_for_marker, send_prompt, OrcaConfig};
+use omo_bridge::{default_scope_dir, WorkspaceMux};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::time::sleep;
 use tracing::{info, warn};
+use url::Url;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "omo-relay",
     version,
-    about = "Relay omo-bridge continuation events into the Orca terminal that drives ChatGPT Web"
+    about = "Route omo-bridge continuation events back to the ChatGPT Web terminal for each workspace scope"
 )]
 struct Cli {
     /// omo-bridge SSE event endpoint.
     #[arg(long, default_value = "http://127.0.0.1:18800/events")]
     events_url: String,
 
-    /// Orca worktree selector used while discovering the orchestrator terminal.
+    /// Broad mount root used by the bridge daemon.
+    #[arg(long, default_value = "/")]
+    mount_root: PathBuf,
+
+    /// Override the shared directory containing per-delegation workspace scopes.
+    #[arg(long)]
+    scope_dir: Option<PathBuf>,
+
+    /// Orca worktree selector used while rediscovering orchestrator terminals.
     #[arg(long, default_value = "active")]
     worktree: String,
 
-    /// Pin a specific Orca terminal handle. If omitted, the relay discovers it by recent output.
+    /// Pin a terminal only for --resolve-only or explicit single-terminal debugging.
     #[arg(long, env = "OMO_RELAY_TERMINAL")]
     terminal: Option<String>,
 
@@ -35,17 +47,27 @@ struct Cli {
     #[arg(long, env = "OMO_BRIDGE_TOKEN")]
     token: Option<String>,
 
-    /// Resolve and print the orchestrator terminal without subscribing or sending anything.
+    /// Resolve and print the generic orchestrator terminal without subscribing.
     #[arg(long)]
     resolve_only: bool,
 
-    /// Observe continuation events but do not type them into the orchestrator terminal.
+    /// Observe continuation events but do not type them into any terminal.
     #[arg(long)]
     dry_run: bool,
 
     /// Delay before reconnecting a dropped SSE stream.
     #[arg(long, default_value_t = 1_000)]
     reconnect_ms: u64,
+}
+
+impl Cli {
+    fn orca(&self) -> OrcaConfig {
+        OrcaConfig::new(
+            self.worktree.clone(),
+            self.terminal.clone(),
+            self.orca_bin.clone(),
+        )
+    }
 }
 
 #[derive(Default)]
@@ -82,21 +104,27 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let mut terminal = resolve_terminal(&cli).await?;
-    info!(terminal = %terminal, "resolved ChatGPT Web orchestrator terminal");
-
+    let orca = cli.orca();
     if cli.resolve_only {
-        println!("{}", terminal);
+        println!("{}", resolve_terminal(&orca).await?);
         return Ok(());
     }
+
+    let port = events_port(&cli.events_url)?;
+    let scope_dir = cli
+        .scope_dir
+        .clone()
+        .unwrap_or_else(|| default_scope_dir(port));
+    let mux = WorkspaceMux::new(&cli.mount_root, &scope_dir)?;
+    info!(scope_dir = %scope_dir.display(), "relay using multiplexed workspace scopes");
 
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .build()?;
-    let mut last_continuation_seq = 0u64;
+    let mut last_continuation_seq = HashMap::<String, u64>::new();
 
     loop {
-        match consume_events(&client, &cli, &mut terminal, &mut last_continuation_seq).await {
+        match consume_events(&client, &cli, &orca, &mux, &mut last_continuation_seq).await {
             Ok(()) => warn!("event stream closed; reconnecting"),
             Err(error) => warn!(error = %error, "event stream failed; reconnecting"),
         }
@@ -107,8 +135,9 @@ async fn main() -> Result<()> {
 async fn consume_events(
     client: &reqwest::Client,
     cli: &Cli,
-    terminal: &mut String,
-    last_continuation_seq: &mut u64,
+    orca: &OrcaConfig,
+    mux: &WorkspaceMux,
+    last_continuation_seq: &mut HashMap<String, u64>,
 ) -> Result<()> {
     let mut request = client.get(&cli.events_url);
     if let Some(token) = &cli.token {
@@ -143,7 +172,7 @@ async fn consume_events(
 
             if line.is_empty() {
                 if let Some((event, payload)) = frame.take_json() {
-                    handle_event(cli, terminal, last_continuation_seq, &event, payload).await?;
+                    handle_event(cli, orca, mux, last_continuation_seq, &event, payload).await?;
                 }
                 continue;
             }
@@ -164,8 +193,9 @@ async fn consume_events(
 
 async fn handle_event(
     cli: &Cli,
-    terminal: &mut String,
-    last_continuation_seq: &mut u64,
+    orca: &OrcaConfig,
+    mux: &WorkspaceMux,
+    last_continuation_seq: &mut HashMap<String, u64>,
     event: &str,
     payload: Value,
 ) -> Result<()> {
@@ -177,211 +207,107 @@ async fn handle_event(
             );
         }
         "completion" => {
+            let scope_id = payload
+                .pointer("/data/scope_id")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>");
             let ready = payload
                 .pointer("/data/ready")
-                .and_then(|value| value.as_bool())
+                .and_then(Value::as_bool)
                 .unwrap_or(false);
-            info!(ready, "completion state received");
+            info!(scope_id, ready, "completion state received");
         }
         "continuation_required" => {
-            let seq = payload
-                .get("seq")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            if seq != 0 && seq <= *last_continuation_seq {
-                info!(seq, "skipping duplicate continuation event");
-                return Ok(());
-            }
-            let relay = payload
-                .pointer("/data/relay_to_same_chat")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            let prompt = payload
-                .pointer("/data/prompt")
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .trim();
-            if !relay || prompt.is_empty() {
-                warn!(seq, "continuation event had no relayable prompt");
-                return Ok(());
-            }
-
-            if cli.dry_run {
-                info!(seq, terminal = %terminal, prompt = %prompt, "dry-run continuation relay");
-            } else if let Err(first_error) = send_prompt(cli, terminal, prompt).await {
-                warn!(error = %first_error, terminal = %terminal, "relay send failed; rediscovering terminal");
-                let fresh = resolve_terminal_uncached(cli).await?;
-                send_prompt(cli, &fresh, prompt).await.with_context(|| {
-                    format!("failed to relay after terminal rediscovery ({fresh})")
-                })?;
-                *terminal = fresh;
-            }
-            *last_continuation_seq = (*last_continuation_seq).max(seq);
-            info!(seq, terminal = %terminal, "continuation relayed to main orchestrator");
+            relay_continuation(cli, orca, mux, last_continuation_seq, &payload).await?;
         }
         "lagged" => {
-            warn!(payload = %payload, "SSE subscriber lagged; bridge state should be reconciled")
+            warn!(payload = %payload, "SSE subscriber lagged; scope task_state should be reconciled")
         }
         _ => {}
     }
     Ok(())
 }
 
-async fn send_prompt(cli: &Cli, terminal: &str, prompt: &str) -> Result<()> {
-    let result = run_orca_json(
-        cli,
-        &[
-            "terminal",
-            "send",
-            "--terminal",
-            terminal,
-            "--text",
-            prompt,
-            "--enter",
-            "--json",
-        ],
-    )
-    .await?;
-    if result.get("ok").and_then(|value| value.as_bool()) != Some(true) {
-        return Err(anyhow!("orca terminal send failed: {result}"));
+async fn relay_continuation(
+    cli: &Cli,
+    orca: &OrcaConfig,
+    mux: &WorkspaceMux,
+    last_continuation_seq: &mut HashMap<String, u64>,
+    payload: &Value,
+) -> Result<()> {
+    let seq = payload
+        .get("seq")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let scope_id = payload
+        .pointer("/data/scope_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let relay = payload
+        .pointer("/data/relay_to_same_chat")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let prompt = payload
+        .pointer("/data/prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+
+    if scope_id.is_empty() || !relay || prompt.is_empty() {
+        warn!(
+            seq,
+            "continuation event is missing scope/prompt routing data"
+        );
+        return Ok(());
     }
+
+    let last = last_continuation_seq.get(scope_id).copied().unwrap_or(0);
+    if seq != 0 && seq <= last {
+        info!(scope_id, seq, "skipping duplicate continuation event");
+        return Ok(());
+    }
+
+    let scope = mux.lookup(scope_id)?;
+    let stored_terminal = scope.terminal.as_deref();
+    let terminal = match resolve_terminal_for_marker(orca, scope_id).await {
+        Ok(fresh) => {
+            if stored_terminal != Some(fresh.as_str()) {
+                mux.update_terminal(scope_id, &fresh)?;
+            }
+            fresh
+        }
+        Err(marker_error) => match stored_terminal {
+            Some(stored) => {
+                warn!(scope_id, error = %marker_error, terminal = stored, "scope marker rediscovery failed; using stored terminal");
+                stored.to_string()
+            }
+            None => return Err(marker_error.context("scope has no stored terminal fallback")),
+        },
+    };
+
+    if cli.dry_run {
+        info!(scope_id, seq, terminal = %terminal, prompt = %prompt, "dry-run continuation relay");
+    } else if let Err(first_error) = send_prompt(orca, &terminal, prompt).await {
+        warn!(scope_id, error = %first_error, terminal = %terminal, "scope relay send failed; rediscovering by scope marker");
+        let fresh = resolve_terminal_for_marker(orca, scope_id).await?;
+        send_prompt(orca, &fresh, prompt).await.with_context(|| {
+            format!("failed to relay scope {scope_id} after terminal rediscovery")
+        })?;
+        mux.update_terminal(scope_id, &fresh)?;
+    }
+
+    last_continuation_seq.insert(scope_id.to_string(), last.max(seq));
+    info!(scope_id, seq, terminal = %terminal, "continuation relayed for scope");
     Ok(())
 }
 
-async fn resolve_terminal(cli: &Cli) -> Result<String> {
-    if let Some(terminal) = &cli.terminal {
-        verify_terminal(cli, terminal).await?;
-        return Ok(terminal.clone());
-    }
-    resolve_terminal_uncached(cli).await
-}
-
-async fn verify_terminal(cli: &Cli, terminal: &str) -> Result<()> {
-    let result =
-        run_orca_json(cli, &["terminal", "show", "--terminal", terminal, "--json"]).await?;
-    let node = result
-        .pointer("/result/terminal")
-        .ok_or_else(|| anyhow!("terminal not found: {terminal}"))?;
-    if node.get("connected").and_then(|value| value.as_bool()) != Some(true)
-        || node.get("writable").and_then(|value| value.as_bool()) != Some(true)
-    {
-        return Err(anyhow!("terminal is not connected+writable: {terminal}"));
-    }
-    Ok(())
-}
-
-async fn resolve_terminal_uncached(cli: &Cli) -> Result<String> {
-    let listed = run_orca_json(
-        cli,
-        &["terminal", "list", "--worktree", &cli.worktree, "--json"],
-    )
-    .await?;
-    let terminals = listed
-        .pointer("/result/terminals")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| anyhow!("orca terminal list returned no terminals"))?;
-
-    let mut candidates = Vec::<(i64, i64, String)>::new();
-    for terminal in terminals {
-        if terminal.get("connected").and_then(|value| value.as_bool()) != Some(true)
-            || terminal.get("writable").and_then(|value| value.as_bool()) != Some(true)
-        {
-            continue;
-        }
-        let Some(handle) = terminal.get("handle").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let read = run_orca_json(
-            cli,
-            &[
-                "terminal",
-                "read",
-                "--terminal",
-                handle,
-                "--limit",
-                "160",
-                "--json",
-            ],
-        )
-        .await?;
-        let tail = read
-            .pointer("/result/terminal/tail")
-            .and_then(|value| value.as_array())
-            .map(|lines| {
-                lines
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        let score = orchestrator_score(&tail);
-        let last_output = terminal
-            .get("lastOutputAt")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0);
-        if score > 0 {
-            candidates.push((score, last_output, handle.to_string()));
-        }
-    }
-
-    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    let best = candidates
-        .first()
-        .ok_or_else(|| anyhow!("could not identify the ChatGPT Web orchestrator terminal"))?;
-    if best.0 < 100 {
-        return Err(anyhow!(
-            "terminal discovery was ambiguous (best score {}); set --terminal/OMO_RELAY_TERMINAL",
-            best.0
-        ));
-    }
-    if candidates.get(1).is_some_and(|second| second.0 == best.0) {
-        return Err(anyhow!(
-            "multiple terminals matched equally; set --terminal/OMO_RELAY_TERMINAL"
-        ));
-    }
-    Ok(best.2.clone())
-}
-
-fn orchestrator_score(text: &str) -> i64 {
-    let mut score = 0;
-    for (needle, weight) in [
-        ("ChatGPT Web", 120),
-        ("ChatGPT", 30),
-        ("omo-bridge", 70),
-        ("연결됨", 50),
-        ("single-agent harness", 40),
-        ("대화창", 20),
-    ] {
-        if text.contains(needle) {
-            score += weight;
-        }
-    }
-    score
-}
-
-async fn run_orca_json(cli: &Cli, args: &[&str]) -> Result<Value> {
-    let output = Command::new(&cli.orca_bin)
-        .args(args)
-        .output()
-        .await
-        .with_context(|| format!("failed to execute {}", cli.orca_bin))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
-        return Err(anyhow!(
-            "orca command failed ({}): {} {}",
-            output.status,
-            stdout.trim(),
-            stderr.trim()
-        ));
-    }
-    let value: Value = serde_json::from_str(&stdout)
-        .with_context(|| format!("orca returned invalid JSON: {}", stdout.trim()))?;
-    if value.get("ok").and_then(|value| value.as_bool()) == Some(false) {
-        return Err(anyhow!("orca returned an error: {value}"));
-    }
-    Ok(value)
+fn events_port(events_url: &str) -> Result<u16> {
+    let parsed = Url::parse(events_url)
+        .with_context(|| format!("invalid events URL for scope routing: {events_url}"))?;
+    parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("events URL has no resolvable port: {events_url}"))
 }
 
 #[cfg(test)]
@@ -389,31 +315,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scores_real_orchestrator_markers_highly() {
-        let text = "omo-bridge mount changed; ChatGPT Web에 연결됨 전송; single-agent harness";
-        assert!(orchestrator_score(text) >= 200);
-    }
-
-    #[test]
-    fn unrelated_pi_terminal_does_not_match() {
-        assert_eq!(
-            orchestrator_score("(😺 OmO Native) Goal achieved; reflecting"),
-            0
-        );
-    }
-
-    #[test]
-    fn parses_continuation_payload_shape() {
+    fn parses_scoped_continuation_payload_shape() {
         let payload = serde_json::json!({
             "seq": 42,
             "kind": "continuation_required",
             "data": {
+                "scope_id": "55555555-5555-4555-8555-555555555555",
                 "prompt": "continue",
                 "relay_to_same_chat": true
             }
         });
         assert_eq!(payload["seq"], 42);
+        assert_eq!(
+            payload["data"]["scope_id"],
+            "55555555-5555-4555-8555-555555555555"
+        );
         assert_eq!(payload["data"]["prompt"], "continue");
         assert_eq!(payload["data"]["relay_to_same_chat"], true);
+    }
+
+    #[test]
+    fn derives_scope_port_from_events_url() {
+        assert_eq!(events_port("http://127.0.0.1:18800/events").unwrap(), 18800);
     }
 }

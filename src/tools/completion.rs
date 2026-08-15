@@ -6,6 +6,7 @@ use std::process::Command;
 
 pub fn handle_completion_check(
     ws: &Workspace,
+    scope_id: &str,
     require_task_plan: Option<bool>,
     require_verification: Option<bool>,
     require_changes: Option<bool>,
@@ -14,7 +15,7 @@ pub fn handle_completion_check(
     let require_verification = require_verification.unwrap_or(true);
     let require_changes = require_changes.unwrap_or(false);
 
-    let state = match load_task_state(ws) {
+    let state = match load_task_state(ws, scope_id) {
         Ok(state) => state,
         Err(e) => return ToolCallResult::err(e),
     };
@@ -134,6 +135,8 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    const SCOPE: &str = "22222222-2222-4222-8222-222222222222";
+
     fn init_git(path: &std::path::Path) {
         Command::new("git")
             .args(["init", "-q"])
@@ -148,18 +151,23 @@ mod tests {
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
 
-        handle_task_plan(&ws, "Implement", vec!["Edit".into(), "Verify".into()]);
-        record_mutation(&ws, "src/lib.rs");
+        handle_task_plan(
+            &ws,
+            SCOPE,
+            "Implement",
+            vec!["Edit".into(), "Verify".into()],
+        );
+        record_mutation(&ws, SCOPE, "src/lib.rs");
 
-        let before = handle_completion_check(&ws, None, None, None);
+        let before = handle_completion_check(&ws, SCOPE, None, None, None);
         assert!(before.success);
         assert!(!before.data.unwrap()["ready"].as_bool().unwrap());
 
-        handle_task_update(&ws, "T1", "done", None);
-        handle_task_update(&ws, "T2", "done", None);
-        record_verification(&ws, "cargo test", true, Some(0), 10);
+        handle_task_update(&ws, SCOPE, "T1", "done", None);
+        handle_task_update(&ws, SCOPE, "T2", "done", None);
+        record_verification(&ws, SCOPE, "cargo test", true, Some(0), 10);
 
-        let after = handle_completion_check(&ws, None, None, None);
+        let after = handle_completion_check(&ws, SCOPE, None, None, None);
         assert!(after.success);
         assert!(after.data.unwrap()["ready"].as_bool().unwrap());
     }
@@ -169,7 +177,7 @@ mod tests {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_completion_check(&ws, Some(false), Some(false), Some(false));
+        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
         assert!(result.success);
         assert!(result.data.unwrap()["ready"].as_bool().unwrap());
     }
@@ -179,7 +187,7 @@ mod tests {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_completion_check(&ws, Some(false), Some(true), Some(false));
+        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(true), Some(false));
         assert!(result.success);
         let data = result.data.unwrap();
         assert!(!data["ready"].as_bool().unwrap());
@@ -197,7 +205,7 @@ mod tests {
         fs::write(dir.path().join("bad.txt"), "trailing space \n").unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
 
-        let result = handle_completion_check(&ws, Some(false), Some(false), Some(false));
+        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
         assert!(result.success);
         let data = result.data.unwrap();
         assert!(!data["ready"].as_bool().unwrap());

@@ -1,7 +1,7 @@
 use crate::cli::Cli;
 use crate::error::{BridgeError, Result};
 use crate::events::{EventBus, HarnessEvent};
-use crate::security::Workspace;
+use crate::security::{Workspace, WorkspaceMux};
 use crate::tools::*;
 use axum::{
     extract::State,
@@ -22,22 +22,22 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
 use tower_http::cors::CorsLayer;
 
-const CODING_AGENT_INSTRUCTIONS: &str = r#"You are directly responsible for coding in the mounted workspace. omo-bridge is an I/O and verification harness, not another coding agent: do not delegate implementation back to OpenCode, OMO, Codex, or another agent through this bridge.
+const CODING_AGENT_INSTRUCTIONS: &str = r#"You are directly responsible for coding in the workspace scope assigned to this delegation by the terminal orchestrator. omo-bridge is an I/O and verification harness, not another coding agent: do not delegate implementation back to OpenCode, OMO, Codex, or another agent through this bridge. The daemon may have machine-root mount authority, but every MCP coding tool call requires this delegation scope_id and is sandboxed to that scope. Multiple scopes may run concurrently. Never omit or substitute the scope_id from the delegation prompt.
 
 For non-trivial implementation tasks, use this workflow:
 1. Inspect the relevant files, tests, and repository structure before editing. Prefer search_text, ast_grep, LSP queries, and targeted read_file calls over guessing filenames, symbols, references, or APIs.
-2. Create a task_plan that captures the user's actual acceptance criteria. Keep it current with task_update as work progresses.
+2. Recover task_state first. Continue a matching incomplete task; otherwise create a task_plan that captures the delegated task acceptance criteria. Keep it current with task_update as work progresses.
 3. Make edits with patch_file. When replacing an existing file, pass the SHA256 returned by the latest read_file whenever practical; if the precondition fails, re-read instead of overwriting stale content.
-4. Run the project's real verification commands after edits (tests, type checks, lint, build, cargo check/clippy, etc.). Do not claim a command passed unless its returned data.success is true.
+4. Run the project verification commands after edits (tests, type checks, lint, build, cargo check/clippy, etc.). Do not claim a command passed unless its returned data.success is true.
 5. Diagnose failures yourself, edit again, and rerun verification. Do not stop after merely writing code.
 6. Inspect git_status_diff before declaring completion so accidental or incomplete changes are visible.
 7. Mark task-plan items done only when there is concrete evidence. Call completion_check at the end of a non-trivial coding task; if ready=false, continue working on its blockers.
 
-For small read-only questions or a trivial single edit, a task plan is optional. Never fabricate file contents, command output, test results, or completion evidence. Preserve the workspace sandbox: all paths must remain relative to the mounted workspace."#;
+For small read-only questions or a trivial single edit, a task plan is optional. Never fabricate file contents, command output, test results, or completion evidence. All file and command paths must remain relative to this delegation workspace, and every tool call must include its scope_id."#;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub workspace: Arc<Workspace>,
+    pub workspace: Arc<WorkspaceMux>,
     pub cli: Arc<Cli>,
     pub events: Arc<EventBus>,
 }
@@ -76,12 +76,14 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn healthz_handler() -> impl IntoResponse {
+async fn healthz_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "service": "omo-bridge",
-        "version": "0.5.0",
-        "events": "/events"
+        "version": "0.6.0",
+        "events": "/events",
+        "workspace_mode": "multiplexed_scopes",
+        "mount_root": state.workspace.mount_root().to_string_lossy()
     }))
 }
 
@@ -165,33 +167,51 @@ async fn mcp_post_handler(
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
             let call_id = uuid::Uuid::new_v4().to_string();
+            let scope_id = arguments
+                .get("scope_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let metadata = tool_event_metadata(tool_name, &arguments);
 
             state.events.publish(
                 "tool_started",
                 serde_json::json!({
                     "call_id": call_id,
+                    "scope_id": scope_id,
                     "tool": tool_name,
                     "arguments": metadata,
                 }),
             );
 
             let started = Instant::now();
-            let tool_res =
-                dispatch_tool(&state.workspace, &state.cli, tool_name, arguments.clone());
+            let tool_res = if scope_id.is_empty() {
+                ToolCallResult::err("scope_id is required for every omo-bridge tool call")
+            } else {
+                match state.workspace.resolve(scope_id) {
+                    Ok(workspace) => dispatch_tool(
+                        &workspace,
+                        &state.cli,
+                        scope_id,
+                        tool_name,
+                        arguments.clone(),
+                    ),
+                    Err(error) => ToolCallResult::err(error.to_string()),
+                }
+            };
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
             state.events.publish(
                 "tool_finished",
                 serde_json::json!({
                     "call_id": call_id,
+                    "scope_id": scope_id,
                     "tool": tool_name,
                     "success": tool_res.success,
                     "error": tool_res.error,
                     "duration_ms": elapsed_ms,
                 }),
             );
-            publish_specialized_events(&state.events, tool_name, &arguments, &tool_res);
+            publish_specialized_events(&state.events, scope_id, tool_name, &arguments, &tool_res);
 
             JsonRpcResponse {
                 jsonrpc: "2.0".into(),
@@ -238,17 +258,17 @@ fn initialize_result() -> Value {
         },
         "serverInfo": {
             "name": "omo-bridge",
-            "version": "0.5.0"
+            "version": "0.6.0"
         },
         "instructions": CODING_AGENT_INSTRUCTIONS
     })
 }
 
 fn tool_definitions() -> Vec<Value> {
-    vec![
+    let mut tools = vec![
         serde_json::json!({
             "name": "read_file",
-            "description": "Read a UTF-8 file in the mounted workspace. Returns SHA256 plus line-sliced content; use the SHA256 as patch_file's optimistic precondition before replacing an existing file.",
+            "description": "Read a UTF-8 file in the delegation workspace. Returns SHA256 plus line-sliced content; use the SHA256 as patch_file's optimistic precondition before replacing an existing file.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -286,7 +306,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "search_text",
-            "description": "Search UTF-8 source files for literal text across the workspace. Returns file, line, column and preview. Prefer this before broad file reads when locating symbols, tests, routes, or configuration.",
+            "description": "Search UTF-8 source files for literal text across the delegation workspace. Returns file, line, column and preview. Prefer this before broad file reads when locating symbols, tests, routes, or configuration.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -300,7 +320,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "ast_grep",
-            "description": "Run structural AST pattern search with ast-grep/sg inside the mounted workspace. Use this for syntax-aware call/import/class/function patterns when literal search_text is insufficient.",
+            "description": "Run structural AST pattern search with ast-grep/sg inside the delegation workspace. Use this for syntax-aware call/import/class/function patterns when literal search_text is insufficient.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -428,7 +448,36 @@ fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
-    ]
+    ];
+    for tool in &mut tools {
+        let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let properties = schema
+            .entry("properties")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(properties) = properties.as_object_mut() {
+            properties.insert(
+                "scope_id".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Per-delegation workspace scope id supplied by the OMO delegation prompt"
+                }),
+            );
+        }
+        let required = schema
+            .entry("required")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(required) = required.as_array_mut() {
+            if !required
+                .iter()
+                .any(|value| value.as_str() == Some("scope_id"))
+            {
+                required.push(serde_json::json!("scope_id"));
+            }
+        }
+    }
+    tools
 }
 
 fn verify_auth(state: &AppState, headers: &HeaderMap) -> Result<()> {
@@ -510,6 +559,7 @@ fn tool_event_metadata(name: &str, args: &Value) -> Value {
 
 fn publish_specialized_events(
     events: &EventBus,
+    scope_id: &str,
     name: &str,
     args: &Value,
     result: &ToolCallResult,
@@ -521,6 +571,7 @@ fn publish_specialized_events(
             events.publish(
                 "verification",
                 serde_json::json!({
+                    "scope_id": scope_id,
                     "command": command,
                     "success": data.and_then(|v| v.get("success")).and_then(Value::as_bool).unwrap_or(false),
                     "exit_code": data.and_then(|v| v.get("exit_code")),
@@ -545,6 +596,7 @@ fn publish_specialized_events(
         events.publish(
             "completion",
             serde_json::json!({
+                "scope_id": scope_id,
                 "ready": ready,
                 "blockers": blockers,
                 "verification_evidence": data.and_then(|v| v.get("verification_evidence")).cloned().unwrap_or(Value::Null),
@@ -567,12 +619,13 @@ fn publish_specialized_events(
                 .filter(|text| !text.is_empty())
                 .unwrap_or_else(|| "- completion_check did not return ready=true".into());
             let prompt = format!(
-                "The coding task is not complete. Continue working in this same ChatGPT conversation.\n\nCompletion blockers:\n{}\n\nRecover task_state if context was compacted, resolve every blocker, rerun the relevant verification, inspect git_status_diff, and call completion_check again. Do not stop until completion_check returns ready=true unless an external blocker makes progress impossible.",
-                blocker_lines
+                "The coding task for scope {} is not complete. Continue working in this same ChatGPT conversation.\n\nCompletion blockers:\n{}\n\nUse scope_id {} on every omo-bridge tool call. Recover task_state if context was compacted, resolve every blocker, rerun the relevant verification, inspect git_status_diff, and call completion_check again. Do not stop until completion_check returns ready=true unless an external blocker makes progress impossible.",
+                scope_id, blocker_lines, scope_id
             );
             events.publish(
                 "continuation_required",
                 serde_json::json!({
+                    "scope_id": scope_id,
                     "prompt": prompt,
                     "blockers": blockers,
                     "relay_to_same_chat": true,
@@ -582,39 +635,45 @@ fn publish_specialized_events(
     }
 }
 
-fn dispatch_tool(ws: &Workspace, cli: &Cli, name: &str, args: Value) -> ToolCallResult {
+fn dispatch_tool(
+    ws: &Workspace,
+    cli: &Cli,
+    scope_id: &str,
+    name: &str,
+    args: Value,
+) -> ToolCallResult {
     match name {
         "read_file" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
             let start = args
                 .get("start_line")
-                .and_then(|v| v.as_u64())
+                .and_then(Value::as_u64)
                 .map(|v| v as usize);
             let max = args
                 .get("max_lines")
-                .and_then(|v| v.as_u64())
+                .and_then(Value::as_u64)
                 .map(|v| v as usize);
             handle_read_file(ws, path, start, max, cli.max_file_bytes)
         }
         "list_files" => {
-            let path = args.get("path").and_then(|v| v.as_str());
+            let path = args.get("path").and_then(Value::as_str);
             let depth = args
                 .get("max_depth")
-                .and_then(|v| v.as_u64())
+                .and_then(Value::as_u64)
                 .map(|v| v as usize);
             let limit = args
                 .get("limit")
-                .and_then(|v| v.as_u64())
+                .and_then(Value::as_u64)
                 .map(|v| v as usize);
             handle_list_files(ws, path, depth, limit)
         }
         "search_text" => {
-            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let path = args.get("path").and_then(|v| v.as_str());
-            let case_sensitive = args.get("case_sensitive").and_then(|v| v.as_bool());
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            let path = args.get("path").and_then(Value::as_str);
+            let case_sensitive = args.get("case_sensitive").and_then(Value::as_bool);
             let max_results = args
                 .get("max_results")
-                .and_then(|v| v.as_u64())
+                .and_then(Value::as_u64)
                 .map(|v| v as usize);
             handle_search_text(ws, query, path, case_sensitive, max_results)
         }
@@ -659,17 +718,17 @@ fn dispatch_tool(ws: &Workspace, cli: &Cli, name: &str, args: Value) -> ToolCall
             handle_lsp(ws, LspOperation::Symbols, path, None, None, timeout)
         }
         "patch_file" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let sha = args.get("expected_sha256").and_then(|v| v.as_str());
-            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            let sha = args.get("expected_sha256").and_then(Value::as_str);
+            let content = args.get("content").and_then(Value::as_str).unwrap_or("");
             let result = handle_patch_file(ws, path, sha, content);
             if result.success {
-                record_mutation(ws, path);
+                record_mutation(ws, scope_id, path);
             }
             result
         }
         "run_command" => {
-            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
             let result = handle_run_command(ws, cmd, cli.command_timeout_ms);
             if result.success {
                 if let Some(data) = result.data.as_ref() {
@@ -679,15 +738,15 @@ fn dispatch_tool(ws: &Workspace, cli: &Cli, name: &str, args: Value) -> ToolCall
                         .unwrap_or(false);
                     let exit_code = data.get("exit_code").and_then(Value::as_i64);
                     let duration_ms = data.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
-                    record_verification(ws, cmd, success, exit_code, duration_ms);
+                    record_verification(ws, scope_id, cmd, success, exit_code, duration_ms);
                 }
             }
             result
         }
         "git_status_diff" => handle_git_status(ws),
         "task_plan" => {
-            let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or("");
-            let Some(raw_items) = args.get("items").and_then(|v| v.as_array()) else {
+            let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
+            let Some(raw_items) = args.get("items").and_then(Value::as_array) else {
                 return ToolCallResult::err("items must be an array of strings");
             };
             let mut items = Vec::with_capacity(raw_items.len());
@@ -697,20 +756,26 @@ fn dispatch_tool(ws: &Workspace, cli: &Cli, name: &str, args: Value) -> ToolCall
                 };
                 items.push(item.to_string());
             }
-            handle_task_plan(ws, goal, items)
+            handle_task_plan(ws, scope_id, goal, items)
         }
         "task_update" => {
-            let item_id = args.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
-            let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            let note = args.get("note").and_then(|v| v.as_str());
-            handle_task_update(ws, item_id, status, note)
+            let item_id = args.get("item_id").and_then(Value::as_str).unwrap_or("");
+            let status = args.get("status").and_then(Value::as_str).unwrap_or("");
+            let note = args.get("note").and_then(Value::as_str);
+            handle_task_update(ws, scope_id, item_id, status, note)
         }
-        "task_state" => handle_task_state(ws),
+        "task_state" => handle_task_state(ws, scope_id),
         "completion_check" => {
-            let require_task_plan = args.get("require_task_plan").and_then(|v| v.as_bool());
-            let require_verification = args.get("require_verification").and_then(|v| v.as_bool());
-            let require_changes = args.get("require_changes").and_then(|v| v.as_bool());
-            handle_completion_check(ws, require_task_plan, require_verification, require_changes)
+            let require_task_plan = args.get("require_task_plan").and_then(Value::as_bool);
+            let require_verification = args.get("require_verification").and_then(Value::as_bool);
+            let require_changes = args.get("require_changes").and_then(Value::as_bool);
+            handle_completion_check(
+                ws,
+                scope_id,
+                require_task_plan,
+                require_verification,
+                require_changes,
+            )
         }
         _ => ToolCallResult::err(format!("Unknown tool: {}", name)),
     }
@@ -736,7 +801,7 @@ mod tests {
         let instructions = init["instructions"].as_str().unwrap();
         assert!(instructions.contains("directly responsible for coding"));
         assert!(instructions.contains("completion_check"));
-        assert_eq!(init["serverInfo"]["version"], "0.5.0");
+        assert_eq!(init["serverInfo"]["version"], "0.6.0");
     }
 
     #[test]
@@ -793,13 +858,23 @@ mod tests {
             "verification_evidence": null
         }));
 
-        publish_specialized_events(&events, "completion_check", &serde_json::json!({}), &result);
+        publish_specialized_events(
+            &events,
+            "33333333-3333-4333-8333-333333333333",
+            "completion_check",
+            &serde_json::json!({}),
+            &result,
+        );
 
         let completion = rx.recv().await.unwrap();
         let continuation = rx.recv().await.unwrap();
         assert_eq!(completion.kind, "completion");
         assert_eq!(continuation.kind, "continuation_required");
         assert_eq!(continuation.data["relay_to_same_chat"], true);
+        assert_eq!(
+            continuation.data["scope_id"],
+            "33333333-3333-4333-8333-333333333333"
+        );
         let prompt = continuation.data["prompt"].as_str().unwrap();
         assert!(prompt.contains("tests are failing"));
         assert!(prompt.contains("completion_check returns ready=true"));

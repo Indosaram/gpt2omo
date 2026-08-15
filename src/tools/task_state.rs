@@ -61,7 +61,12 @@ pub struct TaskState {
     pub verifications: Vec<VerificationRecord>,
 }
 
-pub fn handle_task_plan(ws: &Workspace, goal: &str, items: Vec<String>) -> ToolCallResult {
+pub fn handle_task_plan(
+    ws: &Workspace,
+    scope_id: &str,
+    goal: &str,
+    items: Vec<String>,
+) -> ToolCallResult {
     let goal = goal.trim();
     if goal.is_empty() {
         return ToolCallResult::err("Task goal cannot be empty");
@@ -71,6 +76,22 @@ pub fn handle_task_plan(ws: &Workspace, goal: &str, items: Vec<String>) -> ToolC
     }
     if items.len() > 100 {
         return ToolCallResult::err("Task plan cannot contain more than 100 items");
+    }
+
+    match load_task_state(ws, scope_id) {
+        Ok(Some(existing))
+            if existing
+                .items
+                .iter()
+                .any(|item| item.status != TaskStatus::Done) =>
+        {
+            return ToolCallResult::err(format!(
+                "An incomplete task plan already exists for this delegation scope: {}. Recover task_state and continue or resolve it before creating a new plan",
+                existing.goal
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => return ToolCallResult::err(error),
     }
 
     let mut normalized = Vec::with_capacity(items.len());
@@ -99,9 +120,10 @@ pub fn handle_task_plan(ws: &Workspace, goal: &str, items: Vec<String>) -> ToolC
         verifications: Vec::new(),
     };
 
-    match save_task_state(ws, &state) {
+    match save_task_state(ws, scope_id, &state) {
         Ok(()) => ToolCallResult::ok(serde_json::json!({
             "active": true,
+            "scope_id": scope_id,
             "state": state,
         })),
         Err(e) => ToolCallResult::err(e),
@@ -110,6 +132,7 @@ pub fn handle_task_plan(ws: &Workspace, goal: &str, items: Vec<String>) -> ToolC
 
 pub fn handle_task_update(
     ws: &Workspace,
+    scope_id: &str,
     item_id: &str,
     status: &str,
     note: Option<&str>,
@@ -120,7 +143,7 @@ pub fn handle_task_update(
         );
     };
 
-    let mut state = match load_task_state(ws) {
+    let mut state = match load_task_state(ws, scope_id) {
         Ok(Some(state)) => state,
         Ok(None) => return ToolCallResult::err("No active task plan"),
         Err(e) => return ToolCallResult::err(e),
@@ -137,42 +160,46 @@ pub fn handle_task_update(
         .map(str::to_string);
     state.updated_ms = now_ms();
 
-    match save_task_state(ws, &state) {
+    match save_task_state(ws, scope_id, &state) {
         Ok(()) => ToolCallResult::ok(serde_json::json!({
             "active": true,
+            "scope_id": scope_id,
             "state": state,
         })),
         Err(e) => ToolCallResult::err(e),
     }
 }
 
-pub fn handle_task_state(ws: &Workspace) -> ToolCallResult {
-    match load_task_state(ws) {
+pub fn handle_task_state(ws: &Workspace, scope_id: &str) -> ToolCallResult {
+    match load_task_state(ws, scope_id) {
         Ok(Some(state)) => ToolCallResult::ok(serde_json::json!({
             "active": true,
+            "scope_id": scope_id,
             "state": state,
         })),
         Ok(None) => ToolCallResult::ok(serde_json::json!({
             "active": false,
+            "scope_id": scope_id,
             "state": null,
         })),
         Err(e) => ToolCallResult::err(e),
     }
 }
 
-pub fn record_mutation(ws: &Workspace, path: &str) {
-    let Ok(Some(mut state)) = load_task_state(ws) else {
+pub fn record_mutation(ws: &Workspace, scope_id: &str, path: &str) {
+    let Ok(Some(mut state)) = load_task_state(ws, scope_id) else {
         return;
     };
     let now = now_ms();
     state.last_mutation_ms = Some(now);
     state.last_mutation_path = Some(path.to_string());
     state.updated_ms = now;
-    let _ = save_task_state(ws, &state);
+    let _ = save_task_state(ws, scope_id, &state);
 }
 
 pub fn record_verification(
     ws: &Workspace,
+    scope_id: &str,
     command: &str,
     success: bool,
     exit_code: Option<i64>,
@@ -182,7 +209,7 @@ pub fn record_verification(
         return;
     }
 
-    let Ok(Some(mut state)) = load_task_state(ws) else {
+    let Ok(Some(mut state)) = load_task_state(ws, scope_id) else {
         return;
     };
 
@@ -198,7 +225,7 @@ pub fn record_verification(
         state.verifications.drain(0..excess);
     }
     state.updated_ms = now_ms();
-    let _ = save_task_state(ws, &state);
+    let _ = save_task_state(ws, scope_id, &state);
 }
 
 pub fn is_verification_command(command: &str) -> bool {
@@ -225,8 +252,11 @@ pub fn is_verification_command(command: &str) -> bool {
     .any(|prefix| lower.starts_with(prefix))
 }
 
-pub fn load_task_state(ws: &Workspace) -> std::result::Result<Option<TaskState>, String> {
-    let path = state_path(ws)?;
+pub fn load_task_state(
+    ws: &Workspace,
+    scope_id: &str,
+) -> std::result::Result<Option<TaskState>, String> {
+    let path = state_path(ws, scope_id)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -237,8 +267,12 @@ pub fn load_task_state(ws: &Workspace) -> std::result::Result<Option<TaskState>,
     Ok(Some(state))
 }
 
-fn save_task_state(ws: &Workspace, state: &TaskState) -> std::result::Result<(), String> {
-    let path = state_path(ws)?;
+fn save_task_state(
+    ws: &Workspace,
+    scope_id: &str,
+    state: &TaskState,
+) -> std::result::Result<(), String> {
+    let path = state_path(ws, scope_id)?;
     let parent = path
         .parent()
         .ok_or_else(|| "Task state path has no parent".to_string())?;
@@ -256,9 +290,13 @@ fn save_task_state(ws: &Workspace, state: &TaskState) -> std::result::Result<(),
     Ok(())
 }
 
-fn state_path(ws: &Workspace) -> std::result::Result<PathBuf, String> {
+fn state_path(ws: &Workspace, scope_id: &str) -> std::result::Result<PathBuf, String> {
+    uuid::Uuid::parse_str(scope_id).map_err(|_| "Invalid task scope id".to_string())?;
     let root = ws.root().to_string_lossy();
-    let key = format!("{:x}", Sha256::digest(root.as_bytes()));
+    let key = format!(
+        "{:x}",
+        Sha256::digest(format!("{}:{}", root, scope_id).as_bytes())
+    );
     Ok(std::env::temp_dir()
         .join("omo-bridge")
         .join("task-state")
@@ -277,6 +315,9 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    const SCOPE_A: &str = "11111111-1111-4111-8111-111111111111";
+    const SCOPE_B: &str = "22222222-2222-4222-8222-222222222222";
+
     #[test]
     fn test_task_plan_update_and_persistence() {
         let dir = tempdir().unwrap();
@@ -284,15 +325,16 @@ mod tests {
 
         let plan = handle_task_plan(
             &ws,
+            SCOPE_A,
             "Implement feature",
             vec!["Inspect code".into(), "Run tests".into()],
         );
         assert!(plan.success);
 
-        let update = handle_task_update(&ws, "T1", "done", Some("inspected"));
+        let update = handle_task_update(&ws, SCOPE_A, "T1", "done", Some("inspected"));
         assert!(update.success);
 
-        let state = load_task_state(&ws).unwrap().unwrap();
+        let state = load_task_state(&ws, SCOPE_A).unwrap().unwrap();
         assert_eq!(state.goal, "Implement feature");
         assert_eq!(state.items[0].status, TaskStatus::Done);
         assert_eq!(state.items[0].note.as_deref(), Some("inspected"));
@@ -302,12 +344,12 @@ mod tests {
     fn test_mutation_and_verification_are_recorded() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        handle_task_plan(&ws, "Change code", vec!["Edit".into()]);
+        handle_task_plan(&ws, SCOPE_A, "Change code", vec!["Edit".into()]);
 
-        record_mutation(&ws, "src/lib.rs");
-        record_verification(&ws, "cargo test", true, Some(0), 123);
+        record_mutation(&ws, SCOPE_A, "src/lib.rs");
+        record_verification(&ws, SCOPE_A, "cargo test", true, Some(0), 123);
 
-        let state = load_task_state(&ws).unwrap().unwrap();
+        let state = load_task_state(&ws, SCOPE_A).unwrap().unwrap();
         assert_eq!(state.last_mutation_path.as_deref(), Some("src/lib.rs"));
         assert_eq!(state.verifications.len(), 1);
         assert!(state.verifications[0].success);
@@ -317,9 +359,35 @@ mod tests {
     fn test_non_verification_command_is_not_recorded() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        handle_task_plan(&ws, "Inspect", vec!["Inspect".into()]);
-        record_verification(&ws, "git --version", true, Some(0), 1);
-        let state = load_task_state(&ws).unwrap().unwrap();
+        handle_task_plan(&ws, SCOPE_A, "Inspect", vec!["Inspect".into()]);
+        record_verification(&ws, SCOPE_A, "git --version", true, Some(0), 1);
+        let state = load_task_state(&ws, SCOPE_A).unwrap().unwrap();
         assert!(state.verifications.is_empty());
+    }
+
+    #[test]
+    fn task_state_is_isolated_by_scope_even_in_same_workspace() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        assert!(handle_task_plan(&ws, SCOPE_A, "Task A", vec!["A".into()]).success);
+        assert!(handle_task_plan(&ws, SCOPE_B, "Task B", vec!["B".into()]).success);
+        assert_eq!(
+            load_task_state(&ws, SCOPE_A).unwrap().unwrap().goal,
+            "Task A"
+        );
+        assert_eq!(
+            load_task_state(&ws, SCOPE_B).unwrap().unwrap().goal,
+            "Task B"
+        );
+    }
+
+    #[test]
+    fn incomplete_plan_cannot_be_overwritten_within_same_scope() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        assert!(handle_task_plan(&ws, SCOPE_A, "First task", vec!["Do work".into()]).success);
+        let blocked = handle_task_plan(&ws, SCOPE_A, "Second task", vec!["Other work".into()]);
+        assert!(!blocked.success);
+        assert!(blocked.error.unwrap().contains("incomplete task plan"));
     }
 }

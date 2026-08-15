@@ -1,15 +1,18 @@
 use axum::body::{to_bytes, Body};
 use http::{Request, StatusCode};
-use omo_bridge::{create_router, AppState, Cli, EventBus, Workspace};
+use omo_bridge::{create_router, AppState, Cli, EventBus, WorkspaceMux};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>) {
-    let workspace = Workspace::open(dir.path()).unwrap();
+fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String) {
+    let scope_dir = dir.path().join("scopes");
+    let mux = WorkspaceMux::new(dir.path(), &scope_dir).unwrap();
+    let scope = mux.register(dir.path(), Some("term-test".into())).unwrap();
     let cli = Cli {
-        workspace: dir.path().to_path_buf(),
+        mount_root: dir.path().to_path_buf(),
+        scope_dir: Some(scope_dir),
         bind: "127.0.0.1:0".into(),
         token: None,
         max_file_bytes: 10 * 1024 * 1024,
@@ -17,11 +20,11 @@ fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>) {
     };
     let events = Arc::new(EventBus::new(dir.path().to_string_lossy().to_string()));
     let app = create_router(AppState {
-        workspace: Arc::new(workspace),
+        workspace: Arc::new(mux.clone()),
         cli: Arc::new(cli),
         events: events.clone(),
     });
-    (app, events)
+    (app, events, mux, scope.scope_id)
 }
 
 async fn rpc(app: axum::Router, payload: Value) -> Value {
@@ -40,7 +43,7 @@ async fn rpc(app: axum::Router, payload: Value) -> Value {
 #[tokio::test]
 async fn initialize_and_tools_list_smoke() {
     let dir = tempfile::tempdir().unwrap();
-    let (app, _) = test_app(&dir);
+    let (app, _, _, _) = test_app(&dir);
 
     let init = rpc(
         app.clone(),
@@ -52,11 +55,11 @@ async fn initialize_and_tools_list_smoke() {
         }),
     )
     .await;
-    assert_eq!(init["result"]["serverInfo"]["version"], "0.5.0");
+    assert_eq!(init["result"]["serverInfo"]["version"], "0.6.0");
     assert!(init["result"]["instructions"]
         .as_str()
         .unwrap()
-        .contains("directly responsible for coding"));
+        .contains("scope_id"));
 
     let tools = rpc(
         app,
@@ -68,9 +71,8 @@ async fn initialize_and_tools_list_smoke() {
         }),
     )
     .await;
-    let names: Vec<&str> = tools["result"]["tools"]
-        .as_array()
-        .unwrap()
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
@@ -86,6 +88,14 @@ async fn initialize_and_tools_list_smoke() {
     ] {
         assert!(names.contains(&required), "missing tool: {}", required);
     }
+    for tool in tools {
+        assert!(tool["inputSchema"]["properties"]["scope_id"].is_object());
+        assert!(tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("scope_id")));
+    }
 }
 
 #[tokio::test]
@@ -96,7 +106,7 @@ async fn tools_call_dispatches_search_text_smoke() {
         "fn alpha() {}\nfn important_symbol() {}\n",
     )
     .unwrap();
-    let (app, _) = test_app(&dir);
+    let (app, _, _, scope_id) = test_app(&dir);
 
     let response = rpc(
         app,
@@ -107,6 +117,7 @@ async fn tools_call_dispatches_search_text_smoke() {
             "params": {
                 "name": "search_text",
                 "arguments": {
+                    "scope_id": scope_id,
                     "query": "important_symbol",
                     "path": "."
                 }
@@ -126,7 +137,7 @@ async fn tools_call_dispatches_search_text_smoke() {
 #[tokio::test]
 async fn events_endpoint_is_sse() {
     let dir = tempfile::tempdir().unwrap();
-    let (app, _) = test_app(&dir);
+    let (app, _, _, _) = test_app(&dir);
     let request = Request::builder()
         .method("GET")
         .uri("/events")
@@ -144,10 +155,10 @@ async fn events_endpoint_is_sse() {
 }
 
 #[tokio::test]
-async fn tool_calls_publish_started_and_finished_events() {
+async fn tool_calls_publish_started_and_finished_events_with_scope() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("sample.txt"), "needle\n").unwrap();
-    let (app, events) = test_app(&dir);
+    let (app, events, _, scope_id) = test_app(&dir);
     let mut receiver = events.subscribe();
 
     let response = rpc(
@@ -158,7 +169,7 @@ async fn tool_calls_publish_started_and_finished_events() {
             "method": "tools/call",
             "params": {
                 "name": "search_text",
-                "arguments": {"query": "needle"}
+                "arguments": {"scope_id": scope_id, "query": "needle"}
             }
         }),
     )
@@ -169,21 +180,120 @@ async fn tool_calls_publish_started_and_finished_events() {
     let finished = receiver.recv().await.unwrap();
     assert_eq!(started.kind, "tool_started");
     assert_eq!(started.data["tool"], "search_text");
+    assert_eq!(started.data["scope_id"], scope_id);
     assert_eq!(finished.kind, "tool_finished");
-    assert_eq!(finished.data["tool"], "search_text");
-    assert_eq!(finished.data["success"], true);
+    assert_eq!(finished.data["scope_id"], scope_id);
     assert!(finished.seq > started.seq);
 }
 
 #[tokio::test]
-async fn verification_and_completion_have_specialized_events() {
+async fn tool_calls_require_scope_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _, _, _) = test_app(&dir);
+
+    let response = rpc(
+        app,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": {
+                "name": "read_file",
+                "arguments": {"path": "Cargo.toml"}
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(response["result"]["isError"], true);
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("scope_id is required"));
+}
+
+#[tokio::test]
+async fn two_scopes_access_separate_workspaces_without_global_switch() {
+    let mount = tempfile::tempdir().unwrap();
+    let first = mount.path().join("first");
+    let second = mount.path().join("second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(first.join("only-first.txt"), "first").unwrap();
+    std::fs::write(second.join("only-second.txt"), "second").unwrap();
+
+    let scope_dir = mount.path().join("scopes");
+    let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
+    let scope_a = mux.register(&first, Some("term-a".into())).unwrap();
+    let scope_b = mux.register(&second, Some("term-b".into())).unwrap();
+    let cli = Cli {
+        mount_root: mount.path().to_path_buf(),
+        scope_dir: Some(scope_dir),
+        bind: "127.0.0.1:0".into(),
+        token: None,
+        max_file_bytes: 1024,
+        command_timeout_ms: 5_000,
+    };
+    let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
+    let app = create_router(AppState {
+        workspace: Arc::new(mux),
+        cli: Arc::new(cli),
+        events,
+    });
+
+    let first_read = rpc(
+        app.clone(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "read_file",
+                "arguments": {"scope_id": scope_a.scope_id, "path": "only-first.txt"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(first_read["result"]["isError"], false);
+
+    let second_read = rpc(
+        app.clone(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "tools/call",
+            "params": {
+                "name": "read_file",
+                "arguments": {"scope_id": scope_b.scope_id, "path": "only-second.txt"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(second_read["result"]["isError"], false);
+
+    let crossed = rpc(
+        app,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 102,
+            "method": "tools/call",
+            "params": {
+                "name": "read_file",
+                "arguments": {"scope_id": scope_b.scope_id, "path": "only-first.txt"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(crossed["result"]["isError"], true);
+}
+
+#[tokio::test]
+async fn verification_completion_and_continuation_events_keep_scope() {
     let dir = tempfile::tempdir().unwrap();
     std::process::Command::new("git")
         .args(["init", "-q"])
         .current_dir(dir.path())
         .status()
         .unwrap();
-    let (app, events) = test_app(&dir);
+    let (app, events, _, scope_id) = test_app(&dir);
     let mut receiver = events.subscribe();
 
     rpc(
@@ -194,7 +304,7 @@ async fn verification_and_completion_have_specialized_events() {
             "method": "tools/call",
             "params": {
                 "name": "run_command",
-                "arguments": {"command": "cargo fmt --check"}
+                "arguments": {"scope_id": scope_id, "command": "cargo fmt --check"}
             }
         }),
     )
@@ -209,10 +319,10 @@ async fn verification_and_completion_have_specialized_events() {
         }
     }
     let verification = verification.expect("verification event was not published");
-    assert_eq!(verification.data["command"], "cargo fmt --check");
+    assert_eq!(verification.data["scope_id"], scope_id);
 
     rpc(
-        app,
+        app.clone(),
         json!({
             "jsonrpc": "2.0",
             "id": 6,
@@ -220,6 +330,7 @@ async fn verification_and_completion_have_specialized_events() {
             "params": {
                 "name": "completion_check",
                 "arguments": {
+                    "scope_id": scope_id,
                     "require_task_plan": false,
                     "require_verification": false,
                     "require_changes": false
@@ -238,5 +349,40 @@ async fn verification_and_completion_have_specialized_events() {
         }
     }
     let completion = completion.expect("completion event was not published");
+    assert_eq!(completion.data["scope_id"], scope_id);
     assert_eq!(completion.data["ready"], true);
+
+    rpc(
+        app,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "completion_check",
+                "arguments": {
+                    "scope_id": scope_id,
+                    "require_task_plan": true,
+                    "require_verification": false,
+                    "require_changes": false
+                }
+            }
+        }),
+    )
+    .await;
+
+    let mut continuation = None;
+    for _ in 0..4 {
+        let event = receiver.recv().await.unwrap();
+        if event.kind == "continuation_required" {
+            continuation = Some(event);
+            break;
+        }
+    }
+    let continuation = continuation.expect("continuation event was not published");
+    assert_eq!(continuation.data["scope_id"], scope_id);
+    assert!(continuation.data["prompt"]
+        .as_str()
+        .unwrap()
+        .contains(&scope_id));
 }

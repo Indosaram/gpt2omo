@@ -8,12 +8,16 @@ use std::path::PathBuf;
     about = "Sandboxed local MCP HTTP/SSE daemon for ChatGPT"
 )]
 pub struct Cli {
-    /// Workspace root directory to mount
-    #[arg(long, default_value = ".")]
-    pub workspace: PathBuf,
+    /// Broad filesystem mount root. Individual MCP calls are sandboxed by per-delegation scope.
+    #[arg(long, default_value = "/")]
+    pub mount_root: PathBuf,
+
+    /// Optional directory that stores per-delegation workspace scope leases.
+    #[arg(long)]
+    pub scope_dir: Option<PathBuf>,
 
     /// Bind address for HTTP/SSE server
-    #[arg(long, default_value = "127.0.0.1:8765")]
+    #[arg(long, default_value = "127.0.0.1:18800")]
     pub bind: String,
 
     /// Optional bearer token for authentication
