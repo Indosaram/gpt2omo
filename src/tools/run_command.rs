@@ -300,7 +300,7 @@ mod tests {
         assert!(ok_res.success);
         assert!(ok_res.data.unwrap()["success"].as_bool().unwrap());
 
-        let denied_res = handle_run_command(&ws, "python3 -c \"print('escape', true)\"", 5000);
+        let denied_res = handle_run_command(&ws, "python3 -c \"print('escape', true)\"", 5000, false);
         assert!(!denied_res.success);
         assert!(denied_res
             .error
