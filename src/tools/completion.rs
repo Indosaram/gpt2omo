@@ -232,7 +232,7 @@ mod tests {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_completion_check(&ws, SCOPE, None, None, Some(false));
+        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
         assert!(!result.success);
         assert!(result
             .error
