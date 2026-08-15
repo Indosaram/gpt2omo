@@ -1693,12 +1693,13 @@ mod tests {
         .success);
         assert!(handle_task_update(&ws, &staged[0].scope_id, "T1", "done", None).success);
         record_verification(&ws, &staged[0].scope_id, "cargo test", true, Some(0), 10);
+        std::fs::write(project.join("implemented.txt"), "implemented").unwrap();
         let result = handle_completion_check(
             &ws,
             &staged[0].scope_id,
             None,
             None,
-            Some(false),
+            Some(true),
         );
         assert!(result.success);
         assert_eq!(result.data.unwrap()["ready"], true);
