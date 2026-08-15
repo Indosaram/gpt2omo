@@ -2,7 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::future::join_all;
 use omo_bridge::orca::{
-    close_browser_page, create_chatgpt_tab, send_chatgpt_prompt, verify_chatgpt_page, OrcaConfig,
+    close_browser_page, create_chatgpt_tab, send_chatgpt_prompt, verify_chatgpt_conversation,
+    verify_chatgpt_page, OrcaConfig,
 };
 use omo_bridge::tools::task_state::{
     clear_delegation_lifecycle, load_delegation_lifecycle, record_terminal_evidence,
@@ -683,6 +684,10 @@ async fn stage_resume_delegation(
         .browser_page_id
         .clone()
         .ok_or_else(|| anyhow!("retained scope has no browser_page_id"))?;
+    let conversation_id = scope
+        .browser_conversation_id
+        .clone()
+        .ok_or_else(|| anyhow!("retained scope has no stored ChatGPT conversation identity"))?;
 
     if retained_session_expired(&previous, epoch_ms()) {
         let detail = format!("retained Web session lease expired before resume: {scope_id}");
@@ -707,11 +712,11 @@ async fn stage_resume_delegation(
         });
     }
 
-    if let Err(error) = verify_chatgpt_page(orca, &page).await {
+    if let Err(error) = verify_chatgpt_conversation(orca, &page, &conversation_id).await {
         let lifecycle = start_next_delegation_generation(&workspace, scope_id, false)
             .map_err(anyhow::Error::msg)?;
         let detail = format!(
-            "retained browser_page_id {} is no longer a live chatgpt.com conversation: {}",
+            "retained browser_page_id {} is no longer the expected retained ChatGPT conversation: {}",
             page, error
         );
         let terminal_lifecycle = record_terminal_evidence(
@@ -1142,7 +1147,28 @@ async fn retain_terminal_session(
             }
         }
     };
-    if let Err(error) = verify_chatgpt_page(orca, page).await {
+    let probe = match verify_chatgpt_page(orca, page).await {
+        Ok(probe) => probe,
+        Err(error) => {
+            let _ = release_session_retention(&workspace, &item.scope_id);
+            let _ = mux.remove(&item.scope_id);
+            drop(scope_lock);
+            let close_error = close_browser_page(orca, page).await.err();
+            return SessionDisposition {
+                retained: false,
+                closed: close_error.is_none(),
+                error: Some(match close_error {
+                    Some(close_error) => format!(
+                        "terminal browser page is not retainable: {}; tab close also failed: {}",
+                        error, close_error
+                    ),
+                    None => format!("terminal browser page is not retainable: {}", error),
+                }),
+                ..SessionDisposition::default()
+            };
+        }
+    };
+    if let Err(error) = mux.update_browser_conversation_id(&item.scope_id, &probe.conversation_id) {
         let _ = release_session_retention(&workspace, &item.scope_id);
         let _ = mux.remove(&item.scope_id);
         drop(scope_lock);
@@ -1152,10 +1178,10 @@ async fn retain_terminal_session(
             closed: close_error.is_none(),
             error: Some(match close_error {
                 Some(close_error) => format!(
-                    "terminal browser page is not retainable: {}; tab close also failed: {}",
+                    "failed to persist ChatGPT conversation identity: {}; tab close also failed: {}",
                     error, close_error
                 ),
-                None => format!("terminal browser page is not retainable: {}", error),
+                None => format!("failed to persist ChatGPT conversation identity: {}", error),
             }),
             ..SessionDisposition::default()
         };
@@ -1462,8 +1488,8 @@ mod tests {
     use super::*;
     use omo_bridge::tools::completion::handle_completion_check;
     use omo_bridge::tools::task_state::{
-        handle_task_plan, handle_task_state, handle_task_update, retain_session_with_lease,
-        start_fresh_delegation_lifecycle,
+        handle_task_plan, handle_task_state, handle_task_update, record_verification,
+        retain_session_with_lease, start_fresh_delegation_lifecycle,
     };
     use tempfile::tempdir;
 
@@ -1567,6 +1593,8 @@ mod tests {
         let scope = mux
             .register_browser(&project, "retained-browser-page".into())
             .unwrap();
+        mux.update_browser_conversation_id(&scope.scope_id, "retained-conversation")
+            .unwrap();
         let ws = mux.resolve(&scope.scope_id).unwrap();
         start_fresh_delegation_lifecycle(&ws, &scope.scope_id).unwrap();
         record_terminal_evidence(
@@ -1656,11 +1684,20 @@ mod tests {
         let ws = mux.resolve(&scope.scope_id).unwrap();
         let lifecycle = start_fresh_delegation_lifecycle(&ws, &scope.scope_id).unwrap();
         let staged = vec![staged_for_scope(scope, &lifecycle, false)];
+        assert!(handle_task_plan(
+            &ws,
+            &staged[0].scope_id,
+            "complete smoke",
+            vec!["verify".into()],
+        )
+        .success);
+        assert!(handle_task_update(&ws, &staged[0].scope_id, "T1", "done", None).success);
+        record_verification(&ws, &staged[0].scope_id, "cargo test", true, Some(0), 10);
         let result = handle_completion_check(
             &ws,
             &staged[0].scope_id,
-            Some(false),
-            Some(false),
+            None,
+            None,
             Some(false),
         );
         assert!(result.success);
