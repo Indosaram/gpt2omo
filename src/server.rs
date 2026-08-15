@@ -76,15 +76,18 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn healthz_handler(State(state): State<AppState>) -> impl IntoResponse {
-    Json(serde_json::json!({
+async fn healthz_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse> {
+    verify_auth(&state, &headers)?;
+    Ok(Json(serde_json::json!({
         "status": "ok",
         "service": "omo-bridge",
         "version": "0.7.0",
         "events": "/events",
-        "workspace_mode": "multiplexed_scopes",
-        "mount_root": state.workspace.mount_root().to_string_lossy()
-    }))
+        "workspace_mode": "multiplexed_scopes"
+    })))
 }
 
 async fn mcp_sse_handler(
@@ -386,7 +389,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "run_command",
-            "description": "Run a whitelisted build/test/verification command directly in the workspace without a shell. Enforces the configured timeout and caps captured output. Verification commands are recorded for completion_check.",
+            "description": "Run a whitelisted build/test/verification command directly in the workspace without a shell. Read-only Git inspection is available by default; repository-controlled build/test commands require --allow-host-command-execution and an OS-level sandbox. Enforces the configured timeout and caps captured output.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -729,7 +732,7 @@ fn dispatch_tool(
         }
         "run_command" => {
             let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-            let result = handle_run_command(ws, cmd, cli.command_timeout_ms);
+            let result = handle_run_command(ws, cmd, cli.command_timeout_ms, cli.allow_host_command_execution);
             if result.success {
                 if let Some(data) = result.data.as_ref() {
                     let success = data
