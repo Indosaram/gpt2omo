@@ -107,26 +107,59 @@ async fn events_sse_handler(
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
     verify_auth(&state, &headers)?;
 
-    let receiver = state.events.subscribe();
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let replay = state.events.subscribe_from(last_event_id);
     let hello = state.events.connection_event();
-    let initial = stream::once(async move { Ok(harness_event_to_sse(hello)) });
-    let updates = stream::unfold(receiver, |mut receiver| async move {
-        match receiver.recv().await {
-            Ok(event) => Some((Ok(harness_event_to_sse(event)), receiver)),
-            Err(RecvError::Lagged(missed)) => {
-                let event = Event::default().event("lagged").data(
-                    serde_json::json!({
-                        "kind": "lagged",
-                        "missed": missed,
-                        "message": "SSE subscriber fell behind the event buffer; reconcile with task_state/completion_check"
-                    })
-                    .to_string(),
-                );
-                Some((Ok(event), receiver))
-            }
-            Err(RecvError::Closed) => None,
-        }
+    let gap = replay.missed.map(|(from, to)| {
+        Event::default().event("lagged").data(
+            serde_json::json!({
+                "kind": "lagged",
+                "missed_from": from,
+                "missed_to": to,
+                "message": "SSE replay history was too small; reconcile with task_state/completion_check"
+            })
+            .to_string(),
+        )
     });
+    let replay_through = replay.replayed_through;
+    let replay_events = stream::iter(
+        replay
+            .events
+            .into_iter()
+            .map(|event| Ok(harness_event_to_sse(event))),
+    );
+    let initial = stream::once(async move { Ok(harness_event_to_sse(hello)) })
+        .chain(stream::iter(gap.into_iter().map(Ok)))
+        .chain(replay_events);
+    let updates = stream::unfold(
+        (replay.receiver, replay_through),
+        |(mut receiver, mut last_sent)| async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(event) if event.seq <= last_sent => continue,
+                    Ok(event) => {
+                        last_sent = event.seq;
+                        return Some((Ok(harness_event_to_sse(event)), (receiver, last_sent)));
+                    }
+                    Err(RecvError::Lagged(missed)) => {
+                        let event = Event::default().event("lagged").data(
+                            serde_json::json!({
+                                "kind": "lagged",
+                                "missed": missed,
+                                "message": "SSE subscriber fell behind the event buffer; reconcile with task_state/completion_check"
+                            })
+                            .to_string(),
+                        );
+                        return Some((Ok(event), (receiver, last_sent)));
+                    }
+                    Err(RecvError::Closed) => return None,
+                }
+            }
+        },
+    );
 
     Ok(Sse::new(initial.chain(updates)).keep_alive(
         KeepAlive::new()
@@ -136,10 +169,13 @@ async fn events_sse_handler(
 }
 
 fn harness_event_to_sse(event: HarnessEvent) -> Event {
-    Event::default()
-        .id(event.seq.to_string())
+    let mut sse = Event::default()
         .event(event.kind.clone())
-        .data(serde_json::to_string(&event).unwrap_or_else(|_| "{}".into()))
+        .data(serde_json::to_string(&event).unwrap_or_else(|_| "{}".into()));
+    if event.kind != "connected" {
+        sse = sse.id(event.seq.to_string());
+    }
+    sse
 }
 
 async fn mcp_post_handler(
