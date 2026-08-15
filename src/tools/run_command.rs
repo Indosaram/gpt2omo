@@ -8,7 +8,12 @@ use std::time::{Duration, Instant};
 
 const MAX_CAPTURE_BYTES: usize = 120_000;
 
-pub fn handle_run_command(ws: &Workspace, cmd_str: &str, timeout_ms: u64) -> ToolCallResult {
+pub fn handle_run_command(
+    ws: &Workspace,
+    cmd_str: &str,
+    timeout_ms: u64,
+    allow_host_commands: bool,
+) -> ToolCallResult {
     let parts = match split_command_line(cmd_str) {
         Ok(parts) if !parts.is_empty() => parts,
         Ok(_) => return ToolCallResult::err("Empty command string"),
@@ -26,6 +31,16 @@ pub fn handle_run_command(ws: &Workspace, cmd_str: &str, timeout_ms: u64) -> Too
             "Command '{}' is not in the allowed execution whitelist",
             binary
         ));
+    }
+
+    // Build tools and repository scripts can execute arbitrary host code even without a shell.
+    // Keep only read-only Git inspection available by default; callers must explicitly opt in
+    // after placing the daemon in a real OS-level sandbox.
+    if !allow_host_commands && !is_read_only_git_command(binary, args) {
+        return ToolCallResult::err(
+            "Host command execution is disabled by default; use --allow-host-command-execution only with an OS-level sandbox"
+                .into(),
+        );
     }
 
     if let Err(e) = validate_command_shape(binary, args) {
@@ -92,6 +107,14 @@ pub fn handle_run_command(ws: &Workspace, cmd_str: &str, timeout_ms: u64) -> Too
         "stderr_truncated": stderr_truncated,
         "duration_ms": duration_ms
     }))
+}
+
+fn is_read_only_git_command(binary: &str, args: &[String]) -> bool {
+    binary == "git"
+        && matches!(
+            args.first().map(String::as_str),
+            Some("--version" | "status" | "diff" | "rev-parse" | "log" | "show")
+        )
 }
 
 fn validate_command_shape(binary: &str, args: &[String]) -> std::result::Result<(), String> {
@@ -273,18 +296,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
 
-        let ok_res = handle_run_command(&ws, "git --version", 5000);
+        let ok_res = handle_run_command(&ws, "git --version", 5000, true);
         assert!(ok_res.success);
         assert!(ok_res.data.unwrap()["success"].as_bool().unwrap());
 
-        let denied_res = handle_run_command(&ws, "python3 -c \"print('escape')\"", 5000);
+        let denied_res = handle_run_command(&ws, "python3 -c \"print('escape', true)\"", 5000);
         assert!(!denied_res.success);
         assert!(denied_res
             .error
             .unwrap()
             .contains("not in the allowed execution whitelist"));
 
-        let denied_git = handle_run_command(&ws, "git config --global user.name attacker", 5000);
+        let denied_git = handle_run_command(&ws, "git config --global user.name attacker", 5000, true);
         assert!(!denied_git.success);
         assert!(denied_git.error.unwrap().contains("git subcommand"));
     }
@@ -299,7 +322,7 @@ mod tests {
     fn test_absolute_path_outside_workspace_is_denied() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_run_command(&ws, "git status --git-dir=/tmp/outside", 5000);
+        let result = handle_run_command(&ws, "git status --git-dir=/tmp/outside", 5000, true);
         assert!(!result.success);
         assert!(result
             .error
@@ -311,9 +334,18 @@ mod tests {
     fn test_parent_traversal_inside_option_value_is_denied() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_run_command(&ws, "cargo test --manifest-path=../Cargo.toml", 5000);
+        let result = handle_run_command(&ws, "cargo test --manifest-path=../Cargo.toml", 5000, true);
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Parent-directory traversal"));
+    }
+
+    #[test]
+    fn host_command_execution_is_disabled_by_default() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        let result = handle_run_command(&ws, "make test", 50, false);
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("disabled by default"));
     }
 
     #[test]
@@ -321,7 +353,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         fs::write(dir.path().join("Makefile"), "test:\n\t@sleep 1\n").unwrap();
-        let result = handle_run_command(&ws, "make test", 50);
+        let result = handle_run_command(&ws, "make test", 50, true);
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["timed_out"], true);
