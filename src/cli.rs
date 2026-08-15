@@ -24,6 +24,11 @@ pub struct Cli {
     #[arg(long, env = "OMO_BRIDGE_TOKEN")]
     pub token: Option<String>,
 
+    /// Allow repository-controlled build/test commands to execute with host privileges.
+    /// Keep disabled unless the daemon is already inside an OS-level sandbox.
+    #[arg(long, env = "OMO_BRIDGE_ALLOW_HOST_COMMAND_EXECUTION", default_value_t = false)]
+    pub allow_host_command_execution: bool,
+
     /// Maximum file read size in bytes (default 10MB)
     #[arg(long, default_value_t = 10 * 1024 * 1024)]
     pub max_file_bytes: usize,
