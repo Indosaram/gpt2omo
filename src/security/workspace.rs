@@ -79,6 +79,8 @@ pub struct WorkspaceScope {
     pub terminal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_page_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_conversation_id: Option<String>,
     pub created_ms: u64,
     pub updated_ms: u64,
 }
@@ -162,6 +164,7 @@ impl WorkspaceMux {
             workspace: workspace.root().to_string_lossy().to_string(),
             terminal,
             browser_page_id,
+            browser_conversation_id: None,
             created_ms: now,
             updated_ms: now,
         };
@@ -229,6 +232,34 @@ impl WorkspaceMux {
     pub fn update_terminal(&self, scope_id: &str, terminal: &str) -> Result<WorkspaceScope> {
         let mut scope = self.lookup(scope_id)?;
         scope.terminal = Some(terminal.to_string());
+        scope.updated_ms = now_ms();
+        self.persist(&scope)?;
+        Ok(scope)
+    }
+
+    pub fn update_browser_conversation_id(
+        &self,
+        scope_id: &str,
+        conversation_id: &str,
+    ) -> Result<WorkspaceScope> {
+        let conversation_id = conversation_id.trim();
+        if conversation_id.is_empty()
+            || conversation_id.len() > 256
+            || conversation_id
+                .chars()
+                .any(|ch| ch == '/' || ch == '?' || ch == '#')
+        {
+            return Err(BridgeError::Security(
+                "Invalid ChatGPT conversation id".into(),
+            ));
+        }
+        let mut scope = self.lookup(scope_id)?;
+        if scope.browser_page_id.is_none() {
+            return Err(BridgeError::Security(
+                "Cannot bind a conversation id to a non-browser scope".into(),
+            ));
+        }
+        scope.browser_conversation_id = Some(conversation_id.to_string());
         scope.updated_ms = now_ms();
         self.persist(&scope)?;
         Ok(scope)
@@ -383,6 +414,16 @@ mod tests {
         assert_eq!(
             mux.lookup(&b.scope_id).unwrap().browser_page_id.as_deref(),
             Some("page-b")
+        );
+        assert!(mux
+            .update_browser_conversation_id(&b.scope_id, "conversation-b")
+            .is_ok());
+        assert_eq!(
+            mux.lookup(&b.scope_id)
+                .unwrap()
+                .browser_conversation_id
+                .as_deref(),
+            Some("conversation-b")
         );
     }
 
