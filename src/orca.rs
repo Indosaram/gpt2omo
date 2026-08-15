@@ -30,6 +30,7 @@ pub struct ChatgptPageProbe {
     pub url: String,
     pub title: String,
     pub generating: bool,
+    pub conversation_id: String,
 }
 
 pub async fn create_chatgpt_tab(config: &OrcaConfig) -> Result<String> {
@@ -79,6 +80,22 @@ pub async fn verify_chatgpt_page(config: &OrcaConfig, page: &str) -> Result<Chat
 }))()"#;
     let value = eval_json(config, page, expression).await?;
     validate_chatgpt_page_probe(&value)
+}
+
+pub async fn verify_chatgpt_conversation(
+    config: &OrcaConfig,
+    page: &str,
+    expected_conversation_id: &str,
+) -> Result<ChatgptPageProbe> {
+    let probe = verify_chatgpt_page(config, page).await?;
+    if probe.conversation_id != expected_conversation_id {
+        return Err(anyhow!(
+            "browser page is bound to conversation {}, expected {}",
+            probe.conversation_id,
+            expected_conversation_id
+        ));
+    }
+    Ok(probe)
 }
 
 pub async fn send_chatgpt_prompt(config: &OrcaConfig, page: &str, prompt: &str) -> Result<()> {
@@ -173,6 +190,25 @@ fn validate_chatgpt_page_probe(value: &Value) -> Result<ChatgptPageProbe> {
             "stored browser page is no longer the expected chatgpt.com conversation: {url}"
         ));
     }
+    let mut segments = parsed
+        .path_segments()
+        .ok_or_else(|| anyhow!("ChatGPT conversation URL has no path: {url}"))?
+        .filter(|segment| !segment.is_empty());
+    if segments.next() != Some("c") {
+        return Err(anyhow!(
+            "stored browser page is not a concrete ChatGPT conversation URL: {url}"
+        ));
+    }
+    let conversation_id = segments
+        .next()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow!("ChatGPT conversation URL has no conversation id: {url}"))?
+        .to_string();
+    if segments.next().is_some() {
+        return Err(anyhow!(
+            "stored browser page has an unexpected ChatGPT conversation path: {url}"
+        ));
+    }
     Ok(ChatgptPageProbe {
         url: url.to_string(),
         title: value
@@ -184,6 +220,7 @@ fn validate_chatgpt_page_probe(value: &Value) -> Result<ChatgptPageProbe> {
             .get("generating")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        conversation_id,
     })
 }
 
@@ -436,6 +473,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(probe.url, "https://chatgpt.com/c/abc123");
+        assert_eq!(probe.conversation_id, "abc123");
         assert!(!probe.generating);
     }
 
@@ -444,6 +482,12 @@ mod tests {
         assert!(validate_chatgpt_page_probe(&serde_json::json!({
             "ready": false,
             "url": "https://chatgpt.com/c/abc123"
+        }))
+        .is_err());
+        assert!(validate_chatgpt_page_probe(&serde_json::json!({
+            "ready": true,
+            "url": "https://chatgpt.com/",
+            "title": "ChatGPT"
         }))
         .is_err());
         assert!(validate_chatgpt_page_probe(&serde_json::json!({
