@@ -4,6 +4,7 @@ use omo_bridge::orca::{resolve_terminal, send_prompt, OrcaConfig};
 use omo_bridge::{default_scope_dir, WorkspaceMux};
 use reqwest::header::AUTHORIZATION;
 use serde_json::Value;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -18,8 +19,12 @@ use url::Url;
 )]
 struct Cli {
     /// Task text to send to ChatGPT Web. Multiple trailing words are joined with spaces.
-    #[arg(value_name = "TASK", required = true)]
+    #[arg(value_name = "TASK", required_unless_present = "stdin")]
     task: Vec<String>,
+
+    /// Read the complete task text from stdin. Used by the OpenCode /delegate-web command.
+    #[arg(long, conflicts_with = "task")]
+    stdin: bool,
 
     /// Override automatic workspace discovery. By default the Git worktree root is used,
     /// falling back to the current directory when not inside a Git repository.
@@ -66,7 +71,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let task = cli.task.join(" ").trim().to_string();
+    let task = read_task(&cli)?;
     if task.is_empty() {
         return Err(anyhow!("task cannot be empty"));
     }
@@ -130,6 +135,27 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn read_task(cli: &Cli) -> Result<String> {
+    let task = if cli.stdin {
+        let mut input = String::new();
+        std::io::stdin()
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut input)
+            .context("failed to read delegated task from stdin")?;
+        if input.len() > 1024 * 1024 {
+            return Err(anyhow!("delegated task from stdin exceeds 1 MiB"));
+        }
+        input
+    } else {
+        cli.task.join(" ")
+    };
+    let task = task.trim().to_string();
+    if task.is_empty() {
+        return Err(anyhow!("task cannot be empty"));
+    }
+    Ok(task)
 }
 
 fn discover_workspace(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -283,7 +309,7 @@ mod tests {
     fn rejects_non_multiplexed_bridge_health_shape() {
         let old = serde_json::json!({
             "service": "omo-bridge",
-            "version": "0.6.0",
+            "version": "0.6.1",
             "workspace_mode": "dynamic_active_scope"
         });
         let error = validate_bridge_health(&old, "http://127.0.0.1:18800").unwrap_err();
@@ -294,7 +320,7 @@ mod tests {
     fn accepts_multiplexed_bridge_health_shape() {
         let current = serde_json::json!({
             "service": "omo-bridge",
-            "version": "0.6.0",
+            "version": "0.6.1",
             "workspace_mode": "multiplexed_scopes"
         });
         validate_bridge_health(&current, "http://127.0.0.1:18800").unwrap();

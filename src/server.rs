@@ -80,7 +80,7 @@ async fn healthz_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "service": "omo-bridge",
-        "version": "0.6.0",
+        "version": "0.6.1",
         "events": "/events",
         "workspace_mode": "multiplexed_scopes",
         "mount_root": state.workspace.mount_root().to_string_lossy()
@@ -258,7 +258,7 @@ fn initialize_result() -> Value {
         },
         "serverInfo": {
             "name": "omo-bridge",
-            "version": "0.6.0"
+            "version": "0.6.1"
         },
         "instructions": CODING_AGENT_INSTRUCTIONS
     })
@@ -801,7 +801,7 @@ mod tests {
         let instructions = init["instructions"].as_str().unwrap();
         assert!(instructions.contains("directly responsible for coding"));
         assert!(instructions.contains("completion_check"));
-        assert_eq!(init["serverInfo"]["version"], "0.6.0");
+        assert_eq!(init["serverInfo"]["version"], "0.6.1");
     }
 
     #[test]
