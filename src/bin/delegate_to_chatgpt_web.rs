@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Instant};
 use url::Url;
 
-const MAX_PARALLEL_WEB_WORKERS: usize = 3;
+const MAX_PARALLEL_WEB_WORKERS: usize = 2;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const READINESS_TIMEOUT: Duration = Duration::from_secs(180);
 const READINESS_RETRY_AFTER: Duration = Duration::from_secs(45);
@@ -36,7 +36,7 @@ const DEFAULT_SESSION_TTL_MINUTES: u64 = 120;
 #[command(
     name = "delegate_to_chatgpt_web",
     version,
-    about = "Create, retain, resume, or close up to three isolated ChatGPT Web coding delegations through omo-bridge",
+    about = "Create, retain, resume, or close up to two isolated ChatGPT Web coding delegations through omo-bridge",
     trailing_var_arg = true
 )]
 struct Cli {
@@ -91,19 +91,19 @@ struct Cli {
     workspace: Option<PathBuf>,
 
     /// Broad mount root used by the running bridge daemon.
-    #[arg(long, default_value = "/")]
+    #[arg(long, env = "OMO_MOUNT_ROOT", default_value = "/")]
     mount_root: PathBuf,
 
     /// omo-bridge base URL.
-    #[arg(long, default_value = "http://127.0.0.1:18800")]
+    #[arg(long, env = "OMO_BRIDGE_URL", default_value = "http://127.0.0.1:18800")]
     bridge_url: String,
 
     /// Override the shared directory that stores per-delegation workspace scopes.
-    #[arg(long)]
+    #[arg(long, env = "OMO_SCOPE_DIR")]
     scope_dir: Option<PathBuf>,
 
     /// Orca worktree selector used for browser tabs.
-    #[arg(long, default_value = "active")]
+    #[arg(long, env = "OMO_ORCA_WORKTREE", default_value = "active")]
     worktree: String,
 
     /// Legacy terminal selector retained for compatibility. Browser-scoped delegations do not use it.
@@ -111,7 +111,7 @@ struct Cli {
     terminal: Option<String>,
 
     /// Orca CLI executable.
-    #[arg(long, default_value = "orca")]
+    #[arg(long, env = "OMO_ORCA_BIN", default_value = "orca")]
     orca_bin: String,
 
     /// Optional bearer token used by omo-bridge.
@@ -1577,10 +1577,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_more_than_three_parallel_tasks() {
-        assert!(validate_parallel_count(3).is_ok());
-        let error = validate_parallel_count(4).unwrap_err().to_string();
-        assert!(error.contains("limited to 3 workers"));
+    fn rejects_more_than_two_parallel_tasks() {
+        assert!(validate_parallel_count(2).is_ok());
+        let error = validate_parallel_count(3).unwrap_err().to_string();
+        assert!(error.contains("limited to 2 workers"));
     }
 
     #[test]
@@ -1818,10 +1818,10 @@ mod tests {
     }
 
     #[test]
-    fn cli_fixture_preserves_three_worker_cap_and_resume_is_single_scope() {
+    fn cli_fixture_preserves_two_worker_cap_and_resume_is_single_scope() {
         let cli = cli_for_test();
         assert!(!cli.batch_stdin);
         assert!(cli.resume_scope.is_none());
-        assert_eq!(MAX_PARALLEL_WEB_WORKERS, 3);
+        assert_eq!(MAX_PARALLEL_WEB_WORKERS, 2);
     }
 }
