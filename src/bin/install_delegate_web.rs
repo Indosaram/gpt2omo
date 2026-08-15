@@ -195,31 +195,28 @@ fn render_coordinator_prompt(delegate_bin: &Path) -> String {
 USER TASK:
 $ARGUMENTS
 
-Do not implement, edit, test, research, or debug the user's coding task yourself. Do not call Task/background/subagent/team tools and do not dispatch Anthropic, OMO, OpenCode, Codex, or other coding agents. Your only job is to decide how many independent ChatGPT Web workers the task merits and dispatch them through the helper below.
+Do not implement, edit, test, research, or debug the user's coding task yourself. Do not call Task/background/subagent/team tools and do not dispatch Anthropic, OMO, OpenCode, Codex, or other coding agents. Your only job is to decide whether this is a fresh Web delegation, a follow-up in a retained Web session, or a retained-session close request, then invoke the helper exactly once.
 
-## Fan-out policy — hard maximum 3
+## Fresh fan-out policy — hard maximum 3
 
-Choose exactly 1, 2, or 3 workers.
+Choose exactly 1, 2, or 3 workers for a fresh delegation.
 
 - Default to **1 worker**. Use one when the task is tightly coupled, mostly sequential, touches the same core files/state, or parallelism would create coordination risk.
 - Use **2 workers** only when there are two genuinely independent implementation tracks with clear ownership boundaries.
-- Use **3 workers** only when there are three genuinely independent tracks (for example separate backend / native UI / web UI modules) that can make useful progress concurrently.
+- Use **3 workers** only when there are three genuinely independent tracks.
 - Never create a fourth worker. The helper independently rejects manifests containing more than 3 tasks.
 - Do not split merely to increase parallelism. Each worker task must be independently actionable and contain enough original acceptance criteria to finish its assigned slice.
-- OMO owns repository/worktree selection. If the current worktree is correct, omit `workspace` from a task and the helper uses the current git root. If OMO has already selected different worktrees/repos for different tracks, put those exact absolute paths in each task's `workspace` field. Do not create or switch worktrees as part of this command.
-- Same physical repository may be assigned to multiple workers when OMO judges the tracks safe to run concurrently. File/index conflicts are OMO's orchestration responsibility, not omo-bridge's.
+- OMO owns repository/worktree selection. For fresh tasks, omit `workspace` when the current worktree is correct; otherwise use the exact OMO-selected absolute workspace path. The bridge never creates or switches worktrees.
 
-## Dispatch
+## Fresh dispatch
 
-Construct one valid JSON manifest with **1–3** entries. Each entry is:
+Construct one JSON manifest with **1–3** entries:
 
 ```json
 {{"label":"short-label","task":"complete worker instruction","workspace":"/optional/absolute/path"}}
 ```
 
-`workspace` is optional. Preserve concrete file names, requirements, verification commands, and constraints from USER TASK inside the appropriate worker instruction. Do not invent unrelated work.
-
-Invoke the helper **exactly once** by piping that JSON manifest on stdin:
+Invoke the helper exactly once:
 
 ```bash
 cat <<'__OMO_DELEGATE_WEB_BATCH__' | {bin} --batch-stdin --json
@@ -227,13 +224,43 @@ cat <<'__OMO_DELEGATE_WEB_BATCH__' | {bin} --batch-stdin --json
 __OMO_DELEGATE_WEB_BATCH__
 ```
 
-Do not invoke the helper once per worker. The helper creates one fresh ChatGPT Web tab and independent omo-bridge scope per task, but sends only a readiness bootstrap first. Each worker must successfully call MCP `task_state` for its own scope; the helper trusts only server-side readiness evidence. The actual task prompts are dispatched only after every 1–3 worker is freshly READY. If any worker is unready, stale, or times out, the helper sends zero actual task prompts and cleans up the staged tabs/scopes.
+By default terminal workers are closed and their scopes are unregistered. If the user explicitly wants this exact ChatGPT Web conversation available for later follow-up, add `--keep-session` to the same fresh helper invocation. Do not add it merely by default.
 
-After actual dispatch, the helper stays in the foreground until every worker has an authoritative terminal state. `COMPLETED` comes only from `completion_check.ready=true`; `BLOCKED` comes from the existing task-state/task-update path; transport/control-plane failures are reported as `FAILED` or `LOST`. Worker text that says READY, done, blocked, or failed is never authoritative.
+## Resume an existing retained Web conversation
 
-When helper JSON has `"terminal":true`, it is a completed batch result and you must report `parallel_count` plus each delegation's `label`, `scope_id`, `workspace`, `browser_page_id`, `actual_task_sent`, `terminal_state`, and `terminal_detail` when present. `"ok":true` means every worker reached `COMPLETED`. `"ok":false` with `"terminal":true` is still a valid terminal batch result and must be reported as `BLOCKED`, `FAILED`, or `LOST` rather than treated as a transport failure. Do not continue coding locally.
+When the user explicitly asks to continue/follow up in a prior Web session and a prior helper result in context has `session_retained:true` / `resumable:true`, reuse that exact `scope_id`. Do not create a fresh tab, do not pass `--workspace`, and do not invent or substitute a scope id.
 
-If the helper process itself fails before returning a terminal batch result, report the exact failure and stop. Never fall back to OMO/Anthropic subagents."#,
+Invoke exactly once:
+
+```bash
+cat <<'__OMO_DELEGATE_WEB_RESUME__' | {bin} --resume-scope '<exact-scope-id>' --stdin --json
+<complete follow-up task>
+__OMO_DELEGATE_WEB_RESUME__
+```
+
+Add `--keep-session` to the resume invocation only if the user wants the same conversation retained again after this follow-up. The helper verifies that the stored `browser_page_id` is still the exact live `https://chatgpt.com` page before incrementing the internal lifecycle generation. A missing/dead/wrong page becomes authoritative `LOST`; the helper never silently opens a replacement conversation.
+
+A previously `COMPLETED` retained session may create a new task plan for the follow-up. A previously `BLOCKED` retained session reopens only blocked items as `in_progress` while preserving blocker notes, so the same plan can continue.
+
+## Close a retained session
+
+If the user asks to discard/close a previously retained Web session, invoke:
+
+```bash
+{bin} --close-scope '<exact-scope-id>' --json
+```
+
+This closes the stored tab and unregisters the scope. Do not send a coding task in the same invocation.
+
+## Authoritative lifecycle
+
+Fresh and resumed generations both send a bootstrap-only prompt first. Each worker must successfully call scoped MCP `task_state`; the helper trusts only lifecycle evidence for the current generation. Actual task prompts are sent only after readiness succeeds. Any stale/unready worker makes fresh fan-out fail closed with zero actual task dispatches.
+
+After actual dispatch, the helper remains foreground until every worker has a terminal state. `COMPLETED` comes only from `completion_check.ready=true`; `BLOCKED` comes from task state/update evidence; transport/control-plane failures are `FAILED` or `LOST`. Textual READY/done/blocked/failed claims are never authoritative.
+
+When helper JSON has `"terminal":true`, report each delegation's `scope_id`, `browser_page_id`, `generation`, `terminal_state`, `terminal_detail`, `session_retained`, `session_closed`, and `resumable`. `"ok":false` with `"terminal":true` is still an authoritative terminal batch result, not a reason to fall back to another coding agent.
+
+If the helper process itself fails before returning a terminal result, report the exact failure and stop. Never fall back to OMO/Anthropic subagents."#,
         bin = bin,
     )
 }
@@ -242,7 +269,7 @@ fn render_skill(delegate_bin: &Path) -> String {
     format!(
         r#"---
 name: delegate-web
-description: Use when delegating coding work to ChatGPT Web. Splits a request into at most three independent Web workers, never OMO/Anthropic subagents, and preserves OMO ownership of repo/worktree selection.
+description: Use when delegating coding work to ChatGPT Web, retaining a completed Web conversation for follow-up, resuming an exact retained scope, or closing a retained Web session. Never uses OMO/Anthropic subagents and preserves OMO ownership of repo/worktree selection.
 compatibility: Requires omo-bridge, omo-relay, Orca browser access, and delegate_to_chatgpt_web.
 metadata:
   opencode/slash: "false"
@@ -252,18 +279,19 @@ metadata:
 
 `/delegate-web` is a transport/orchestration surface, not a local coding workflow.
 
-- The coordinator may inspect the user request only enough to choose **1–3** independent Web tasks.
-- Hard maximum: **3 parallel ChatGPT Web workers**. Default to one; split only across genuinely independent tracks.
-- Never use OMO Task/background/subagent/team dispatch as a substitute or fallback.
-- OMO decides which repository/worktree each task uses. The bridge never creates or chooses worktrees.
-- Invoke `{bin} --batch-stdin --json` exactly once with a JSON manifest containing 1–3 tasks.
-- The helper creates one fresh ChatGPT Web conversation and independent omo-bridge scope per task, sends a bootstrap-only prompt first, and accepts readiness only from a successful scoped MCP `task_state` call recorded server-side.
-- Actual task prompts are sent concurrently only after every worker is freshly READY; any unready/stale/timeout worker makes the whole batch fail closed with zero actual task dispatches and staged tab/scope cleanup.
-- After task dispatch the helper remains attached until all workers are terminal: authoritative `COMPLETED` requires `completion_check.ready=true`, while `BLOCKED`, `FAILED`, and `LOST` are also terminal and are returned to OMO immediately when the batch is fully decided.
-- `omo-relay` routes each scope's continuation directly back to its stored `browser_page_id`; ChatGPT generation/idle gating remains in the Orca send path.
-- Never trust textual READY/completion/blocker claims as lifecycle evidence.
-- More than three tasks must be merged into at most three coherent tracks before dispatch; never queue a fourth Web worker.
-- A helper process error before a terminal batch result is a transport failure; a returned `terminal=true` batch with `ok=false` is an authoritative BLOCKED/FAILED/LOST result, not a reason to fall back to another coding agent.
+- Fresh work supports **1–3 parallel ChatGPT Web workers**; four or more are hard-rejected.
+- Fresh terminal sessions close by default. Use `{bin} --batch-stdin --json --keep-session` only when the user wants those exact conversations resumable later.
+- A retained helper result exposes `scope_id`, `browser_page_id`, `generation`, `session_retained:true`, and `resumable:true`.
+- Resume exactly one retained session with `{bin} --resume-scope '<scope-id>' --stdin --json`; never pass `--workspace` and never open a replacement tab.
+- Add `--keep-session` to a resume only when the user wants it retained again after the follow-up; otherwise the resumed session closes at its new terminal state.
+- Close a retained session explicitly with `{bin} --close-scope '<scope-id>' --json`.
+- Before resume, the helper verifies the stored `browser_page_id` is still a live `https://chatgpt.com` page. Dead/missing/wrong pages become `LOST` and are not silently replaced.
+- Resume increments an internal lifecycle generation. A prior `COMPLETED` plan may be replaced by a new follow-up plan; prior `BLOCKED` items are reopened as `in_progress` with notes preserved.
+- Fresh and resumed generations use bootstrap-only readiness and accept readiness only from successful scoped MCP `task_state` evidence for the current generation.
+- Authoritative `COMPLETED` requires `completion_check.ready=true`; `BLOCKED`, `FAILED`, and `LOST` are terminal too. Never trust textual lifecycle claims.
+- `omo-relay` keeps continuation routing bound to the exact stored `browser_page_id`; Orca generation/idle gating remains in the send path.
+- OMO decides repository/worktree selection for fresh work. The bridge never creates or chooses worktrees.
+- A returned `terminal=true` / `ok=false` result is authoritative, not a reason to fall back to another coding agent.
 "#,
         bin = delegate_bin.display(),
     )
@@ -329,14 +357,23 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_documents_keep_resume_and_close_session_modes() {
+        let prompt = render_coordinator_prompt(Path::new("/tmp/delegate_to_chatgpt_web"));
+        assert!(prompt.contains("--keep-session"));
+        assert!(prompt.contains("--resume-scope '<exact-scope-id>'"));
+        assert!(prompt.contains("--close-scope '<exact-scope-id>'"));
+        assert!(prompt.contains("session_retained:true"));
+        assert!(prompt.contains("never silently opens a replacement conversation"));
+        assert!(prompt.contains("internal lifecycle generation"));
+    }
+
+    #[test]
     fn coordinator_documents_authoritative_readiness_and_terminal_results() {
         let prompt = render_coordinator_prompt(Path::new("/tmp/delegate_to_chatgpt_web"));
-        assert!(prompt.contains("sends only a readiness bootstrap first"));
-        assert!(prompt.contains("successfully call MCP `task_state`"));
-        assert!(prompt.contains("zero actual task prompts"));
+        assert!(prompt.contains("bootstrap-only prompt first"));
+        assert!(prompt.contains("scoped MCP `task_state`"));
         assert!(prompt.contains("`completion_check.ready=true`"));
         assert!(prompt.contains("`\"terminal\":true`"));
-        assert!(prompt.contains("`\"ok\":false` with `\"terminal\":true`"));
     }
 
     #[test]
@@ -354,14 +391,15 @@ mod tests {
     }
 
     #[test]
-    fn skill_documents_parallel_limit_and_worktree_ownership() {
+    fn skill_documents_retained_session_lifecycle() {
         let skill = render_skill(Path::new("/tmp/delegate_to_chatgpt_web"));
         assert!(skill.contains("name: delegate-web"));
-        assert!(skill.contains("Hard maximum: **3 parallel ChatGPT Web workers**"));
-        assert!(skill.contains("OMO decides which repository/worktree"));
-        assert!(skill.contains("successful scoped MCP `task_state`"));
-        assert!(skill.contains("authoritative `COMPLETED`"));
-        assert!(skill.contains("stored `browser_page_id`"));
+        assert!(skill.contains("**1–3 parallel ChatGPT Web workers**"));
+        assert!(skill.contains("--keep-session"));
+        assert!(skill.contains("--resume-scope '<scope-id>'"));
+        assert!(skill.contains("--close-scope '<scope-id>'"));
+        assert!(skill.contains("browser_page_id"));
+        assert!(skill.contains("lifecycle generation"));
         assert!(skill.contains("opencode/slash: \"false\""));
     }
 

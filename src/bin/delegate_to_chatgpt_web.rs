@@ -1,12 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::future::join_all;
-use omo_bridge::orca::{close_browser_page, create_chatgpt_tab, send_chatgpt_prompt, OrcaConfig};
+use omo_bridge::orca::{
+    close_browser_page, create_chatgpt_tab, send_chatgpt_prompt, verify_chatgpt_page, OrcaConfig,
+};
 use omo_bridge::tools::task_state::{
-    clear_delegation_lifecycle, load_delegation_lifecycle, record_terminal_evidence,
+    clear_delegation_lifecycle, load_delegation_lifecycle, mark_session_retained,
+    record_terminal_evidence, start_fresh_delegation_lifecycle, start_next_delegation_generation,
     DelegationLifecycle, DelegationTerminalState,
 };
-use omo_bridge::{default_scope_dir, WorkspaceMux};
+use omo_bridge::{default_scope_dir, Workspace, WorkspaceMux, WorkspaceScope};
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use serde_json::Value;
@@ -28,7 +31,7 @@ const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[command(
     name = "delegate_to_chatgpt_web",
     version,
-    about = "Create up to three isolated ChatGPT Web coding delegations through omo-bridge",
+    about = "Create, retain, or resume up to three isolated ChatGPT Web coding delegations through omo-bridge",
     trailing_var_arg = true
 )]
 struct Cli {
@@ -44,8 +47,20 @@ struct Cli {
     #[arg(long, conflicts_with = "stdin")]
     batch_stdin: bool,
 
-    /// Override automatic workspace discovery for a single task, or provide the default workspace
-    /// for batch items that do not specify one. OMO remains responsible for worktree selection.
+    /// Resume one retained delegation in its exact existing ChatGPT Web conversation.
+    #[arg(long, conflicts_with = "batch_stdin")]
+    resume_scope: Option<String>,
+
+    /// Close and unregister one previously retained delegation scope without sending a task.
+    #[arg(long, conflicts_with_all = ["resume_scope", "batch_stdin", "stdin", "keep_session"])]
+    close_scope: Option<String>,
+
+    /// Keep terminal ChatGPT Web tabs/scopes resumable instead of closing them after this task.
+    #[arg(long)]
+    keep_session: bool,
+
+    /// Override automatic workspace discovery for a fresh task, or provide the default workspace
+    /// for fresh batch items that do not specify one. Resume always trusts the stored scope workspace.
     #[arg(long, env = "OMO_WORKSPACE")]
     workspace: Option<PathBuf>,
 
@@ -77,7 +92,7 @@ struct Cli {
     #[arg(long, env = "OMO_BRIDGE_TOKEN")]
     token: Option<String>,
 
-    /// Validate workspaces and create scopes, but do not create ChatGPT tabs or send prompts.
+    /// Validate fresh workspaces/create scopes, but do not create/send browser prompts.
     #[arg(long)]
     dry_run: bool,
 
@@ -113,7 +128,9 @@ struct StagedDelegation {
     workspace: String,
     label: Option<String>,
     browser_page_id: Option<String>,
-    created_ms: u64,
+    generation: u64,
+    generation_started_ms: u64,
+    resumed: bool,
     bootstrap_prompt: Option<String>,
     task_prompt: Option<String>,
 }
@@ -125,18 +142,35 @@ struct TerminalObservation {
     terminal_ms: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SessionDisposition {
+    retained: bool,
+    closed: bool,
+    error: Option<String>,
+}
+
 #[derive(Default)]
 struct BatchOutcome {
     readiness_complete: bool,
     terminal_complete: bool,
     actual_sent: Vec<bool>,
     terminal: Vec<TerminalObservation>,
+    sessions: Vec<SessionDisposition>,
+}
+
+enum ResumeStage {
+    Ready(StagedDelegation),
+    Lost {
+        staged: StagedDelegation,
+        terminal: TerminalObservation,
+        session: SessionDisposition,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let tasks = prepare_tasks(&cli)?;
+    validate_control_mode(&cli)?;
 
     let bridge_url = cli.bridge_url.trim_end_matches('/');
     let client = reqwest::Client::builder()
@@ -157,10 +191,57 @@ async fn main() -> Result<()> {
         cli.orca_bin.clone(),
     );
 
-    let staged = if cli.dry_run {
-        stage_dry_run(&mux, &tasks)?
+    if let Some(scope_id) = cli.close_scope.as_deref() {
+        let value = close_retained_scope(&mux, &orca, scope_id).await?;
+        if cli.json {
+            println!("{}", serde_json::to_string(&value)?);
+        } else {
+            println!(
+                "Closed retained Web scope {} page={}",
+                scope_id,
+                value["browser_page_id"].as_str().unwrap_or("<missing>")
+            );
+        }
+        return Ok(());
+    }
+
+    let staged = if let Some(scope_id) = cli.resume_scope.as_deref() {
+        if cli.dry_run {
+            return Err(anyhow!(
+                "--dry-run is not supported with --resume-scope because resume requires authoritative browser-page liveness verification"
+            ));
+        }
+        let task = prepare_resume_task(&cli)?;
+        match stage_resume_delegation(&mux, &orca, scope_id, &task).await? {
+            ResumeStage::Ready(item) => vec![item],
+            ResumeStage::Lost {
+                staged,
+                terminal,
+                session,
+            } => {
+                emit_result(
+                    &cli,
+                    &scope_dir,
+                    bridge_url,
+                    &[staged],
+                    BatchOutcome {
+                        readiness_complete: false,
+                        terminal_complete: true,
+                        actual_sent: vec![false],
+                        terminal: vec![terminal],
+                        sessions: vec![session],
+                    },
+                )?;
+                return Ok(());
+            }
+        }
     } else {
-        stage_browser_delegations(&mux, &orca, &tasks).await?
+        let tasks = prepare_tasks(&cli)?;
+        if cli.dry_run {
+            stage_dry_run(&mux, &tasks)?
+        } else {
+            stage_browser_delegations(&mux, &orca, &tasks).await?
+        }
     };
 
     if cli.dry_run {
@@ -175,31 +256,31 @@ async fn main() -> Result<()> {
     }
 
     if let Err(error) = dispatch_bootstrap(&orca, &staged).await {
-        cleanup_staged(&mux, &orca, &staged).await;
+        cleanup_unstarted_staged(&mux, &orca, &staged).await;
         return Err(error.context(
-            "readiness bootstrap failed; actual task dispatch count is 0 and all staged tabs/scopes were cleaned up",
+            "readiness bootstrap failed; actual task dispatch count is 0 and all newly staged tabs/scopes were cleaned up",
         ));
     }
 
     if let Err(error) = wait_for_all_ready(&mux, &staged, READINESS_TIMEOUT).await {
-        cleanup_staged(&mux, &orca, &staged).await;
+        cleanup_unstarted_staged(&mux, &orca, &staged).await;
         return Err(error.context(
-            "authoritative readiness handshake failed closed; actual task dispatch count is 0 and all staged tabs/scopes were cleaned up",
+            "authoritative readiness handshake failed closed; actual task dispatch count is 0 and all newly staged tabs/scopes were cleaned up",
         ));
     }
 
     let actual_sent = match dispatch_actual_tasks(&mux, &orca, &staged).await {
         Ok(sent) => sent,
         Err(error) => {
-            cleanup_staged(&mux, &orca, &staged).await;
+            cleanup_unstarted_staged(&mux, &orca, &staged).await;
             return Err(error.context(
-                "readiness became invalid before dispatch; actual task dispatch count is 0 and all staged tabs/scopes were cleaned up",
+                "readiness became invalid before dispatch; actual task dispatch count is 0 and all newly staged tabs/scopes were cleaned up",
             ));
         }
     };
 
     let terminal = wait_for_terminal_states(&mux, &staged, TERMINAL_TIMEOUT).await;
-    cleanup_browser_pages(&orca, &staged).await;
+    let sessions = finalize_terminal_sessions(&mux, &orca, &staged, cli.keep_session).await;
 
     emit_result(
         &cli,
@@ -211,8 +292,36 @@ async fn main() -> Result<()> {
             terminal_complete: true,
             actual_sent,
             terminal,
+            sessions,
         },
     )?;
+    Ok(())
+}
+
+fn validate_control_mode(cli: &Cli) -> Result<()> {
+    if cli.close_scope.is_some()
+        && (!cli.task.is_empty()
+            || cli.batch_stdin
+            || cli.stdin
+            || cli.workspace.is_some()
+            || cli.dry_run)
+    {
+        return Err(anyhow!(
+                "--close-scope cannot be combined with a task, stdin/batch input, --workspace, or --dry-run"
+            ));
+    }
+    if cli.resume_scope.is_some() {
+        if cli.workspace.is_some() {
+            return Err(anyhow!(
+                "--resume-scope uses the authoritative workspace stored in that scope and cannot be combined with --workspace"
+            ));
+        }
+        if cli.batch_stdin {
+            return Err(anyhow!(
+                "--resume-scope cannot be combined with --batch-stdin"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -228,17 +337,24 @@ fn emit_result(
         .enumerate()
         .map(|(index, item)| {
             let terminal_observation = outcome.terminal.get(index);
+            let session = outcome.sessions.get(index).cloned().unwrap_or_default();
             serde_json::json!({
                 "index": index + 1,
                 "label": item.label,
                 "scope_id": item.scope_id,
                 "workspace": item.workspace,
                 "browser_page_id": item.browser_page_id,
+                "generation": item.generation,
+                "resumed": item.resumed,
                 "ready": outcome.readiness_complete,
                 "actual_task_sent": outcome.actual_sent.get(index).copied().unwrap_or(false),
                 "terminal_state": terminal_observation.map(|state| state.state),
                 "terminal_detail": terminal_observation.and_then(|state| state.detail.clone()),
                 "terminal_ms": terminal_observation.and_then(|state| state.terminal_ms),
+                "session_retained": session.retained,
+                "session_closed": session.closed,
+                "session_error": session.error,
+                "resumable": session.retained,
             })
         })
         .collect::<Vec<_>>();
@@ -251,11 +367,18 @@ fn emit_result(
     let all_sent = !outcome.actual_sent.is_empty()
         && outcome.actual_sent.len() == staged.len()
         && outcome.actual_sent.iter().all(|sent| *sent);
+    let session_policy_ok = outcome.sessions.is_empty()
+        || (outcome.sessions.len() == staged.len()
+            && outcome
+                .sessions
+                .iter()
+                .all(|session| session.error.is_none()));
     let result = serde_json::json!({
-        "ok": if cli.dry_run { true } else { all_completed && all_sent },
+        "ok": if cli.dry_run { true } else { all_completed && all_sent && session_policy_ok },
         "sent": all_sent,
         "ready": outcome.readiness_complete,
         "terminal": outcome.terminal_complete,
+        "keep_session": cli.keep_session,
         "parallel_count": staged.len(),
         "max_parallel": MAX_PARALLEL_WEB_WORKERS,
         "scope_dir": scope_dir.to_string_lossy(),
@@ -283,18 +406,39 @@ fn emit_result(
                 .get(index)
                 .map(|value| format!("{:?}", value.state).to_ascii_uppercase())
                 .unwrap_or_else(|| "LOST".into());
+            let session = outcome.sessions.get(index).cloned().unwrap_or_default();
             println!(
-                "{}. scope={} workspace={} page={} terminal={}",
+                "{}. scope={} generation={} page={} terminal={} retained={} closed={}",
                 index + 1,
                 item.scope_id,
-                item.workspace,
+                item.generation,
                 item.browser_page_id.as_deref().unwrap_or("<missing>"),
-                state
+                state,
+                session.retained,
+                session.closed
             );
         }
     }
 
     Ok(())
+}
+
+fn prepare_resume_task(cli: &Cli) -> Result<String> {
+    if !cli.task.is_empty() && cli.stdin {
+        return Err(anyhow!("TASK arguments cannot be combined with --stdin"));
+    }
+    let task = if cli.stdin {
+        read_stdin_bounded()?
+    } else {
+        cli.task.join(" ")
+    };
+    let task = task.trim().to_string();
+    if task.is_empty() {
+        return Err(anyhow!(
+            "--resume-scope requires one non-empty follow-up task"
+        ));
+    }
+    Ok(task)
 }
 
 fn prepare_tasks(cli: &Cli) -> Result<Vec<PreparedTask>> {
@@ -390,7 +534,9 @@ fn stage_dry_run(mux: &WorkspaceMux, tasks: &[PreparedTask]) -> Result<Vec<Stage
                 workspace: scope.workspace,
                 label: task.label.clone(),
                 browser_page_id: None,
-                created_ms: scope.created_ms,
+                generation: 0,
+                generation_started_ms: scope.created_ms,
+                resumed: false,
                 bootstrap_prompt: None,
                 task_prompt: None,
             })
@@ -408,7 +554,7 @@ async fn stage_browser_delegations(
         let page = match create_chatgpt_tab(orca).await {
             Ok(page) => page,
             Err(error) => {
-                cleanup_staged(mux, orca, &staged).await;
+                cleanup_unstarted_staged(mux, orca, &staged).await;
                 return Err(error.context("failed to create a fresh ChatGPT Web worker tab"));
             }
         };
@@ -416,7 +562,7 @@ async fn stage_browser_delegations(
             Ok(scope) => scope,
             Err(error) => {
                 let _ = close_browser_page(orca, &page).await;
-                cleanup_staged(mux, orca, &staged).await;
+                cleanup_unstarted_staged(mux, orca, &staged).await;
                 return Err(error.into());
             }
         };
@@ -425,30 +571,145 @@ async fn stage_browser_delegations(
             Err(error) => {
                 let _ = close_browser_page(orca, &page).await;
                 let _ = mux.remove(&scope.scope_id);
-                cleanup_staged(mux, orca, &staged).await;
+                cleanup_unstarted_staged(mux, orca, &staged).await;
                 return Err(error.into());
             }
         };
-        if let Err(error) = clear_delegation_lifecycle(&workspace, &scope.scope_id) {
-            let _ = close_browser_page(orca, &page).await;
-            let _ = mux.remove(&scope.scope_id);
-            cleanup_staged(mux, orca, &staged).await;
-            return Err(anyhow!(error));
-        }
-        let bootstrap_prompt = build_bootstrap_prompt(&scope.scope_id, Path::new(&scope.workspace));
-        let task_prompt =
-            build_delegation_prompt(&scope.scope_id, Path::new(&scope.workspace), &task.task);
-        staged.push(StagedDelegation {
-            scope_id: scope.scope_id,
-            workspace: scope.workspace,
-            label: task.label.clone(),
-            browser_page_id: Some(page),
-            created_ms: scope.created_ms,
-            bootstrap_prompt: Some(bootstrap_prompt),
-            task_prompt: Some(task_prompt),
-        });
+        let lifecycle = match start_fresh_delegation_lifecycle(&workspace, &scope.scope_id) {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => {
+                let _ = close_browser_page(orca, &page).await;
+                let _ = mux.remove(&scope.scope_id);
+                cleanup_unstarted_staged(mux, orca, &staged).await;
+                return Err(anyhow!(error));
+            }
+        };
+        staged.push(build_staged_delegation(
+            &scope,
+            Some(page),
+            task.label.clone(),
+            &task.task,
+            &lifecycle,
+            false,
+        ));
     }
     Ok(staged)
+}
+
+async fn stage_resume_delegation(
+    mux: &WorkspaceMux,
+    orca: &OrcaConfig,
+    scope_id: &str,
+    task: &str,
+) -> Result<ResumeStage> {
+    let (scope, workspace, previous) = load_resumable_scope(mux, scope_id)?;
+    let page = scope
+        .browser_page_id
+        .clone()
+        .ok_or_else(|| anyhow!("retained scope has no browser_page_id"))?;
+
+    if let Err(error) = verify_chatgpt_page(orca, &page).await {
+        let lifecycle = start_next_delegation_generation(&workspace, scope_id, false)
+            .map_err(|value| anyhow!(value))?;
+        let detail = format!(
+            "retained browser_page_id {} is no longer a live chatgpt.com conversation: {}",
+            page, error
+        );
+        let terminal_lifecycle = record_terminal_evidence(
+            &workspace,
+            scope_id,
+            DelegationTerminalState::Lost,
+            Some(&detail),
+        )
+        .map_err(|value| anyhow!(value))?;
+        let _ = mark_session_retained(&workspace, scope_id, false);
+        let _ = mux.remove(scope_id);
+        let staged = build_staged_delegation(&scope, Some(page), None, task, &lifecycle, true);
+        return Ok(ResumeStage::Lost {
+            staged,
+            terminal: TerminalObservation {
+                state: terminal_lifecycle
+                    .terminal_state
+                    .unwrap_or(DelegationTerminalState::Lost),
+                detail: terminal_lifecycle.terminal_detail,
+                terminal_ms: terminal_lifecycle.terminal_ms,
+            },
+            session: SessionDisposition {
+                retained: false,
+                closed: false,
+                error: Some(detail),
+            },
+        });
+    }
+
+    let reopen_blocked = previous.terminal_state == Some(DelegationTerminalState::Blocked);
+    let lifecycle = start_next_delegation_generation(&workspace, scope_id, reopen_blocked)
+        .map_err(|value| anyhow!(value))?;
+    Ok(ResumeStage::Ready(build_staged_delegation(
+        &scope,
+        Some(page),
+        None,
+        task,
+        &lifecycle,
+        true,
+    )))
+}
+
+fn load_resumable_scope(
+    mux: &WorkspaceMux,
+    scope_id: &str,
+) -> Result<(WorkspaceScope, Workspace, DelegationLifecycle)> {
+    let scope = mux.lookup(scope_id)?;
+    let workspace = mux.resolve(scope_id)?;
+    let lifecycle = load_delegation_lifecycle(&workspace, scope_id)
+        .map_err(|value| anyhow!(value))?
+        .ok_or_else(|| anyhow!("retained scope has no delegation lifecycle evidence"))?;
+    if !lifecycle.session_retained {
+        return Err(anyhow!(
+            "scope {} is not retained/resumable; use --keep-session on the terminal delegation before resuming",
+            scope_id
+        ));
+    }
+    if lifecycle.terminal_state.is_none() {
+        return Err(anyhow!(
+            "scope {} is not terminal yet and cannot be resumed concurrently",
+            scope_id
+        ));
+    }
+    Ok((scope, workspace, lifecycle))
+}
+
+fn build_staged_delegation(
+    scope: &WorkspaceScope,
+    page: Option<String>,
+    label: Option<String>,
+    task: &str,
+    lifecycle: &DelegationLifecycle,
+    resumed: bool,
+) -> StagedDelegation {
+    let workspace_path = Path::new(&scope.workspace);
+    StagedDelegation {
+        scope_id: scope.scope_id.clone(),
+        workspace: scope.workspace.clone(),
+        label,
+        browser_page_id: page,
+        generation: lifecycle.generation,
+        generation_started_ms: lifecycle.generation_started_ms,
+        resumed,
+        bootstrap_prompt: Some(build_bootstrap_prompt(
+            &scope.scope_id,
+            workspace_path,
+            lifecycle.generation,
+            resumed,
+        )),
+        task_prompt: Some(build_delegation_prompt(
+            &scope.scope_id,
+            workspace_path,
+            lifecycle.generation,
+            resumed,
+            task,
+        )),
+    }
 }
 
 async fn dispatch_bootstrap(orca: &OrcaConfig, staged: &[StagedDelegation]) -> Result<()> {
@@ -491,6 +752,14 @@ async fn wait_for_all_ready(
         for (index, item) in staged.iter().enumerate() {
             let lifecycle = lifecycle_for(mux, item)?;
             if let Some(lifecycle) = lifecycle.as_ref() {
+                if lifecycle.generation != item.generation {
+                    return Err(anyhow!(
+                        "worker {} lifecycle generation changed from {} to {} before dispatch",
+                        index + 1,
+                        item.generation,
+                        lifecycle.generation
+                    ));
+                }
                 if let Some(state) = lifecycle.terminal_state {
                     return Err(anyhow!(
                         "worker {} entered terminal state {:?} before actual task dispatch",
@@ -529,12 +798,11 @@ fn actual_dispatch_plan(
     let mut plan = Vec::with_capacity(staged.len());
     for item in staged {
         let lifecycle = lifecycle_for(mux, item)?;
-        if lifecycle
-            .as_ref()
-            .and_then(|state| state.terminal_state)
-            .is_some()
-            || !has_fresh_readiness(item, lifecycle.as_ref(), now_ms)
-        {
+        if lifecycle.as_ref().is_none_or(|state| {
+            state.generation != item.generation
+                || state.terminal_state.is_some()
+                || !has_fresh_readiness(item, Some(state), now_ms)
+        }) {
             return Ok(Vec::new());
         }
         let page = item
@@ -578,9 +846,6 @@ async fn dispatch_actual_tasks(
                     DelegationTerminalState::Failed,
                     &detail,
                 );
-                if let Some(page) = &staged[index].browser_page_id {
-                    let _ = close_browser_page(orca, page).await;
-                }
             }
         }
     }
@@ -601,7 +866,7 @@ async fn wait_for_terminal_states(
                 continue;
             }
             match lifecycle_for(mux, item) {
-                Ok(Some(lifecycle)) => {
+                Ok(Some(lifecycle)) if lifecycle.generation == item.generation => {
                     if let Some(state) = lifecycle.terminal_state {
                         observed[index] = Some(TerminalObservation {
                             state,
@@ -609,6 +874,16 @@ async fn wait_for_terminal_states(
                             terminal_ms: lifecycle.terminal_ms,
                         });
                     }
+                }
+                Ok(Some(lifecycle)) => {
+                    observed[index] = Some(TerminalObservation {
+                        state: DelegationTerminalState::Lost,
+                        detail: Some(format!(
+                            "lifecycle generation changed unexpectedly from {} to {}",
+                            item.generation, lifecycle.generation
+                        )),
+                        terminal_ms: Some(epoch_ms()),
+                    });
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -655,6 +930,134 @@ async fn wait_for_terminal_states(
     observed.into_iter().flatten().collect()
 }
 
+async fn finalize_terminal_sessions(
+    mux: &WorkspaceMux,
+    orca: &OrcaConfig,
+    staged: &[StagedDelegation],
+    keep_session: bool,
+) -> Vec<SessionDisposition> {
+    let mut dispositions = Vec::with_capacity(staged.len());
+    for item in staged {
+        let disposition = if keep_session {
+            retain_terminal_session(mux, orca, item).await
+        } else {
+            close_terminal_session(mux, orca, item).await
+        };
+        dispositions.push(disposition);
+    }
+    dispositions
+}
+
+async fn retain_terminal_session(
+    mux: &WorkspaceMux,
+    orca: &OrcaConfig,
+    item: &StagedDelegation,
+) -> SessionDisposition {
+    let Some(page) = item.browser_page_id.as_deref() else {
+        return SessionDisposition {
+            error: Some("cannot retain delegation without browser_page_id".into()),
+            ..SessionDisposition::default()
+        };
+    };
+    let workspace = match mux.resolve(&item.scope_id) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return SessionDisposition {
+                error: Some(format!("cannot resolve retained scope: {}", error)),
+                ..SessionDisposition::default()
+            }
+        }
+    };
+    if let Err(error) = verify_chatgpt_page(orca, page).await {
+        let _ = mark_session_retained(&workspace, &item.scope_id, false);
+        let _ = mux.remove(&item.scope_id);
+        return SessionDisposition {
+            error: Some(format!(
+                "terminal browser page could not be retained because it is no longer live: {}",
+                error
+            )),
+            ..SessionDisposition::default()
+        };
+    }
+    match mark_session_retained(&workspace, &item.scope_id, true) {
+        Ok(_) => SessionDisposition {
+            retained: true,
+            closed: false,
+            error: None,
+        },
+        Err(error) => {
+            let close_error = close_browser_page(orca, page).await.err();
+            let _ = mux.remove(&item.scope_id);
+            SessionDisposition {
+                retained: false,
+                closed: close_error.is_none(),
+                error: Some(match close_error {
+                    Some(close_error) => format!(
+                        "failed to persist retained-session state: {}; fallback tab close also failed: {}",
+                        error, close_error
+                    ),
+                    None => format!("failed to persist retained-session state: {}", error),
+                }),
+            }
+        }
+    }
+}
+
+async fn close_terminal_session(
+    mux: &WorkspaceMux,
+    orca: &OrcaConfig,
+    item: &StagedDelegation,
+) -> SessionDisposition {
+    let workspace = mux.resolve(&item.scope_id).ok();
+    if let Some(workspace) = workspace.as_ref() {
+        let _ = mark_session_retained(workspace, &item.scope_id, false);
+    }
+    let close_result = match item.browser_page_id.as_deref() {
+        Some(page) => close_browser_page(orca, page).await,
+        None => Err(anyhow!("delegation has no browser_page_id to close")),
+    };
+    let remove_result = mux.remove(&item.scope_id);
+    let error = match (close_result.as_ref().err(), remove_result.as_ref().err()) {
+        (None, None) => None,
+        (Some(close_error), None) => Some(format!("browser tab close failed: {}", close_error)),
+        (None, Some(remove_error)) => Some(format!("scope cleanup failed: {}", remove_error)),
+        (Some(close_error), Some(remove_error)) => Some(format!(
+            "browser tab close failed: {}; scope cleanup failed: {}",
+            close_error, remove_error
+        )),
+    };
+    SessionDisposition {
+        retained: false,
+        closed: close_result.is_ok(),
+        error,
+    }
+}
+
+async fn close_retained_scope(
+    mux: &WorkspaceMux,
+    orca: &OrcaConfig,
+    scope_id: &str,
+) -> Result<Value> {
+    let (scope, workspace, lifecycle) = load_resumable_scope(mux, scope_id)?;
+    let page = scope
+        .browser_page_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("retained scope has no browser_page_id"))?;
+    let close_error = close_browser_page(orca, page).await.err();
+    mark_session_retained(&workspace, scope_id, false).map_err(|value| anyhow!(value))?;
+    mux.remove(scope_id)?;
+    Ok(serde_json::json!({
+        "ok": close_error.is_none(),
+        "closed_scope": scope_id,
+        "browser_page_id": page,
+        "generation": lifecycle.generation,
+        "scope_removed": true,
+        "session_retained": false,
+        "session_closed": close_error.is_none(),
+        "session_error": close_error.map(|error| error.to_string()),
+    }))
+}
+
 fn lifecycle_for(
     mux: &WorkspaceMux,
     item: &StagedDelegation,
@@ -668,10 +1071,15 @@ fn has_fresh_readiness(
     lifecycle: Option<&DelegationLifecycle>,
     now_ms: u64,
 ) -> bool {
-    let Some(ready_ms) = lifecycle.and_then(|state| state.ready_ms) else {
+    let Some(lifecycle) = lifecycle else {
         return false;
     };
-    ready_ms >= item.created_ms
+    let Some(ready_ms) = lifecycle.ready_ms else {
+        return false;
+    };
+    lifecycle.generation == item.generation
+        && lifecycle.generation_started_ms == item.generation_started_ms
+        && ready_ms >= item.generation_started_ms
         && now_ms >= ready_ms
         && now_ms.saturating_sub(ready_ms) <= READINESS_FRESHNESS_MS
 }
@@ -683,11 +1091,25 @@ fn record_helper_terminal(
     detail: &str,
 ) -> Result<DelegationLifecycle> {
     let workspace = mux.resolve(&item.scope_id)?;
+    let lifecycle = load_delegation_lifecycle(&workspace, &item.scope_id)
+        .map_err(|error| anyhow!(error))?
+        .ok_or_else(|| anyhow!("delegation lifecycle is missing"))?;
+    if lifecycle.generation != item.generation {
+        return Err(anyhow!(
+            "refusing to record terminal state for stale generation {} (current {})",
+            item.generation,
+            lifecycle.generation
+        ));
+    }
     record_terminal_evidence(&workspace, &item.scope_id, state, Some(detail))
         .map_err(|error| anyhow!(error))
 }
 
-async fn cleanup_staged(mux: &WorkspaceMux, orca: &OrcaConfig, staged: &[StagedDelegation]) {
+async fn cleanup_unstarted_staged(
+    mux: &WorkspaceMux,
+    orca: &OrcaConfig,
+    staged: &[StagedDelegation],
+) {
     for item in staged {
         if let Ok(workspace) = mux.resolve(&item.scope_id) {
             let _ = clear_delegation_lifecycle(&workspace, &item.scope_id);
@@ -696,14 +1118,6 @@ async fn cleanup_staged(mux: &WorkspaceMux, orca: &OrcaConfig, staged: &[StagedD
             let _ = close_browser_page(orca, page).await;
         }
         let _ = mux.remove(&item.scope_id);
-    }
-}
-
-async fn cleanup_browser_pages(orca: &OrcaConfig, staged: &[StagedDelegation]) {
-    for item in staged {
-        if let Some(page) = &item.browser_page_id {
-            let _ = close_browser_page(orca, page).await;
-        }
     }
 }
 
@@ -786,32 +1200,59 @@ fn validate_bridge_health(value: &Value, base_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn build_bootstrap_prompt(scope_id: &str, workspace: &Path) -> String {
+fn build_bootstrap_prompt(
+    scope_id: &str,
+    workspace: &Path,
+    generation: u64,
+    resumed: bool,
+) -> String {
+    let mode = if resumed {
+        "This is a resume readiness handshake for the existing ChatGPT Web conversation."
+    } else {
+        "This is a readiness handshake for a fresh ChatGPT Web worker."
+    };
     format!(
         "[OMO-BRIDGE READINESS BOOTSTRAP]\n\
 SCOPE_ID: {}\n\
-WORKSPACE: {}\n\n\
-This is a readiness handshake only. The actual coding task has NOT been sent yet. Your only allowed action now is to call the omo-bridge MCP tool task_state with exactly scope_id={}. Do not inspect files, create a task plan, edit, run commands, delegate, or start coding.\n\n\
-A textual READY/OK/complete message is ignored and provides no readiness evidence. Readiness exists only if the task_state MCP call succeeds and the bridge records it server-side for this scope. After that successful tool call, stop and wait for the actual task prompt. If the MCP schema or scope_id field is unavailable, do not fabricate readiness.",
+WORKSPACE: {}\n\
+GENERATION: {}\n\n\
+{} The actual coding task for this generation has NOT been sent yet. Your only allowed action now is to call the omo-bridge MCP tool task_state with exactly scope_id={}. Do not inspect files, edit, run commands, delegate, or start coding.\n\n\
+A textual READY/OK/complete message is ignored and provides no readiness evidence. Readiness exists only if the scoped task_state MCP call succeeds and the bridge records it for this generation. After that successful tool call, stop and wait for the actual task prompt.",
         scope_id,
         workspace.display(),
+        generation,
+        mode,
         scope_id,
     )
 }
 
-fn build_delegation_prompt(scope_id: &str, workspace: &Path, task: &str) -> String {
+fn build_delegation_prompt(
+    scope_id: &str,
+    workspace: &Path,
+    generation: u64,
+    resumed: bool,
+    task: &str,
+) -> String {
+    let resume_guidance = if resumed {
+        "This is a follow-up in the same retained ChatGPT Web conversation. Recover task_state first. If the previous plan is complete, create a new plan for the follow-up when needed. If a previously blocked item has been reopened as in_progress, preserve its blocker context and continue that existing plan rather than creating a competing plan."
+    } else {
+        "This is a fresh Web delegation. Recover task_state before non-trivial work and create a task plan when needed."
+    };
     format!(
         "[OMO-BRIDGE DELEGATION]\n\
 SCOPE_ID: {}\n\
-WORKSPACE: {}\n\n\
-The authoritative readiness handshake for this fresh ChatGPT Web worker has completed. You are the sole coding agent for this task. This conversation is isolated to the scope above. Every omo-bridge tool call MUST include exactly this scope_id: {}. Do not use another scope_id and do not access parent directories. All file/search/command paths are relative to WORKSPACE.\n\n\
-Do not delegate implementation to OMO, OpenCode, Codex, or another coding agent. Use omo-bridge only as the local I/O, code-intelligence, execution, task-state, and completion harness.\n\n\
-Recover task_state with this scope_id before non-trivial work, then use inspect -> task_state/task_plan -> search/AST/LSP/read -> patch -> test/build/diagnostics -> git_status_diff -> task_update -> completion_check. Successful completion is authoritative only when completion_check returns ready=true. If completion_check.ready is false, continue until it is true.\n\n\
-If an external blocker makes further progress impossible, do not merely say BLOCKED. Use the existing task plan: mark the affected task-plan item blocked with task_update and a concrete blocker note, then call task_state once to reconcile server-side BLOCKED evidence. BLOCKED is terminal. If expected MCP tools or the scope_id field are missing, treat that as an MCP schema/reconnect blocker and record it through the task plan when possible.\n\n\
+WORKSPACE: {}\n\
+GENERATION: {}\n\n\
+The authoritative readiness handshake for this generation has completed. You are the sole coding agent for this task. Every omo-bridge tool call MUST include exactly this scope_id: {}. Do not use another scope_id and do not access parent directories. All file/search/command paths are relative to WORKSPACE.\n\n\
+{}\n\n\
+Do not delegate implementation to OMO, OpenCode, Codex, or another coding agent. Use omo-bridge only as the local I/O, code-intelligence, execution, task-state, and completion harness. Use inspect -> task_state/task_plan -> search/AST/LSP/read -> patch -> test/build/diagnostics -> git_status_diff -> task_update -> completion_check. Successful completion is authoritative only when completion_check returns ready=true.\n\n\
+If an external blocker makes further progress impossible, mark the affected item blocked with task_update and a concrete note; BLOCKED is terminal for this generation. Textual done/blocked/failed claims are never authoritative.\n\n\
 TASK:\n{}",
         scope_id,
         workspace.display(),
+        generation,
         scope_id,
+        resume_guidance,
         task
     )
 }
@@ -827,7 +1268,10 @@ fn epoch_ms() -> u64 {
 mod tests {
     use super::*;
     use omo_bridge::tools::completion::handle_completion_check;
-    use omo_bridge::tools::task_state::{handle_task_plan, handle_task_state, handle_task_update};
+    use omo_bridge::tools::task_state::{
+        handle_task_plan, handle_task_state, handle_task_update, mark_session_retained,
+        start_fresh_delegation_lifecycle,
+    };
     use tempfile::tempdir;
 
     fn cli_for_test() -> Cli {
@@ -835,6 +1279,9 @@ mod tests {
             task: Vec::new(),
             stdin: false,
             batch_stdin: false,
+            resume_scope: None,
+            close_scope: None,
+            keep_session: false,
             workspace: None,
             mount_root: PathBuf::from("/"),
             bridge_url: "http://127.0.0.1:18800".into(),
@@ -848,16 +1295,31 @@ mod tests {
         }
     }
 
-    fn staged_for_scope(scope: omo_bridge::WorkspaceScope) -> StagedDelegation {
+    fn staged_for_scope(
+        scope: WorkspaceScope,
+        lifecycle: &DelegationLifecycle,
+        resumed: bool,
+    ) -> StagedDelegation {
         StagedDelegation {
             scope_id: scope.scope_id,
             workspace: scope.workspace,
             label: None,
             browser_page_id: scope.browser_page_id,
-            created_ms: scope.created_ms,
+            generation: lifecycle.generation,
+            generation_started_ms: lifecycle.generation_started_ms,
+            resumed,
             bootstrap_prompt: Some("bootstrap".into()),
             task_prompt: Some("actual-task".into()),
         }
+    }
+
+    #[test]
+    fn default_session_policy_is_close_and_keep_is_explicit() {
+        let cli = cli_for_test();
+        assert!(!cli.keep_session);
+        let mut keep = cli.clone();
+        keep.keep_session = true;
+        assert!(keep.keep_session);
     }
 
     #[test]
@@ -868,6 +1330,69 @@ mod tests {
     }
 
     #[test]
+    fn resumed_scope_uses_exact_stored_browser_page_id() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let scopes = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
+        let scope = mux
+            .register_browser(&project, "retained-browser-page".into())
+            .unwrap();
+        let ws = mux.resolve(&scope.scope_id).unwrap();
+        start_fresh_delegation_lifecycle(&ws, &scope.scope_id).unwrap();
+        record_terminal_evidence(
+            &ws,
+            &scope.scope_id,
+            DelegationTerminalState::Completed,
+            Some("done"),
+        )
+        .unwrap();
+        mark_session_retained(&ws, &scope.scope_id, true).unwrap();
+
+        let (loaded, _, lifecycle) = load_resumable_scope(&mux, &scope.scope_id).unwrap();
+        assert_eq!(
+            loaded.browser_page_id.as_deref(),
+            Some("retained-browser-page")
+        );
+        assert!(lifecycle.session_retained);
+    }
+
+    #[test]
+    fn dead_page_resume_records_lost_generation_and_removes_scope() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let scopes = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
+        let scope = mux.register_browser(&project, "dead-page".into()).unwrap();
+        let ws = mux.resolve(&scope.scope_id).unwrap();
+        start_fresh_delegation_lifecycle(&ws, &scope.scope_id).unwrap();
+        record_terminal_evidence(
+            &ws,
+            &scope.scope_id,
+            DelegationTerminalState::Completed,
+            Some("done"),
+        )
+        .unwrap();
+        mark_session_retained(&ws, &scope.scope_id, true).unwrap();
+
+        let next = start_next_delegation_generation(&ws, &scope.scope_id, false).unwrap();
+        assert_eq!(next.generation, 2);
+        let lost = record_terminal_evidence(
+            &ws,
+            &scope.scope_id,
+            DelegationTerminalState::Lost,
+            Some("dead browser page"),
+        )
+        .unwrap();
+        mark_session_retained(&ws, &scope.scope_id, false).unwrap();
+        mux.remove(&scope.scope_id).unwrap();
+        assert_eq!(lost.terminal_state, Some(DelegationTerminalState::Lost));
+        assert!(mux.lookup(&scope.scope_id).is_err());
+    }
+
+    #[test]
     fn one_worker_readiness_smoke_allows_one_actual_dispatch() {
         let mount = tempdir().unwrap();
         let project = mount.path().join("project");
@@ -875,9 +1400,9 @@ mod tests {
         let scopes = tempdir().unwrap();
         let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
         let scope = mux.register_browser(&project, "page-1".into()).unwrap();
-        let staged = vec![staged_for_scope(scope)];
-        let ws = mux.resolve(&staged[0].scope_id).unwrap();
-        clear_delegation_lifecycle(&ws, &staged[0].scope_id).unwrap();
+        let ws = mux.resolve(&scope.scope_id).unwrap();
+        let lifecycle = start_fresh_delegation_lifecycle(&ws, &scope.scope_id).unwrap();
+        let staged = vec![staged_for_scope(scope, &lifecycle, false)];
 
         assert!(handle_task_state(&ws, &staged[0].scope_id).success);
         let plan = actual_dispatch_plan(&mux, &staged, epoch_ms()).unwrap();
@@ -886,58 +1411,27 @@ mod tests {
     }
 
     #[test]
-    fn three_worker_readiness_smoke_requires_all_three_before_dispatch() {
+    fn stale_generation_readiness_means_zero_actual_task_dispatches() {
         let mount = tempdir().unwrap();
         let project = mount.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let scopes = tempdir().unwrap();
         let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
-        let staged = (1..=3)
-            .map(|index| {
-                staged_for_scope(
-                    mux.register_browser(&project, format!("page-{index}"))
-                        .unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let scope = mux.register_browser(&project, "page-1".into()).unwrap();
+        let ws = mux.resolve(&scope.scope_id).unwrap();
+        let lifecycle = start_fresh_delegation_lifecycle(&ws, &scope.scope_id).unwrap();
+        let staged = vec![staged_for_scope(scope, &lifecycle, false)];
+        assert!(handle_task_state(&ws, &staged[0].scope_id).success);
+        record_terminal_evidence(
+            &ws,
+            &staged[0].scope_id,
+            DelegationTerminalState::Completed,
+            Some("done"),
+        )
+        .unwrap();
+        mark_session_retained(&ws, &staged[0].scope_id, true).unwrap();
+        start_next_delegation_generation(&ws, &staged[0].scope_id, false).unwrap();
 
-        for item in &staged {
-            let ws = mux.resolve(&item.scope_id).unwrap();
-            clear_delegation_lifecycle(&ws, &item.scope_id).unwrap();
-            assert!(handle_task_state(&ws, &item.scope_id).success);
-        }
-        let plan = actual_dispatch_plan(&mux, &staged, epoch_ms()).unwrap();
-        assert_eq!(plan.len(), 3);
-    }
-
-    #[test]
-    fn unready_or_stale_worker_means_zero_actual_task_dispatches() {
-        let mount = tempdir().unwrap();
-        let project = mount.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let scopes = tempdir().unwrap();
-        let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
-        let mut staged = (1..=3)
-            .map(|index| {
-                staged_for_scope(
-                    mux.register_browser(&project, format!("page-{index}"))
-                        .unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        for item in staged.iter().take(2) {
-            let ws = mux.resolve(&item.scope_id).unwrap();
-            clear_delegation_lifecycle(&ws, &item.scope_id).unwrap();
-            assert!(handle_task_state(&ws, &item.scope_id).success);
-        }
-        assert!(actual_dispatch_plan(&mux, &staged, epoch_ms())
-            .unwrap()
-            .is_empty());
-
-        let ws = mux.resolve(&staged[2].scope_id).unwrap();
-        assert!(handle_task_state(&ws, &staged[2].scope_id).success);
-        staged[0].created_ms = u64::MAX;
         assert!(actual_dispatch_plan(&mux, &staged, epoch_ms())
             .unwrap()
             .is_empty());
@@ -955,12 +1449,12 @@ mod tests {
             .unwrap();
         let scopes = tempdir().unwrap();
         let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
-        let staged = vec![staged_for_scope(
-            mux.register_browser(&project, "page-complete".into())
-                .unwrap(),
-        )];
-        let ws = mux.resolve(&staged[0].scope_id).unwrap();
-        clear_delegation_lifecycle(&ws, &staged[0].scope_id).unwrap();
+        let scope = mux
+            .register_browser(&project, "page-complete".into())
+            .unwrap();
+        let ws = mux.resolve(&scope.scope_id).unwrap();
+        let lifecycle = start_fresh_delegation_lifecycle(&ws, &scope.scope_id).unwrap();
+        let staged = vec![staged_for_scope(scope, &lifecycle, false)];
         let result = handle_completion_check(
             &ws,
             &staged[0].scope_id,
@@ -983,12 +1477,12 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let scopes = tempdir().unwrap();
         let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
-        let staged = vec![staged_for_scope(
-            mux.register_browser(&project, "page-blocked".into())
-                .unwrap(),
-        )];
-        let ws = mux.resolve(&staged[0].scope_id).unwrap();
-        clear_delegation_lifecycle(&ws, &staged[0].scope_id).unwrap();
+        let scope = mux
+            .register_browser(&project, "page-blocked".into())
+            .unwrap();
+        let ws = mux.resolve(&scope.scope_id).unwrap();
+        let lifecycle = start_fresh_delegation_lifecycle(&ws, &scope.scope_id).unwrap();
+        let staged = vec![staged_for_scope(scope, &lifecycle, false)];
         assert!(
             handle_task_plan(
                 &ws,
@@ -1015,18 +1509,19 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_contains_no_actual_task_and_requires_mcp_evidence() {
+    fn bootstrap_and_followup_prompts_encode_generation_and_resume_contract() {
         let scope = "44444444-4444-4444-8444-444444444444";
-        let bootstrap = build_bootstrap_prompt(scope, Path::new("/tmp/project"));
+        let bootstrap = build_bootstrap_prompt(scope, Path::new("/tmp/project"), 2, true);
+        assert!(bootstrap.contains("GENERATION: 2"));
+        assert!(bootstrap.contains("resume readiness handshake"));
         assert!(bootstrap.contains("task_state"));
-        assert!(bootstrap.contains("actual coding task has NOT been sent"));
-        assert!(bootstrap.contains("textual READY/OK/complete message is ignored"));
         assert!(!bootstrap.contains("fix tests"));
 
-        let task = build_delegation_prompt(scope, Path::new("/tmp/project"), "fix tests");
+        let task = build_delegation_prompt(scope, Path::new("/tmp/project"), 2, true, "fix tests");
+        assert!(task.contains("GENERATION: 2"));
+        assert!(task.contains("same retained ChatGPT Web conversation"));
         assert!(task.contains("fix tests"));
-        assert!(task.contains("completion_check returns ready=true"));
-        assert!(task.contains("task_update"));
+        assert!(task.contains("completion_check"));
     }
 
     #[test]
@@ -1084,9 +1579,10 @@ mod tests {
     }
 
     #[test]
-    fn cli_fixture_still_defaults_to_single_process_helper_contract() {
+    fn cli_fixture_preserves_three_worker_cap_and_resume_is_single_scope() {
         let cli = cli_for_test();
         assert!(!cli.batch_stdin);
+        assert!(cli.resume_scope.is_none());
         assert_eq!(MAX_PARALLEL_WEB_WORKERS, 3);
     }
 }

@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
+use url::Url;
 
 #[derive(Clone, Debug)]
 pub struct OrcaConfig {
@@ -22,6 +23,13 @@ impl OrcaConfig {
             orca_bin: orca_bin.into(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatgptPageProbe {
+    pub url: String,
+    pub title: String,
+    pub generating: bool,
 }
 
 pub async fn create_chatgpt_tab(config: &OrcaConfig) -> Result<String> {
@@ -57,6 +65,20 @@ pub async fn close_browser_page(config: &OrcaConfig, page: &str) -> Result<()> {
         return Err(anyhow!("orca tab close failed: {result}"));
     }
     Ok(())
+}
+
+pub async fn verify_chatgpt_page(config: &OrcaConfig, page: &str) -> Result<ChatgptPageProbe> {
+    if page.trim().is_empty() {
+        return Err(anyhow!("browser_page_id cannot be empty"));
+    }
+    let expression = r#"(() => ({
+  ready: !!(document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]')),
+  generating: !!document.querySelector('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop answering"]'),
+  url: location.href,
+  title: document.title
+}))()"#;
+    let value = eval_json(config, page, expression).await?;
+    validate_chatgpt_page_probe(&value)
 }
 
 pub async fn send_chatgpt_prompt(config: &OrcaConfig, page: &str, prompt: &str) -> Result<()> {
@@ -134,6 +156,35 @@ async fn wait_for_chatgpt_prompt(config: &OrcaConfig, page: &str) -> Result<()> 
     Err(anyhow!(
         "ChatGPT Web prompt box did not become ready; verify the Orca browser is logged into chatgpt.com"
     ))
+}
+
+fn validate_chatgpt_page_probe(value: &Value) -> Result<ChatgptPageProbe> {
+    if value.get("ready").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow!("stored browser page has no ChatGPT prompt box"));
+    }
+    let url = value
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("stored browser page probe returned no URL"))?;
+    let parsed = Url::parse(url)
+        .with_context(|| format!("stored browser page returned invalid URL: {url}"))?;
+    if parsed.scheme() != "https" || parsed.host_str() != Some("chatgpt.com") {
+        return Err(anyhow!(
+            "stored browser page is no longer the expected chatgpt.com conversation: {url}"
+        ));
+    }
+    Ok(ChatgptPageProbe {
+        url: url.to_string(),
+        title: value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        generating: value
+            .get("generating")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
 }
 
 async fn eval_json(config: &OrcaConfig, page: &str, expression: &str) -> Result<Value> {
@@ -373,5 +424,33 @@ mod tests {
             orchestrator_score("(😺 OmO Native) Goal achieved; reflecting"),
             0
         );
+    }
+
+    #[test]
+    fn validates_live_chatgpt_page_probe() {
+        let probe = validate_chatgpt_page_probe(&serde_json::json!({
+            "ready": true,
+            "generating": false,
+            "url": "https://chatgpt.com/c/abc123",
+            "title": "ChatGPT"
+        }))
+        .unwrap();
+        assert_eq!(probe.url, "https://chatgpt.com/c/abc123");
+        assert!(!probe.generating);
+    }
+
+    #[test]
+    fn rejects_dead_or_wrong_page_probe() {
+        assert!(validate_chatgpt_page_probe(&serde_json::json!({
+            "ready": false,
+            "url": "https://chatgpt.com/c/abc123"
+        }))
+        .is_err());
+        assert!(validate_chatgpt_page_probe(&serde_json::json!({
+            "ready": true,
+            "url": "https://example.com/",
+            "title": "Other"
+        }))
+        .is_err());
     }
 }

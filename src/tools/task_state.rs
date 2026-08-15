@@ -42,6 +42,10 @@ pub enum DelegationTerminalState {
 pub struct DelegationLifecycle {
     pub version: u32,
     pub scope_id: String,
+    #[serde(default = "default_generation")]
+    pub generation: u64,
+    #[serde(default)]
+    pub generation_started_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,6 +54,8 @@ pub struct DelegationLifecycle {
     pub terminal_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_detail: Option<String>,
+    #[serde(default)]
+    pub session_retained: bool,
     pub updated_ms: u64,
 }
 
@@ -339,7 +345,7 @@ pub fn load_delegation_lifecycle(
     }
     let bytes =
         fs::read(&path).map_err(|e| format!("Failed to read delegation lifecycle: {}", e))?;
-    let state: DelegationLifecycle = serde_json::from_slice(&bytes)
+    let mut state: DelegationLifecycle = serde_json::from_slice(&bytes)
         .map_err(|e| format!("Failed to parse delegation lifecycle: {}", e))?;
     if state.version != 1 || state.scope_id != scope_id {
         return Err(format!(
@@ -347,7 +353,86 @@ pub fn load_delegation_lifecycle(
             scope_id
         ));
     }
+    if state.generation == 0 {
+        state.generation = 1;
+    }
+    if state.generation_started_ms == 0 {
+        state.generation_started_ms = state.updated_ms;
+    }
     Ok(Some(state))
+}
+
+pub fn start_fresh_delegation_lifecycle(
+    ws: &Workspace,
+    scope_id: &str,
+) -> std::result::Result<DelegationLifecycle, String> {
+    let lifecycle = new_lifecycle(scope_id, 1);
+    save_lifecycle(ws, scope_id, &lifecycle)?;
+    Ok(lifecycle)
+}
+
+pub fn start_next_delegation_generation(
+    ws: &Workspace,
+    scope_id: &str,
+    reopen_blocked_items: bool,
+) -> std::result::Result<DelegationLifecycle, String> {
+    let previous = load_delegation_lifecycle(ws, scope_id)?
+        .ok_or_else(|| "No delegation lifecycle exists for retained session".to_string())?;
+    if !previous.session_retained {
+        return Err("Delegation session is not retained/resumable".to_string());
+    }
+    if previous.terminal_state.is_none() {
+        return Err("Delegation session still has an active non-terminal generation".to_string());
+    }
+
+    let original_task_state = if reopen_blocked_items {
+        load_task_state(ws, scope_id)?
+    } else {
+        None
+    };
+    let mut updated_task_state = original_task_state.clone();
+    let mut reopened_any = false;
+    if let Some(state) = updated_task_state.as_mut() {
+        for item in &mut state.items {
+            if item.status == TaskStatus::Blocked {
+                item.status = TaskStatus::InProgress;
+                reopened_any = true;
+            }
+        }
+        if reopened_any {
+            state.updated_ms = now_ms();
+            save_task_state(ws, scope_id, state)?;
+        }
+    }
+
+    let lifecycle = new_lifecycle(scope_id, previous.generation.saturating_add(1).max(2));
+    if let Err(error) = save_lifecycle(ws, scope_id, &lifecycle) {
+        if reopened_any {
+            if let Some(original) = original_task_state.as_ref() {
+                let _ = save_task_state(ws, scope_id, original);
+            }
+        }
+        return Err(error);
+    }
+    Ok(lifecycle)
+}
+
+pub fn mark_session_retained(
+    ws: &Workspace,
+    scope_id: &str,
+    retained: bool,
+) -> std::result::Result<DelegationLifecycle, String> {
+    let mut lifecycle = load_delegation_lifecycle(ws, scope_id)?
+        .ok_or_else(|| "No delegation lifecycle exists".to_string())?;
+    if lifecycle.terminal_state.is_none() {
+        return Err(
+            "Cannot change retained-session state before the generation is terminal".to_string(),
+        );
+    }
+    lifecycle.session_retained = retained;
+    lifecycle.updated_ms = now_ms();
+    save_lifecycle(ws, scope_id, &lifecycle)?;
+    Ok(lifecycle)
 }
 
 pub fn record_terminal_evidence(
@@ -357,7 +442,7 @@ pub fn record_terminal_evidence(
     detail: Option<&str>,
 ) -> std::result::Result<DelegationLifecycle, String> {
     let mut lifecycle =
-        load_delegation_lifecycle(ws, scope_id)?.unwrap_or_else(|| new_lifecycle(scope_id));
+        load_delegation_lifecycle(ws, scope_id)?.unwrap_or_else(|| new_lifecycle(scope_id, 1));
     if lifecycle.terminal_state.is_none() {
         let now = now_ms();
         lifecycle.terminal_state = Some(terminal_state);
@@ -389,7 +474,7 @@ fn record_readiness_evidence(
     scope_id: &str,
 ) -> std::result::Result<DelegationLifecycle, String> {
     let mut lifecycle =
-        load_delegation_lifecycle(ws, scope_id)?.unwrap_or_else(|| new_lifecycle(scope_id));
+        load_delegation_lifecycle(ws, scope_id)?.unwrap_or_else(|| new_lifecycle(scope_id, 1));
     if lifecycle.ready_ms.is_none() {
         let now = now_ms();
         lifecycle.ready_ms = Some(now);
@@ -399,16 +484,24 @@ fn record_readiness_evidence(
     Ok(lifecycle)
 }
 
-fn new_lifecycle(scope_id: &str) -> DelegationLifecycle {
+fn new_lifecycle(scope_id: &str, generation: u64) -> DelegationLifecycle {
+    let now = now_ms();
     DelegationLifecycle {
         version: 1,
         scope_id: scope_id.to_string(),
+        generation,
+        generation_started_ms: now,
         ready_ms: None,
         terminal_state: None,
         terminal_ms: None,
         terminal_detail: None,
-        updated_ms: now_ms(),
+        session_retained: false,
+        updated_ms: now,
     }
+}
+
+fn default_generation() -> u64 {
+    1
 }
 
 fn blocked_state_detail(state: &TaskState) -> Option<String> {
@@ -541,12 +634,109 @@ mod tests {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        let lifecycle = start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        assert_eq!(lifecycle.generation, 1);
 
         let result = handle_task_state(&ws, SCOPE_A);
         assert!(result.success);
         let lifecycle = load_delegation_lifecycle(&ws, SCOPE_A).unwrap().unwrap();
         assert!(lifecycle.ready_ms.is_some());
         assert!(lifecycle.terminal_state.is_none());
+        assert!(!lifecycle.session_retained);
+    }
+
+    #[test]
+    fn retained_terminal_session_starts_next_generation() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        record_terminal_evidence(
+            &ws,
+            SCOPE_A,
+            DelegationTerminalState::Completed,
+            Some("done"),
+        )
+        .unwrap();
+        mark_session_retained(&ws, SCOPE_A, true).unwrap();
+
+        let next = start_next_delegation_generation(&ws, SCOPE_A, false).unwrap();
+        assert_eq!(next.generation, 2);
+        assert!(next.ready_ms.is_none());
+        assert!(next.terminal_state.is_none());
+        assert!(!next.session_retained);
+    }
+
+    #[test]
+    fn non_retained_session_cannot_start_next_generation() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        record_terminal_evidence(
+            &ws,
+            SCOPE_A,
+            DelegationTerminalState::Completed,
+            Some("done"),
+        )
+        .unwrap();
+
+        let error = start_next_delegation_generation(&ws, SCOPE_A, false).unwrap_err();
+        assert!(error.contains("not retained/resumable"));
+    }
+
+    #[test]
+    fn blocked_resume_reopens_only_blocked_items_and_preserves_notes() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        handle_task_plan(
+            &ws,
+            SCOPE_A,
+            "Blocked task",
+            vec!["Reach service".into(), "Already done".into()],
+        );
+        handle_task_update(&ws, SCOPE_A, "T1", "blocked", Some("service unavailable"));
+        handle_task_update(&ws, SCOPE_A, "T2", "done", Some("finished"));
+        mark_session_retained(&ws, SCOPE_A, true).unwrap();
+
+        start_next_delegation_generation(&ws, SCOPE_A, true).unwrap();
+        let state = load_task_state(&ws, SCOPE_A).unwrap().unwrap();
+        assert_eq!(state.items[0].status, TaskStatus::InProgress);
+        assert_eq!(state.items[0].note.as_deref(), Some("service unavailable"));
+        assert_eq!(state.items[1].status, TaskStatus::Done);
+        assert_eq!(state.items[1].note.as_deref(), Some("finished"));
+        assert!(handle_task_state(&ws, SCOPE_A).success);
+        let lifecycle = load_delegation_lifecycle(&ws, SCOPE_A).unwrap().unwrap();
+        assert!(lifecycle.ready_ms.is_some());
+        assert!(lifecycle.terminal_state.is_none());
+    }
+
+    #[test]
+    fn completed_resume_can_replace_done_plan_with_new_followup_plan() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        assert!(handle_task_plan(&ws, SCOPE_A, "First", vec!["Finish first".into()]).success);
+        assert!(handle_task_update(&ws, SCOPE_A, "T1", "done", None).success);
+        record_terminal_evidence(
+            &ws,
+            SCOPE_A,
+            DelegationTerminalState::Completed,
+            Some("done"),
+        )
+        .unwrap();
+        mark_session_retained(&ws, SCOPE_A, true).unwrap();
+        start_next_delegation_generation(&ws, SCOPE_A, false).unwrap();
+
+        let new_plan = handle_task_plan(&ws, SCOPE_A, "Follow-up", vec!["Do follow-up".into()]);
+        assert!(new_plan.success);
+        assert_eq!(
+            load_task_state(&ws, SCOPE_A).unwrap().unwrap().goal,
+            "Follow-up"
+        );
     }
 
     #[test]
@@ -554,6 +744,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
         handle_task_plan(&ws, SCOPE_A, "Blocked task", vec!["Reach service".into()]);
 
         let result = handle_task_update(
@@ -583,6 +774,7 @@ mod tests {
         handle_task_plan(&ws, SCOPE_A, "Blocked task", vec!["Reach service".into()]);
         handle_task_update(&ws, SCOPE_A, "T1", "blocked", Some("blocked"));
         clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
 
         assert!(handle_task_state(&ws, SCOPE_A).success);
         let lifecycle = load_delegation_lifecycle(&ws, SCOPE_A).unwrap().unwrap();
@@ -594,10 +786,11 @@ mod tests {
     }
 
     #[test]
-    fn terminal_evidence_is_first_writer_wins() {
+    fn terminal_evidence_is_first_writer_wins_within_generation() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
         record_terminal_evidence(
             &ws,
             SCOPE_A,
