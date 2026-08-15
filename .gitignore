@@ -1,1 +1,22 @@
+# Rust build artifacts
 /target
+
+# Environment & local credentials
+.env
+.env.local
+*.secret
+*.pem
+*.key
+
+# Temporary files & session logs
+*.tmp
+*.log
+.DS_Store
+
+# IDE & Editor configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+.pi/
+.senpi/

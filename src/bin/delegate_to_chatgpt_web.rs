@@ -24,8 +24,9 @@ use url::Url;
 
 const MAX_PARALLEL_WEB_WORKERS: usize = 3;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
-const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
-const READINESS_FRESHNESS_MS: u64 = 90_000;
+const READINESS_TIMEOUT: Duration = Duration::from_secs(180);
+const READINESS_RETRY_AFTER: Duration = Duration::from_secs(45);
+const READINESS_FRESHNESS_MS: u64 = 240_000;
 const TERMINAL_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_SESSION_TTL_MINUTES: u64 = 120;
@@ -294,7 +295,7 @@ async fn main() -> Result<()> {
         ));
     }
 
-    if let Err(error) = wait_for_all_ready(&mux, &staged, READINESS_TIMEOUT).await {
+    if let Err(error) = wait_for_all_ready(&mux, &orca, &staged, READINESS_TIMEOUT).await {
         cleanup_unstarted_staged(&mux, &orca, &staged).await;
         return Err(error.context(
             "authoritative readiness handshake failed closed; actual task dispatch count is 0 and staged tabs/scopes were cleaned up",
@@ -865,10 +866,13 @@ async fn dispatch_bootstrap(orca: &OrcaConfig, staged: &[StagedDelegation]) -> R
 
 async fn wait_for_all_ready(
     mux: &WorkspaceMux,
+    orca: &OrcaConfig,
     staged: &[StagedDelegation],
     timeout: Duration,
 ) -> Result<()> {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut retried = false;
     loop {
         let now = epoch_ms();
         let mut pending = Vec::new();
@@ -892,7 +896,7 @@ async fn wait_for_all_ready(
                 }
             }
             if !has_fresh_readiness(item, lifecycle.as_ref(), now) {
-                pending.push(index + 1);
+                pending.push(index);
             }
         }
         if pending.is_empty() {
@@ -904,10 +908,38 @@ async fn wait_for_all_ready(
                 timeout.as_secs(),
                 pending
                     .iter()
-                    .map(usize::to_string)
+                    .map(|index| (index + 1).to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+        }
+        if !retried && Instant::now().duration_since(started) >= READINESS_RETRY_AFTER {
+            let futures = pending.iter().map(|index| {
+                let item = &staged[*index];
+                send_chatgpt_prompt(
+                    orca,
+                    item.browser_page_id.as_deref().unwrap_or_default(),
+                    item.bootstrap_prompt.as_deref().unwrap_or_default(),
+                )
+            });
+            let results = join_all(futures).await;
+            let failures = pending
+                .iter()
+                .zip(results.into_iter())
+                .filter_map(|(index, result)| {
+                    result
+                        .err()
+                        .map(|error| format!("worker {}: {}", index + 1, error))
+                })
+                .collect::<Vec<_>>();
+            if !failures.is_empty() {
+                return Err(anyhow!(
+                    "one or more pending readiness bootstrap retries failed: {}",
+                    failures.join("; ")
+                ));
+            }
+            retried = true;
+            continue;
         }
         sleep(LIFECYCLE_POLL_INTERVAL).await;
     }
@@ -1377,7 +1409,7 @@ fn build_bootstrap_prompt(
 SCOPE_ID: {}\n\
 WORKSPACE: {}\n\
 GENERATION: {}\n\n\
-{} The actual coding task for this generation has NOT been sent yet. Your only allowed action now is to call the omo-bridge MCP tool task_state with exactly scope_id={}. Do not inspect files, edit, run commands, delegate, or start coding.\n\n\
+{} The actual coding task for this generation has NOT been sent yet. Your only allowed readiness action now is to call the omo-bridge MCP tool task_state with exactly scope_id={}. If the task_state tool schema is not loaded yet, you may perform only the minimal connector/tool discovery required to expose that exact task_state tool, then call it immediately. Do not inspect files, edit, run commands, delegate, or start coding.\n\n\
 A textual READY/OK/complete message is ignored and provides no readiness evidence. Readiness exists only if the scoped task_state MCP call succeeds and the bridge records it for this generation. After that successful tool call, stop and wait for the actual task prompt.",
         scope_id,
         workspace.display(),
@@ -1582,6 +1614,30 @@ mod tests {
             .is_empty());
     }
 
+    #[test]
+    fn one_unready_worker_means_zero_actual_task_dispatches_for_whole_batch() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let scopes = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
+        let mut staged = Vec::new();
+        for page in ["page-1", "page-2", "page-3"] {
+            let scope = mux.register_browser(&project, page.into()).unwrap();
+            let ws = mux.resolve(&scope.scope_id).unwrap();
+            let lifecycle = start_fresh_delegation_lifecycle(&ws, &scope.scope_id).unwrap();
+            staged.push(staged_for_scope(scope, &lifecycle, false));
+        }
+        for index in [0, 2] {
+            let ws = mux.resolve(&staged[index].scope_id).unwrap();
+            assert!(handle_task_state(&ws, &staged[index].scope_id).success);
+        }
+
+        assert!(actual_dispatch_plan(&mux, &staged, epoch_ms())
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn completed_terminal_state_is_observed_for_omo_batch_result() {
         let mount = tempdir().unwrap();
@@ -1660,6 +1716,7 @@ mod tests {
         assert!(bootstrap.contains("GENERATION: 2"));
         assert!(bootstrap.contains("resume readiness handshake"));
         assert!(bootstrap.contains("task_state"));
+        assert!(bootstrap.contains("minimal connector/tool discovery"));
         assert!(!bootstrap.contains("fix tests"));
 
         let task = build_delegation_prompt(scope, Path::new("/tmp/project"), 2, true, "fix tests");
