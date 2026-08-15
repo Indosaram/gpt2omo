@@ -447,7 +447,7 @@ fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "require_task_plan": { "type": "boolean", "enum": [true], "description": "Legacy compatibility field; if supplied it must be true because a fully-done task plan is always required" },
                     "require_verification": { "type": "boolean", "enum": [true], "description": "Legacy compatibility field; if supplied it must be true because post-mutation verification is always required" },
-                    "require_changes": { "type": "boolean", "description": "Require non-clean git status (default false)" }
+                    "require_changes": { "type": "boolean", "enum": [true], "description": "Legacy compatibility field; if supplied it must be true because coding completion always requires working-tree changes" }
                 }
             }
         }),
