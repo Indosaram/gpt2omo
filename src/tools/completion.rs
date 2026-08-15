@@ -293,7 +293,7 @@ mod tests {
         fs::write(dir.path().join("bad.txt"), "trailing space \n").unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
 
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        let result = handle_completion_check(&ws, SCOPE, None, None, Some(false));
         assert!(result.success);
         let data = result.data.unwrap();
         assert!(!data["ready"].as_bool().unwrap());
