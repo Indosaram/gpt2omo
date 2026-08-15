@@ -20,6 +20,7 @@ fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String
         token: None,
         max_file_bytes: 10 * 1024 * 1024,
         command_timeout_ms: 5_000,
+        allow_host_command_execution: false,
     };
     let events = Arc::new(EventBus::new(dir.path().to_string_lossy().to_string()));
     let app = create_router(AppState {
@@ -38,6 +39,7 @@ fn app_for_mux(mount: &TempDir, scope_dir: std::path::PathBuf, mux: &WorkspaceMu
         token: None,
         max_file_bytes: 10 * 1024 * 1024,
         command_timeout_ms: 5_000,
+        allow_host_command_execution: false,
     };
     let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
     create_router(AppState {
@@ -343,6 +345,7 @@ async fn two_scopes_access_separate_workspaces_without_global_switch() {
         token: None,
         max_file_bytes: 1024,
         command_timeout_ms: 5_000,
+        allow_host_command_execution: false,
     };
     let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
     let app = create_router(AppState {
