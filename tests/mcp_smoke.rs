@@ -55,7 +55,7 @@ async fn initialize_and_tools_list_smoke() {
         }),
     )
     .await;
-    assert_eq!(init["result"]["serverInfo"]["version"], "0.6.1");
+    assert_eq!(init["result"]["serverInfo"]["version"], "0.7.0");
     assert!(init["result"]["instructions"]
         .as_str()
         .unwrap()

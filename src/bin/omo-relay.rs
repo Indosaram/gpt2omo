@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::StreamExt;
-use omo_bridge::orca::{resolve_terminal, resolve_terminal_for_marker, send_prompt, OrcaConfig};
+use omo_bridge::orca::{
+    resolve_terminal, resolve_terminal_for_marker, send_chatgpt_prompt, send_prompt, OrcaConfig,
+};
 use omo_bridge::{default_scope_dir, WorkspaceMux};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
@@ -16,7 +18,7 @@ use url::Url;
 #[command(
     name = "omo-relay",
     version,
-    about = "Route omo-bridge continuation events back to the ChatGPT Web terminal for each workspace scope"
+    about = "Route omo-bridge continuation events back to each scoped ChatGPT Web conversation"
 )]
 struct Cli {
     /// omo-bridge SSE event endpoint.
@@ -31,11 +33,11 @@ struct Cli {
     #[arg(long)]
     scope_dir: Option<PathBuf>,
 
-    /// Orca worktree selector used while rediscovering orchestrator terminals.
+    /// Orca worktree selector used for browser pages and legacy terminal discovery.
     #[arg(long, default_value = "active")]
     worktree: String,
 
-    /// Pin a terminal only for --resolve-only or explicit single-terminal debugging.
+    /// Pin a terminal only for --resolve-only or legacy terminal-scoped delegations.
     #[arg(long, env = "OMO_RELAY_TERMINAL")]
     terminal: Option<String>,
 
@@ -51,7 +53,7 @@ struct Cli {
     #[arg(long)]
     resolve_only: bool,
 
-    /// Observe continuation events but do not type them into any terminal.
+    /// Observe continuation events but do not send them to ChatGPT Web/terminal.
     #[arg(long)]
     dry_run: bool,
 
@@ -269,6 +271,29 @@ async fn relay_continuation(
     }
 
     let scope = mux.lookup(scope_id)?;
+    if let Some(page) = scope.browser_page_id.as_deref() {
+        if cli.dry_run {
+            info!(scope_id, seq, browser_page_id = page, prompt = %prompt, "dry-run continuation relay to ChatGPT Web");
+        } else {
+            send_chatgpt_prompt(orca, page, prompt)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to relay continuation directly to ChatGPT Web page {page} for scope {scope_id}"
+                    )
+                })?;
+        }
+        last_continuation_seq.insert(scope_id.to_string(), last.max(seq));
+        info!(
+            scope_id,
+            seq,
+            browser_page_id = page,
+            "continuation relayed directly to ChatGPT Web"
+        );
+        return Ok(());
+    }
+
+    // Backward compatibility for pre-browser scopes created by v0.6.x.
     let stored_terminal = scope.terminal.as_deref();
     let terminal = match resolve_terminal_for_marker(orca, scope_id).await {
         Ok(fresh) => {
@@ -282,23 +307,26 @@ async fn relay_continuation(
                 warn!(scope_id, error = %marker_error, terminal = stored, "scope marker rediscovery failed; using stored terminal");
                 stored.to_string()
             }
-            None => return Err(marker_error.context("scope has no stored terminal fallback")),
+            None => {
+                return Err(marker_error
+                    .context("scope has neither browser page nor stored terminal fallback"))
+            }
         },
     };
 
     if cli.dry_run {
-        info!(scope_id, seq, terminal = %terminal, prompt = %prompt, "dry-run continuation relay");
+        info!(scope_id, seq, terminal = %terminal, prompt = %prompt, "dry-run legacy continuation relay");
     } else if let Err(first_error) = send_prompt(orca, &terminal, prompt).await {
-        warn!(scope_id, error = %first_error, terminal = %terminal, "scope relay send failed; rediscovering by scope marker");
+        warn!(scope_id, error = %first_error, terminal = %terminal, "legacy scope relay send failed; rediscovering by scope marker");
         let fresh = resolve_terminal_for_marker(orca, scope_id).await?;
         send_prompt(orca, &fresh, prompt).await.with_context(|| {
-            format!("failed to relay scope {scope_id} after terminal rediscovery")
+            format!("failed to relay legacy scope {scope_id} after terminal rediscovery")
         })?;
         mux.update_terminal(scope_id, &fresh)?;
     }
 
     last_continuation_seq.insert(scope_id.to_string(), last.max(seq));
-    info!(scope_id, seq, terminal = %terminal, "continuation relayed for scope");
+    info!(scope_id, seq, terminal = %terminal, "legacy continuation relayed for scope");
     Ok(())
 }
 

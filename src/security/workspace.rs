@@ -77,6 +77,8 @@ pub struct WorkspaceScope {
     pub workspace: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_page_id: Option<String>,
     pub created_ms: u64,
     pub updated_ms: u64,
 }
@@ -88,8 +90,6 @@ pub struct WorkspaceMux {
 }
 
 impl WorkspaceMux {
-    /// A single mux can mount a broad root (including `/`) while every MCP call is resolved
-    /// through an immutable per-delegation scope. There is deliberately no global active workspace.
     pub fn new(mount_root: impl AsRef<Path>, scope_dir: impl AsRef<Path>) -> Result<Self> {
         let mount_root = dunce::canonicalize(mount_root.as_ref())
             .map_err(|e| BridgeError::Path(format!("Failed to canonicalize mount root: {}", e)))?;
@@ -117,7 +117,16 @@ impl WorkspaceMux {
         terminal: Option<String>,
     ) -> Result<WorkspaceScope> {
         let scope_id = uuid::Uuid::new_v4().to_string();
-        self.register_with_id(&scope_id, workspace, terminal)
+        self.register_with_id(&scope_id, workspace, terminal, None)
+    }
+
+    pub fn register_browser(
+        &self,
+        workspace: impl AsRef<Path>,
+        browser_page_id: String,
+    ) -> Result<WorkspaceScope> {
+        let scope_id = uuid::Uuid::new_v4().to_string();
+        self.register_with_id(&scope_id, workspace, None, Some(browser_page_id))
     }
 
     fn register_with_id(
@@ -125,6 +134,7 @@ impl WorkspaceMux {
         scope_id: &str,
         workspace: impl AsRef<Path>,
         terminal: Option<String>,
+        browser_page_id: Option<String>,
     ) -> Result<WorkspaceScope> {
         validate_scope_id(scope_id)?;
         let workspace = Workspace::open(workspace)?;
@@ -141,6 +151,7 @@ impl WorkspaceMux {
             scope_id: scope_id.to_string(),
             workspace: workspace.root().to_string_lossy().to_string(),
             terminal,
+            browser_page_id,
             created_ms: now,
             updated_ms: now,
         };
@@ -185,6 +196,15 @@ impl WorkspaceMux {
         scope.updated_ms = now_ms();
         self.persist(&scope)?;
         Ok(scope)
+    }
+
+    pub fn remove(&self, scope_id: &str) -> Result<()> {
+        validate_scope_id(scope_id)?;
+        match fs::remove_file(self.scope_path(scope_id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(BridgeError::Io(error)),
+        }
     }
 
     fn ensure_within_mount(&self, workspace: &Path) -> Result<()> {
@@ -280,7 +300,7 @@ mod tests {
         let mux = WorkspaceMux::new(mount.path(), state.path()).unwrap();
 
         let a = mux.register(&first, Some("term-a".into())).unwrap();
-        let b = mux.register(&second, Some("term-b".into())).unwrap();
+        let b = mux.register_browser(&second, "page-b".into()).unwrap();
 
         assert_ne!(a.scope_id, b.scope_id);
         assert_eq!(
@@ -296,9 +316,22 @@ mod tests {
             Some("term-a")
         );
         assert_eq!(
-            mux.lookup(&b.scope_id).unwrap().terminal.as_deref(),
-            Some("term-b")
+            mux.lookup(&b.scope_id).unwrap().browser_page_id.as_deref(),
+            Some("page-b")
         );
+    }
+
+    #[test]
+    fn mux_can_remove_a_scope() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let state = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), state.path()).unwrap();
+        let scope = mux.register_browser(&project, "page".into()).unwrap();
+        assert!(mux.lookup(&scope.scope_id).is_ok());
+        mux.remove(&scope.scope_id).unwrap();
+        assert!(mux.lookup(&scope.scope_id).is_err());
     }
 
     #[test]

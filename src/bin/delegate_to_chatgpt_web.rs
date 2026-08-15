@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use omo_bridge::orca::{resolve_terminal, send_prompt, OrcaConfig};
+use futures::future::join_all;
+use omo_bridge::orca::{close_browser_page, create_chatgpt_tab, send_chatgpt_prompt, OrcaConfig};
 use omo_bridge::{default_scope_dir, WorkspaceMux};
 use reqwest::header::AUTHORIZATION;
+use serde::Deserialize;
 use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -10,24 +12,31 @@ use std::process::Command;
 use std::time::Duration;
 use url::Url;
 
+const MAX_PARALLEL_WEB_WORKERS: usize = 3;
+const MAX_INPUT_BYTES: usize = 1024 * 1024;
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "delegate_to_chatgpt_web",
     version,
-    about = "Create an isolated workspace scope and delegate one coding task to ChatGPT Web",
+    about = "Create up to three isolated ChatGPT Web coding delegations through omo-bridge",
     trailing_var_arg = true
 )]
 struct Cli {
-    /// Task text to send to ChatGPT Web. Multiple trailing words are joined with spaces.
-    #[arg(value_name = "TASK", required_unless_present = "stdin")]
+    /// Single task text. Multiple trailing words are joined with spaces.
+    #[arg(value_name = "TASK")]
     task: Vec<String>,
 
-    /// Read the complete task text from stdin. Used by the OpenCode /delegate-web command.
-    #[arg(long, conflicts_with = "task")]
+    /// Read one complete task from stdin.
+    #[arg(long, conflicts_with = "batch_stdin")]
     stdin: bool,
 
-    /// Override automatic workspace discovery. By default the Git worktree root is used,
-    /// falling back to the current directory when not inside a Git repository.
+    /// Read a JSON batch manifest from stdin: {"tasks":[{"task":"...","workspace":"...","label":"..."}]}.
+    #[arg(long, conflicts_with = "stdin")]
+    batch_stdin: bool,
+
+    /// Override automatic workspace discovery for a single task, or provide the default workspace
+    /// for batch items that do not specify one. OMO remains responsible for worktree selection.
     #[arg(long, env = "OMO_WORKSPACE")]
     workspace: Option<PathBuf>,
 
@@ -43,11 +52,11 @@ struct Cli {
     #[arg(long)]
     scope_dir: Option<PathBuf>,
 
-    /// Orca worktree selector used while discovering the ChatGPT Web orchestrator terminal.
+    /// Orca worktree selector used for browser tabs.
     #[arg(long, default_value = "active")]
     worktree: String,
 
-    /// Pin a specific Orca terminal handle.
+    /// Legacy terminal selector retained for compatibility. Browser-scoped delegations do not use it.
     #[arg(long, env = "OMO_RELAY_TERMINAL")]
     terminal: Option<String>,
 
@@ -59,7 +68,7 @@ struct Cli {
     #[arg(long, env = "OMO_BRIDGE_TOKEN")]
     token: Option<String>,
 
-    /// Create/resolve the scope and terminal, but do not type the prompt.
+    /// Validate workspaces and create scopes, but do not create ChatGPT tabs or send prompts.
     #[arg(long)]
     dry_run: bool,
 
@@ -68,15 +77,41 @@ struct Cli {
     json: bool,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct BatchManifest {
+    tasks: Vec<BatchTask>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BatchTask {
+    task: String,
+    #[serde(default)]
+    workspace: Option<PathBuf>,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedTask {
+    task: String,
+    workspace: PathBuf,
+    label: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StagedDelegation {
+    scope_id: String,
+    workspace: String,
+    label: Option<String>,
+    browser_page_id: Option<String>,
+    prompt: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let task = read_task(&cli)?;
-    if task.is_empty() {
-        return Err(anyhow!("task cannot be empty"));
-    }
+    let tasks = prepare_tasks(&cli)?;
 
-    let workspace = discover_workspace(cli.workspace.as_deref())?;
     let bridge_url = cli.bridge_url.trim_end_matches('/');
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
@@ -84,78 +119,241 @@ async fn main() -> Result<()> {
         .build()?;
     probe_bridge(&client, bridge_url, cli.token.as_deref()).await?;
 
-    let orca = OrcaConfig::new(
-        cli.worktree.clone(),
-        cli.terminal.clone(),
-        cli.orca_bin.clone(),
-    );
-    let terminal = resolve_terminal(&orca).await?;
-
     let port = bridge_port(bridge_url)?;
     let scope_dir = cli
         .scope_dir
         .clone()
         .unwrap_or_else(|| default_scope_dir(port));
     let mux = WorkspaceMux::new(&cli.mount_root, &scope_dir)?;
-    let scope = mux.register(&workspace, Some(terminal.clone()))?;
-    let prompt = build_delegation_prompt(&scope.scope_id, Path::new(&scope.workspace), &task);
+    let orca = OrcaConfig::new(
+        cli.worktree.clone(),
+        cli.terminal.clone(),
+        cli.orca_bin.clone(),
+    );
+
+    let staged = if cli.dry_run {
+        stage_dry_run(&mux, &tasks)?
+    } else {
+        stage_browser_delegations(&mux, &orca, &tasks).await?
+    };
 
     if !cli.dry_run {
-        send_prompt(&orca, &terminal, &prompt)
-            .await
-            .with_context(|| format!("failed to delegate task to terminal {terminal}"))?;
+        dispatch_staged(&mux, &orca, &staged).await?;
     }
 
+    let delegations = staged
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            serde_json::json!({
+                "index": index + 1,
+                "label": item.label,
+                "scope_id": item.scope_id,
+                "workspace": item.workspace,
+                "browser_page_id": item.browser_page_id,
+            })
+        })
+        .collect::<Vec<_>>();
     let result = serde_json::json!({
         "ok": true,
         "sent": !cli.dry_run,
-        "scope_id": scope.scope_id,
-        "workspace": scope.workspace,
+        "parallel_count": staged.len(),
+        "max_parallel": MAX_PARALLEL_WEB_WORKERS,
         "scope_dir": scope_dir.to_string_lossy(),
-        "terminal": terminal,
         "bridge_url": bridge_url,
+        "delegations": delegations,
     });
 
     if cli.json {
         println!("{}", serde_json::to_string(&result)?);
-    } else if cli.dry_run {
-        println!(
-            "DRY RUN: scope={} workspace={} terminal={}",
-            result["scope_id"].as_str().unwrap_or(""),
-            result["workspace"].as_str().unwrap_or(""),
-            result["terminal"].as_str().unwrap_or("")
-        );
     } else {
         println!(
-            "Delegated to ChatGPT Web: scope={} workspace={} terminal={}",
-            result["scope_id"].as_str().unwrap_or(""),
-            result["workspace"].as_str().unwrap_or(""),
-            result["terminal"].as_str().unwrap_or("")
+            "{} {} ChatGPT Web worker(s)",
+            if cli.dry_run { "Prepared" } else { "Spawned" },
+            staged.len()
         );
+        for (index, item) in staged.iter().enumerate() {
+            println!(
+                "{}. scope={} workspace={} page={}",
+                index + 1,
+                item.scope_id,
+                item.workspace,
+                item.browser_page_id.as_deref().unwrap_or("<dry-run>")
+            );
+        }
     }
 
     Ok(())
 }
 
-fn read_task(cli: &Cli) -> Result<String> {
-    let task = if cli.stdin {
-        let mut input = String::new();
-        std::io::stdin()
-            .take(1024 * 1024 + 1)
-            .read_to_string(&mut input)
-            .context("failed to read delegated task from stdin")?;
-        if input.len() > 1024 * 1024 {
-            return Err(anyhow!("delegated task from stdin exceeds 1 MiB"));
-        }
-        input
-    } else {
-        cli.task.join(" ")
-    };
-    let task = task.trim().to_string();
-    if task.is_empty() {
-        return Err(anyhow!("task cannot be empty"));
+fn prepare_tasks(cli: &Cli) -> Result<Vec<PreparedTask>> {
+    if cli.batch_stdin && !cli.task.is_empty() {
+        return Err(anyhow!(
+            "TASK arguments cannot be combined with --batch-stdin"
+        ));
     }
-    Ok(task)
+    if cli.stdin && !cli.task.is_empty() {
+        return Err(anyhow!("TASK arguments cannot be combined with --stdin"));
+    }
+
+    let default_workspace = discover_workspace(cli.workspace.as_deref())?;
+    let raw_tasks = if cli.batch_stdin {
+        let input = read_stdin_bounded()?;
+        let manifest: BatchManifest =
+            serde_json::from_str(&input).context("failed to parse --batch-stdin JSON manifest")?;
+        manifest.tasks
+    } else {
+        let task = if cli.stdin {
+            read_stdin_bounded()?
+        } else {
+            cli.task.join(" ")
+        };
+        vec![BatchTask {
+            task,
+            workspace: None,
+            label: None,
+        }]
+    };
+
+    if raw_tasks.is_empty() {
+        return Err(anyhow!("at least one Web delegation task is required"));
+    }
+    if raw_tasks.len() > MAX_PARALLEL_WEB_WORKERS {
+        return Err(anyhow!(
+            "parallel Web delegation is limited to {} workers; received {}",
+            MAX_PARALLEL_WEB_WORKERS,
+            raw_tasks.len()
+        ));
+    }
+
+    raw_tasks
+        .into_iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            let task = raw.task.trim().to_string();
+            if task.is_empty() {
+                return Err(anyhow!("batch task {} is empty", index + 1));
+            }
+            let workspace = match raw.workspace {
+                Some(path) => canonical_directory(&path)
+                    .with_context(|| format!("invalid workspace for batch task {}", index + 1))?,
+                None => default_workspace.clone(),
+            };
+            let label = raw
+                .label
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            Ok(PreparedTask {
+                task,
+                workspace,
+                label,
+            })
+        })
+        .collect()
+}
+
+fn read_stdin_bounded() -> Result<String> {
+    let mut input = String::new();
+    std::io::stdin()
+        .take((MAX_INPUT_BYTES + 1) as u64)
+        .read_to_string(&mut input)
+        .context("failed to read delegation input from stdin")?;
+    if input.len() > MAX_INPUT_BYTES {
+        return Err(anyhow!("delegation input exceeds 1 MiB"));
+    }
+    Ok(input)
+}
+
+fn stage_dry_run(mux: &WorkspaceMux, tasks: &[PreparedTask]) -> Result<Vec<StagedDelegation>> {
+    tasks
+        .iter()
+        .map(|task| {
+            let scope = mux.register(&task.workspace, None)?;
+            Ok(StagedDelegation {
+                scope_id: scope.scope_id,
+                workspace: scope.workspace,
+                label: task.label.clone(),
+                browser_page_id: None,
+                prompt: None,
+            })
+        })
+        .collect()
+}
+
+async fn stage_browser_delegations(
+    mux: &WorkspaceMux,
+    orca: &OrcaConfig,
+    tasks: &[PreparedTask],
+) -> Result<Vec<StagedDelegation>> {
+    let mut staged = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let page = match create_chatgpt_tab(orca).await {
+            Ok(page) => page,
+            Err(error) => {
+                cleanup_staged(mux, orca, &staged).await;
+                return Err(error.context("failed to create a fresh ChatGPT Web worker tab"));
+            }
+        };
+        let scope = match mux.register_browser(&task.workspace, page.clone()) {
+            Ok(scope) => scope,
+            Err(error) => {
+                let _ = close_browser_page(orca, &page).await;
+                cleanup_staged(mux, orca, &staged).await;
+                return Err(error.into());
+            }
+        };
+        let prompt =
+            build_delegation_prompt(&scope.scope_id, Path::new(&scope.workspace), &task.task);
+        staged.push(StagedDelegation {
+            scope_id: scope.scope_id,
+            workspace: scope.workspace,
+            label: task.label.clone(),
+            browser_page_id: Some(page),
+            prompt: Some(prompt),
+        });
+    }
+    Ok(staged)
+}
+
+async fn dispatch_staged(
+    mux: &WorkspaceMux,
+    orca: &OrcaConfig,
+    staged: &[StagedDelegation],
+) -> Result<()> {
+    let futures = staged.iter().map(|item| {
+        let page = item.browser_page_id.as_deref().unwrap_or_default();
+        let prompt = item.prompt.as_deref().unwrap_or_default();
+        send_chatgpt_prompt(orca, page, prompt)
+    });
+    let results = join_all(futures).await;
+    let mut failures = Vec::new();
+    for (index, result) in results.into_iter().enumerate() {
+        if let Err(error) = result {
+            let item = &staged[index];
+            if let Some(page) = &item.browser_page_id {
+                let _ = close_browser_page(orca, page).await;
+            }
+            let _ = mux.remove(&item.scope_id);
+            failures.push(format!("worker {}: {}", index + 1, error));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "one or more ChatGPT Web workers failed to start: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+async fn cleanup_staged(mux: &WorkspaceMux, orca: &OrcaConfig, staged: &[StagedDelegation]) {
+    for item in staged {
+        if let Some(page) = &item.browser_page_id {
+            let _ = close_browser_page(orca, page).await;
+        }
+        let _ = mux.remove(&item.scope_id);
+    }
 }
 
 fn discover_workspace(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -240,11 +438,10 @@ fn validate_bridge_health(value: &Value, base_url: &str) -> Result<()> {
 fn build_delegation_prompt(scope_id: &str, workspace: &Path, task: &str) -> String {
     format!(
         "[OMO-BRIDGE DELEGATION]\n\
-Terminal Main Orchestrator delegated this task to ChatGPT Web.\n\n\
 SCOPE_ID: {}\n\
 WORKSPACE: {}\n\n\
-This bridge is a multiplexed single-daemon harness. Other ChatGPT Web tasks may be using different workspace scopes concurrently. Every omo-bridge tool call for this task MUST include exactly this scope_id: {}. Do not use another scope_id and do not access parent directories. All file/search/command paths are relative to WORKSPACE.\n\n\
-You are the sole coding agent for this task. Do not delegate implementation to OMO, OpenCode, Codex, or another coding agent. Use omo-bridge only as the local I/O, code-intelligence, execution, task-state, and completion harness.\n\n\
+You are the sole coding agent for this task. This ChatGPT Web conversation is isolated to the scope above. Every omo-bridge tool call MUST include exactly this scope_id: {}. Do not use another scope_id and do not access parent directories. All file/search/command paths are relative to WORKSPACE.\n\n\
+Do not delegate implementation to OMO, OpenCode, Codex, or another coding agent. Use omo-bridge only as the local I/O, code-intelligence, execution, task-state, and completion harness.\n\n\
 At the start call task_state with this scope_id. For non-trivial work use inspect -> task_state/task_plan -> search/AST/LSP/read -> patch -> test/build/diagnostics -> git_status_diff -> task_update -> completion_check. If completion_check.ready is false, continue until it is true unless an external blocker makes progress impossible. If expected MCP tools or the scope_id field are missing, treat that as an MCP schema/reconnect problem rather than a server implementation failure.\n\n\
 TASK:\n{}",
         scope_id,
@@ -258,6 +455,42 @@ TASK:\n{}",
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn cli_for_test() -> Cli {
+        Cli {
+            task: Vec::new(),
+            stdin: false,
+            batch_stdin: false,
+            workspace: None,
+            mount_root: PathBuf::from("/"),
+            bridge_url: "http://127.0.0.1:18800".into(),
+            scope_dir: None,
+            worktree: "active".into(),
+            terminal: None,
+            orca_bin: "orca".into(),
+            token: None,
+            dry_run: false,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn rejects_more_than_three_parallel_tasks() {
+        let dir = tempdir().unwrap();
+        let mut cli = cli_for_test();
+        cli.workspace = Some(dir.path().to_path_buf());
+        let manifest = BatchManifest {
+            tasks: (0..4)
+                .map(|index| BatchTask {
+                    task: format!("task {index}"),
+                    workspace: None,
+                    label: None,
+                })
+                .collect(),
+        };
+        assert_eq!(manifest.tasks.len(), 4);
+        assert_eq!(MAX_PARALLEL_WEB_WORKERS, 3);
+    }
 
     #[test]
     fn discovers_git_root_before_current_subdirectory() {
@@ -306,21 +539,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_multiplexed_bridge_health_shape() {
-        let old = serde_json::json!({
-            "service": "omo-bridge",
-            "version": "0.6.1",
-            "workspace_mode": "dynamic_active_scope"
-        });
-        let error = validate_bridge_health(&old, "http://127.0.0.1:18800").unwrap_err();
-        assert!(error.to_string().contains("multiplexed workspace scopes"));
-    }
-
-    #[test]
     fn accepts_multiplexed_bridge_health_shape() {
         let current = serde_json::json!({
             "service": "omo-bridge",
-            "version": "0.6.1",
+            "version": "0.7.0",
             "workspace_mode": "multiplexed_scopes"
         });
         validate_bridge_health(&current, "http://127.0.0.1:18800").unwrap();
@@ -333,27 +555,5 @@ mod tests {
         assert!(default_scope_dir(port)
             .to_string_lossy()
             .contains("scopes-18800"));
-    }
-
-    #[test]
-    fn mux_can_register_two_concurrent_delegations() {
-        let mount = tempdir().unwrap();
-        let first = mount.path().join("first");
-        let second = mount.path().join("second");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-        let scopes = tempdir().unwrap();
-        let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
-        let a = mux.register(&first, Some("term-a".into())).unwrap();
-        let b = mux.register(&second, Some("term-b".into())).unwrap();
-        assert_ne!(a.scope_id, b.scope_id);
-        assert_eq!(
-            mux.lookup(&a.scope_id).unwrap().terminal.as_deref(),
-            Some("term-a")
-        );
-        assert_eq!(
-            mux.lookup(&b.scope_id).unwrap().terminal.as_deref(),
-            Some("term-b")
-        );
     }
 }

@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tokio::process::Command;
+use tokio::time::{sleep, Duration};
 
 #[derive(Clone, Debug)]
 pub struct OrcaConfig {
@@ -20,6 +21,134 @@ impl OrcaConfig {
             terminal,
             orca_bin: orca_bin.into(),
         }
+    }
+}
+
+pub async fn create_chatgpt_tab(config: &OrcaConfig) -> Result<String> {
+    let result = run_orca_json(
+        config,
+        &[
+            "tab",
+            "create",
+            "--url",
+            "https://chatgpt.com",
+            "--worktree",
+            &config.worktree,
+            "--json",
+        ],
+    )
+    .await?;
+    let page = result
+        .pointer("/result/browserPageId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("orca tab create returned no browserPageId: {result}"))?
+        .to_string();
+
+    if let Err(error) = wait_for_chatgpt_prompt(config, &page).await {
+        let _ = close_browser_page(config, &page).await;
+        return Err(error);
+    }
+    Ok(page)
+}
+
+pub async fn close_browser_page(config: &OrcaConfig, page: &str) -> Result<()> {
+    let result = run_orca_json(config, &["tab", "close", "--page", page, "--json"]).await?;
+    if result.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow!("orca tab close failed: {result}"));
+    }
+    Ok(())
+}
+
+pub async fn send_chatgpt_prompt(config: &OrcaConfig, page: &str, prompt: &str) -> Result<()> {
+    if prompt.trim().is_empty() {
+        return Err(anyhow!("ChatGPT Web prompt cannot be empty"));
+    }
+    wait_for_chatgpt_idle(config, page).await?;
+
+    let prompt_json = serde_json::to_string(prompt)?;
+    let insert_expression = format!(
+        r#"(() => {{
+  const el = document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
+  if (!el) return {{ ok: false, error: 'no_textbox' }};
+  el.focus();
+  document.execCommand('selectAll', false, null);
+  document.execCommand('delete', false, null);
+  document.execCommand('insertText', false, {prompt_json});
+  el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  return {{ ok: true }};
+}})()"#
+    );
+    let inserted = eval_json(config, page, &insert_expression).await?;
+    if inserted.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow!("unable to fill ChatGPT prompt box: {inserted}"));
+    }
+
+    sleep(Duration::from_millis(250)).await;
+    let send_expression = r#"(() => {
+  const btn = document.querySelector('button[data-testid="send-button"], button[aria-label="Send prompt"]');
+  if (!btn || btn.disabled) return { ok: false, error: 'no_send_button' };
+  btn.click();
+  return { ok: true };
+})()"#;
+    let sent = eval_json(config, page, send_expression).await?;
+    if sent.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow!("unable to send ChatGPT prompt: {sent}"));
+    }
+    Ok(())
+}
+
+async fn wait_for_chatgpt_idle(config: &OrcaConfig, page: &str) -> Result<()> {
+    let expression = r#"(() => ({
+  ready: !!(document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]')),
+  generating: !!document.querySelector('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop answering"]')
+}))()"#;
+    for _ in 0..240 {
+        match eval_json(config, page, expression).await {
+            Ok(value)
+                if value.get("ready").and_then(Value::as_bool) == Some(true)
+                    && value.get("generating").and_then(Value::as_bool) == Some(false) =>
+            {
+                return Ok(())
+            }
+            _ => sleep(Duration::from_millis(250)).await,
+        }
+    }
+    Err(anyhow!(
+        "ChatGPT Web conversation did not become idle within 60 seconds"
+    ))
+}
+
+async fn wait_for_chatgpt_prompt(config: &OrcaConfig, page: &str) -> Result<()> {
+    let expression = r#"(() => ({
+  ready: !!(document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]')),
+  url: location.href,
+  title: document.title
+}))()"#;
+
+    for _ in 0..40 {
+        match eval_json(config, page, expression).await {
+            Ok(value) if value.get("ready").and_then(Value::as_bool) == Some(true) => return Ok(()),
+            _ => sleep(Duration::from_millis(250)).await,
+        }
+    }
+    Err(anyhow!(
+        "ChatGPT Web prompt box did not become ready; verify the Orca browser is logged into chatgpt.com"
+    ))
+}
+
+async fn eval_json(config: &OrcaConfig, page: &str, expression: &str) -> Result<Value> {
+    let result = run_orca_json(
+        config,
+        &["eval", "--page", page, "--expression", expression, "--json"],
+    )
+    .await?;
+    let raw = result
+        .pointer("/result/result")
+        .ok_or_else(|| anyhow!("orca eval returned no result: {result}"))?;
+    match raw {
+        Value::String(text) => serde_json::from_str(text)
+            .with_context(|| format!("orca eval returned non-JSON page result: {text}")),
+        other => Ok(other.clone()),
     }
 }
 
@@ -97,9 +226,6 @@ pub async fn resolve_terminal_uncached(config: &OrcaConfig) -> Result<String> {
     Ok(best.2.clone())
 }
 
-/// Recover the terminal associated with one delegation after a stale terminal handle.
-/// The delegation prompt contains the UUID scope id, so recent terminal output is a stable marker
-/// that is much safer than generic ChatGPT/omo-bridge heuristics when several tasks run at once.
 pub async fn resolve_terminal_for_marker(config: &OrcaConfig, marker: &str) -> Result<String> {
     let marker = marker.trim();
     if marker.is_empty() {
