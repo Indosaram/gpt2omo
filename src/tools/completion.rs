@@ -13,9 +13,17 @@ pub fn handle_completion_check(
     require_verification: Option<bool>,
     require_changes: Option<bool>,
 ) -> ToolCallResult {
-    let require_task_plan = require_task_plan.unwrap_or(true);
-    let require_verification = require_verification.unwrap_or(true);
-    let require_changes = require_changes.unwrap_or(false);
+    if require_task_plan == Some(false)
+        || require_verification == Some(false)
+        || require_changes == Some(false) {
+        return ToolCallResult::err(
+            "completion_check cannot disable task-plan, verification, or change requirements",
+        );
+    }
+
+    let require_task_plan = true;
+    let require_verification = true;
+    let require_changes = true;
 
     let state = match load_task_state(ws, scope_id) {
         Ok(state) => state,
@@ -190,6 +198,7 @@ mod tests {
         handle_task_update(&ws, SCOPE, "T1", "done", None);
         handle_task_update(&ws, SCOPE, "T2", "done", None);
         record_verification(&ws, SCOPE, "cargo test", true, Some(0), 10);
+        fs::write(dir.path().join("implemented.txt"), "implemented").unwrap();
 
         let after = handle_completion_check(&ws, SCOPE, None, None, None);
         assert!(after.success);
@@ -203,7 +212,12 @@ mod tests {
         let ws = Workspace::open(dir.path()).unwrap();
         clear_delegation_lifecycle(&ws, SCOPE).unwrap();
 
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        handle_task_plan(&ws, SCOPE, "complete", vec!["finish".into()]);
+        handle_task_update(&ws, SCOPE, "T1", "done", None);
+        record_verification(&ws, SCOPE, "cargo test", true, Some(0), 10);
+        fs::write(dir.path().join("implemented.txt"), "implemented").unwrap();
+
+        let result = handle_completion_check(&ws, SCOPE, None, None, Some(true));
         assert!(result.success);
         assert!(result.data.unwrap()["ready"].as_bool().unwrap());
         let lifecycle = load_delegation_lifecycle(&ws, SCOPE).unwrap().unwrap();
@@ -218,32 +232,42 @@ mod tests {
     }
 
     #[test]
-    fn test_completion_can_be_used_without_plan_for_simple_read_only_work() {
+    fn test_completion_rejects_disabled_required_checks() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
         let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
-        assert!(result.success);
-        assert!(result.data.unwrap()["ready"].as_bool().unwrap());
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("cannot disable task-plan, verification, or change"));
     }
 
     #[test]
-    fn test_completion_allows_non_git_read_only_work() {
+    fn test_completion_rejects_non_git_workspaces_for_coding_completion() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        handle_task_plan(&ws, SCOPE, "coding", vec!["implement".into()]);
+        handle_task_update(&ws, SCOPE, "T1", "done", None);
+        record_verification(&ws, SCOPE, "cargo test", true, Some(0), 10);
+        let result = handle_completion_check(&ws, SCOPE, None, None, None);
         assert!(result.success);
         let data = result.data.unwrap();
-        assert!(data["ready"].as_bool().unwrap());
+        assert!(!data["ready"].as_bool().unwrap());
         assert_eq!(data["git"]["is_git_repo"], false);
-        assert_eq!(data["git"]["diff_check_ok"], true);
+        assert!(data["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().contains("not a Git repository")));
     }
 
     #[test]
     fn test_completion_requires_git_when_changes_are_required() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(true));
+        let result = handle_completion_check(&ws, SCOPE, None, None, Some(true));
         assert!(result.success);
         let data = result.data.unwrap();
         assert!(!data["ready"].as_bool().unwrap());
@@ -259,7 +283,7 @@ mod tests {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(true), Some(false));
+        let result = handle_completion_check(&ws, SCOPE, None, None, None);
         assert!(result.success);
         let data = result.data.unwrap();
         assert!(!data["ready"].as_bool().unwrap());
@@ -277,7 +301,7 @@ mod tests {
         fs::write(dir.path().join("bad.txt"), "trailing space \n").unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
 
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        let result = handle_completion_check(&ws, SCOPE, None, None, None);
         assert!(result.success);
         let data = result.data.unwrap();
         assert!(!data["ready"].as_bool().unwrap());

@@ -95,24 +95,27 @@ impl Cli {
 #[derive(Default)]
 struct SseFrame {
     event: String,
+    id: Option<u64>,
     data: Vec<String>,
 }
 
 impl SseFrame {
     fn clear(&mut self) {
         self.event.clear();
+        self.id = None;
         self.data.clear();
     }
 
-    fn take_json(&mut self) -> Option<(String, Value)> {
+    fn take_json(&mut self) -> Option<(String, Value, Option<u64>)> {
         if self.event.is_empty() && self.data.is_empty() {
             return None;
         }
         let event = std::mem::take(&mut self.event);
+        let id = self.id.take();
         let data = self.data.join("\n");
         self.data.clear();
         let value = serde_json::from_str(&data).unwrap_or(Value::Null);
-        Some((event, value))
+        Some((event, value, id))
     }
 }
 
@@ -166,9 +169,19 @@ async fn main() -> Result<()> {
         .connect_timeout(Duration::from_secs(5))
         .build()?;
     let mut last_continuation_seq = HashMap::<String, u64>::new();
+    let mut last_event_id = 0u64;
 
     loop {
-        match consume_events(&client, &cli, &orca, &mux, &mut last_continuation_seq).await {
+        match consume_events(
+            &client,
+            &cli,
+            &orca,
+            &mux,
+            &mut last_continuation_seq,
+            &mut last_event_id,
+        )
+        .await
+        {
             Ok(()) => warn!("event stream closed; reconnecting"),
             Err(error) => warn!(error = %error, "event stream failed; reconnecting"),
         }
@@ -215,10 +228,14 @@ async fn consume_events(
     orca: &OrcaConfig,
     mux: &WorkspaceMux,
     last_continuation_seq: &mut HashMap<String, u64>,
+    last_event_id: &mut u64,
 ) -> Result<()> {
     let mut request = client.get(&cli.events_url);
     if let Some(token) = &cli.token {
         request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    if *last_event_id > 0 {
+        request = request.header("Last-Event-ID", last_event_id.to_string());
     }
     let response = request.send().await?.error_for_status()?;
     let content_type = response
@@ -248,8 +265,11 @@ async fn consume_events(
             let line = String::from_utf8_lossy(&line);
 
             if line.is_empty() {
-                if let Some((event, payload)) = frame.take_json() {
+                if let Some((event, payload, event_id)) = frame.take_json() {
                     handle_event(cli, orca, mux, last_continuation_seq, &event, payload).await?;
+                    if let Some(event_id) = event_id {
+                        *last_event_id = (*last_event_id).max(event_id);
+                    }
                 }
                 continue;
             }
@@ -258,6 +278,8 @@ async fn consume_events(
             }
             if let Some(value) = line.strip_prefix("event:") {
                 frame.event = value.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("id:") {
+                frame.id = value.trim().parse::<u64>().ok();
             } else if let Some(value) = line.strip_prefix("data:") {
                 frame.data.push(value.trim_start().to_string());
             }

@@ -76,15 +76,18 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn healthz_handler(State(state): State<AppState>) -> impl IntoResponse {
-    Json(serde_json::json!({
+async fn healthz_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse> {
+    verify_auth(&state, &headers)?;
+    Ok(Json(serde_json::json!({
         "status": "ok",
         "service": "omo-bridge",
         "version": "0.7.0",
         "events": "/events",
-        "workspace_mode": "multiplexed_scopes",
-        "mount_root": state.workspace.mount_root().to_string_lossy()
-    }))
+        "workspace_mode": "multiplexed_scopes"
+    })))
 }
 
 async fn mcp_sse_handler(
@@ -104,26 +107,59 @@ async fn events_sse_handler(
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
     verify_auth(&state, &headers)?;
 
-    let receiver = state.events.subscribe();
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let replay = state.events.subscribe_from(last_event_id);
     let hello = state.events.connection_event();
-    let initial = stream::once(async move { Ok(harness_event_to_sse(hello)) });
-    let updates = stream::unfold(receiver, |mut receiver| async move {
-        match receiver.recv().await {
-            Ok(event) => Some((Ok(harness_event_to_sse(event)), receiver)),
-            Err(RecvError::Lagged(missed)) => {
-                let event = Event::default().event("lagged").data(
-                    serde_json::json!({
-                        "kind": "lagged",
-                        "missed": missed,
-                        "message": "SSE subscriber fell behind the event buffer; reconcile with task_state/completion_check"
-                    })
-                    .to_string(),
-                );
-                Some((Ok(event), receiver))
-            }
-            Err(RecvError::Closed) => None,
-        }
+    let gap = replay.missed.map(|(from, to)| {
+        Event::default().event("lagged").data(
+            serde_json::json!({
+                "kind": "lagged",
+                "missed_from": from,
+                "missed_to": to,
+                "message": "SSE replay history was too small; reconcile with task_state/completion_check"
+            })
+            .to_string(),
+        )
     });
+    let replay_through = replay.replayed_through;
+    let replay_events = stream::iter(
+        replay
+            .events
+            .into_iter()
+            .map(|event| Ok(harness_event_to_sse(event))),
+    );
+    let initial = stream::once(async move { Ok(harness_event_to_sse(hello)) })
+        .chain(stream::iter(gap.into_iter().map(Ok)))
+        .chain(replay_events);
+    let updates = stream::unfold(
+        (replay.receiver, replay_through),
+        |(mut receiver, mut last_sent)| async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(event) if event.seq <= last_sent => continue,
+                    Ok(event) => {
+                        last_sent = event.seq;
+                        return Some((Ok(harness_event_to_sse(event)), (receiver, last_sent)));
+                    }
+                    Err(RecvError::Lagged(missed)) => {
+                        let event = Event::default().event("lagged").data(
+                            serde_json::json!({
+                                "kind": "lagged",
+                                "missed": missed,
+                                "message": "SSE subscriber fell behind the event buffer; reconcile with task_state/completion_check"
+                            })
+                            .to_string(),
+                        );
+                        return Some((Ok(event), (receiver, last_sent)));
+                    }
+                    Err(RecvError::Closed) => return None,
+                }
+            }
+        },
+    );
 
     Ok(Sse::new(initial.chain(updates)).keep_alive(
         KeepAlive::new()
@@ -133,10 +169,13 @@ async fn events_sse_handler(
 }
 
 fn harness_event_to_sse(event: HarnessEvent) -> Event {
-    Event::default()
-        .id(event.seq.to_string())
+    let mut sse = Event::default()
         .event(event.kind.clone())
-        .data(serde_json::to_string(&event).unwrap_or_else(|_| "{}".into()))
+        .data(serde_json::to_string(&event).unwrap_or_else(|_| "{}".into()));
+    if event.kind != "connected" {
+        sse = sse.id(event.seq.to_string());
+    }
+    sse
 }
 
 async fn mcp_post_handler(
@@ -386,7 +425,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "run_command",
-            "description": "Run a whitelisted build/test/verification command directly in the workspace without a shell. Enforces the configured timeout and caps captured output. Verification commands are recorded for completion_check.",
+            "description": "Run a whitelisted build/test/verification command directly in the workspace without a shell. Read-only Git inspection is available by default; repository-controlled build/test commands require --allow-host-command-execution and an OS-level sandbox. Enforces the configured timeout and caps captured output.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -438,13 +477,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "completion_check",
-            "description": "Deterministic completion audit for direct ChatGPT coding: checks task-plan completion, successful verification after the latest bridge edit, working-tree evidence when requested, and git diff --check. If ready=false, continue working.",
+            "description": "Deterministic completion audit for direct ChatGPT coding: checks task-plan completion, successful verification after the latest bridge edit, working-tree change evidence, and git diff --check. Working-tree changes are always required; if ready=false, continue working.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "require_task_plan": { "type": "boolean", "description": "Require an active fully-done task plan (default true)" },
-                    "require_verification": { "type": "boolean", "description": "Require a successful recorded verification after the latest bridge edit (default true)" },
-                    "require_changes": { "type": "boolean", "description": "Require non-clean git status (default false)" }
+                    "require_task_plan": { "type": "boolean", "enum": [true], "description": "Legacy compatibility field; if supplied it must be true because a fully-done task plan is always required" },
+                    "require_verification": { "type": "boolean", "enum": [true], "description": "Legacy compatibility field; if supplied it must be true because post-mutation verification is always required" },
+                    "require_changes": { "type": "boolean", "enum": [true], "description": "Legacy compatibility field; if supplied it must be true because working-tree change evidence is always required" }
                 }
             }
         }),
@@ -729,7 +768,7 @@ fn dispatch_tool(
         }
         "run_command" => {
             let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-            let result = handle_run_command(ws, cmd, cli.command_timeout_ms);
+            let result = handle_run_command(ws, cmd, cli.command_timeout_ms, cli.allow_host_command_execution);
             if result.success {
                 if let Some(data) = result.data.as_ref() {
                     let success = data

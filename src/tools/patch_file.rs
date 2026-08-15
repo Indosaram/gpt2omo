@@ -22,14 +22,17 @@ pub fn handle_patch_file(
 
     match dir.read(&rel_path) {
         Ok(current_bytes) => {
-            if let Some(expected) = expected_sha256 {
-                let current_hash = format!("{:x}", Sha256::digest(&current_bytes));
-                if current_hash != expected {
-                    return ToolCallResult::err(format!(
-                        "Precondition failed: expected sha256 {}, but current file hash is {}",
-                        expected, current_hash
-                    ));
-                }
+            let Some(expected) = expected_sha256 else {
+                return ToolCallResult::err(
+                    "Precondition required when replacing an existing file".into(),
+                );
+            };
+            let current_hash = format!("{:x}", Sha256::digest(&current_bytes));
+            if current_hash != expected {
+                return ToolCallResult::err(format!(
+                    "Precondition failed: expected sha256 {}, but current file hash is {}",
+                    expected, current_hash
+                ));
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -87,6 +90,13 @@ mod tests {
         let res1 = handle_patch_file(&ws, "test.txt", None, "initial content");
         assert!(res1.success);
         let sha1 = res1.data.unwrap()["sha256"].as_str().unwrap().to_string();
+
+        let missing_precondition = handle_patch_file(&ws, "test.txt", None, "unsafe overwrite");
+        assert!(!missing_precondition.success);
+        assert!(missing_precondition
+            .error
+            .unwrap()
+            .contains("Precondition required"));
 
         let res2 = handle_patch_file(&ws, "test.txt", Some(&sha1), "updated content");
         assert!(res2.success);

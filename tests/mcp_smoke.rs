@@ -10,6 +10,13 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String) {
+    test_app_with_command_policy(dir, false)
+}
+
+fn test_app_with_command_policy(
+    dir: &TempDir,
+    allow_host_command_execution: bool,
+) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String) {
     let scope_dir = dir.path().join("scopes");
     let mux = WorkspaceMux::new(dir.path(), &scope_dir).unwrap();
     let scope = mux.register(dir.path(), Some("term-test".into())).unwrap();
@@ -20,6 +27,7 @@ fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String
         token: None,
         max_file_bytes: 10 * 1024 * 1024,
         command_timeout_ms: 5_000,
+        allow_host_command_execution,
     };
     let events = Arc::new(EventBus::new(dir.path().to_string_lossy().to_string()));
     let app = create_router(AppState {
@@ -38,6 +46,7 @@ fn app_for_mux(mount: &TempDir, scope_dir: std::path::PathBuf, mux: &WorkspaceMu
         token: None,
         max_file_bytes: 10 * 1024 * 1024,
         command_timeout_ms: 5_000,
+        allow_host_command_execution: false,
     };
     let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
     create_router(AppState {
@@ -343,6 +352,7 @@ async fn two_scopes_access_separate_workspaces_without_global_switch() {
         token: None,
         max_file_bytes: 1024,
         command_timeout_ms: 5_000,
+        allow_host_command_execution: false,
     };
     let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
     let app = create_router(AppState {
@@ -405,9 +415,26 @@ async fn verification_completion_and_continuation_events_keep_scope() {
         .current_dir(dir.path())
         .status()
         .unwrap();
-    let (app, events, _, scope_id) = test_app(&dir);
-    let mut receiver = events.subscribe();
+    std::fs::write(dir.path().join("Makefile"), "test:\n\t@true\n").unwrap();
+    let (app, events, _, scope_id) = test_app_with_command_policy(&dir, true);
 
+    rpc(
+        app.clone(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "task_plan",
+                "arguments": {
+                    "scope_id": scope_id,
+                    "goal": "verify command policy integration",
+                    "items": ["run verification"]
+                }
+            }
+        }),
+    )
+    .await;
     rpc(
         app.clone(),
         json!({
@@ -415,8 +442,27 @@ async fn verification_completion_and_continuation_events_keep_scope() {
             "id": 5,
             "method": "tools/call",
             "params": {
+                "name": "task_update",
+                "arguments": {
+                    "scope_id": scope_id,
+                    "item_id": "T1",
+                    "status": "done"
+                }
+            }
+        }),
+    )
+    .await;
+    let mut receiver = events.subscribe();
+
+    rpc(
+        app.clone(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
                 "name": "run_command",
-                "arguments": {"scope_id": scope_id, "command": "cargo fmt --check"}
+                "arguments": {"scope_id": scope_id, "command": "make test"}
             }
         }),
     )
@@ -443,9 +489,9 @@ async fn verification_completion_and_continuation_events_keep_scope() {
                 "name": "completion_check",
                 "arguments": {
                     "scope_id": scope_id,
-                    "require_task_plan": false,
-                    "require_verification": false,
-                    "require_changes": false
+                    "require_task_plan": true,
+                    "require_verification": true,
+                    "require_changes": true
                 }
             }
         }),
@@ -475,18 +521,37 @@ async fn verification_completion_and_continuation_events_keep_scope() {
     );
 
     rpc(
-        app,
+        app.clone(),
         json!({
             "jsonrpc": "2.0",
             "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "patch_file",
+                "arguments": {
+                    "scope_id": scope_id,
+                    "path": "after-verification.txt",
+                    "content": "mutation\n"
+                }
+            }
+        }),
+    )
+    .await;
+    let mut receiver = events.subscribe();
+
+    rpc(
+        app,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
             "method": "tools/call",
             "params": {
                 "name": "completion_check",
                 "arguments": {
                     "scope_id": scope_id,
                     "require_task_plan": true,
-                    "require_verification": false,
-                    "require_changes": false
+                    "require_verification": true,
+                    "require_changes": true
                 }
             }
         }),

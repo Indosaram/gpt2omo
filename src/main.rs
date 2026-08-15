@@ -15,6 +15,13 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let addr: SocketAddr = cli.bind.parse()?;
+    let has_token = cli.token.as_deref().is_some_and(|token| !token.is_empty());
+    if !addr.ip().is_loopback() && !has_token {
+        anyhow::bail!(
+            "Refusing non-loopback bind {} without OMO_BRIDGE_TOKEN authentication",
+            addr
+        );
+    }
     let scope_dir = cli
         .scope_dir
         .clone()
