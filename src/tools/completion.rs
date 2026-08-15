@@ -1,6 +1,8 @@
 use crate::security::Workspace;
-use crate::tools::git_status::check_worktree_whitespace;
-use crate::tools::task_state::{load_task_state, TaskStatus};
+use crate::tools::git_status::{check_worktree_whitespace, is_git_worktree};
+use crate::tools::task_state::{
+    load_task_state, record_terminal_evidence, DelegationTerminalState, TaskStatus,
+};
 use crate::tools::ToolCallResult;
 use std::process::Command;
 
@@ -71,16 +73,25 @@ pub fn handle_completion_check(
         }
     }
 
-    let git_status = git_output(ws, &["status", "--porcelain", "--untracked-files=all"]);
-    let (git_status_text, git_status_ok) = match git_status {
-        Ok(text) => (text, true),
-        Err(e) => (e, false),
+    let is_git_repo = is_git_worktree(ws);
+    let (git_status_text, git_status_ok) = if is_git_repo {
+        match git_output(ws, &["status", "--porcelain", "--untracked-files=all"]) {
+            Ok(text) => (text, true),
+            Err(e) => (e, false),
+        }
+    } else {
+        (
+            "Workspace is not a Git repository; git status/diff checks were skipped".into(),
+            false,
+        )
     };
 
-    if require_changes && git_status_ok && git_status_text.trim().is_empty() {
+    if require_changes && !is_git_repo {
+        blockers
+            .push("Workspace is not a Git repository; cannot require working-tree changes".into());
+    } else if require_changes && git_status_ok && git_status_text.trim().is_empty() {
         blockers.push("No working-tree changes are present".into());
-    }
-    if require_changes && !git_status_ok {
+    } else if require_changes && !git_status_ok {
         blockers.push("Unable to verify working-tree changes with git status".into());
     }
 
@@ -90,6 +101,17 @@ pub fn handle_completion_check(
     }
 
     let ready = blockers.is_empty();
+    if ready {
+        if let Err(error) = record_terminal_evidence(
+            ws,
+            scope_id,
+            DelegationTerminalState::Completed,
+            Some("completion_check ready=true"),
+        ) {
+            return ToolCallResult::err(error);
+        }
+    }
+
     ToolCallResult::ok(serde_json::json!({
         "ready": ready,
         "blockers": blockers,
@@ -98,6 +120,7 @@ pub fn handle_completion_check(
         "last_mutation_ms": state.as_ref().and_then(|s| s.last_mutation_ms),
         "last_mutation_path": state.as_ref().and_then(|s| s.last_mutation_path.clone()),
         "git": {
+            "is_git_repo": is_git_repo,
             "status_ok": git_status_ok,
             "status": git_status_text,
             "diff_check_ok": worktree_check.ok,
@@ -130,7 +153,8 @@ fn git_output(ws: &Workspace, args: &[&str]) -> std::result::Result<String, Stri
 mod tests {
     use super::*;
     use crate::tools::task_state::{
-        handle_task_plan, handle_task_update, record_mutation, record_verification,
+        clear_delegation_lifecycle, handle_task_plan, handle_task_update,
+        load_delegation_lifecycle, record_mutation, record_verification,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -173,6 +197,27 @@ mod tests {
     }
 
     #[test]
+    fn ready_completion_records_authoritative_completed_terminal_state() {
+        let dir = tempdir().unwrap();
+        init_git(dir.path());
+        let ws = Workspace::open(dir.path()).unwrap();
+        clear_delegation_lifecycle(&ws, SCOPE).unwrap();
+
+        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        assert!(result.success);
+        assert!(result.data.unwrap()["ready"].as_bool().unwrap());
+        let lifecycle = load_delegation_lifecycle(&ws, SCOPE).unwrap().unwrap();
+        assert_eq!(
+            lifecycle.terminal_state,
+            Some(DelegationTerminalState::Completed)
+        );
+        assert_eq!(
+            lifecycle.terminal_detail.as_deref(),
+            Some("completion_check ready=true")
+        );
+    }
+
+    #[test]
     fn test_completion_can_be_used_without_plan_for_simple_read_only_work() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
@@ -180,6 +225,33 @@ mod tests {
         let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
         assert!(result.success);
         assert!(result.data.unwrap()["ready"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_completion_allows_non_git_read_only_work() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        assert!(result.success);
+        let data = result.data.unwrap();
+        assert!(data["ready"].as_bool().unwrap());
+        assert_eq!(data["git"]["is_git_repo"], false);
+        assert_eq!(data["git"]["diff_check_ok"], true);
+    }
+
+    #[test]
+    fn test_completion_requires_git_when_changes_are_required() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(true));
+        assert!(result.success);
+        let data = result.data.unwrap();
+        assert!(!data["ready"].as_bool().unwrap());
+        assert!(data["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().contains("not a Git repository")));
     }
 
     #[test]

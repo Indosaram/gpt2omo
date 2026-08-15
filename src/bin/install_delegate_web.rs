@@ -227,11 +227,13 @@ cat <<'__OMO_DELEGATE_WEB_BATCH__' | {bin} --batch-stdin --json
 __OMO_DELEGATE_WEB_BATCH__
 ```
 
-Do not invoke the helper once per worker. The helper creates fresh ChatGPT Web conversations and starts all workers concurrently.
+Do not invoke the helper once per worker. The helper creates one fresh ChatGPT Web tab and independent omo-bridge scope per task, but sends only a readiness bootstrap first. Each worker must successfully call MCP `task_state` for its own scope; the helper trusts only server-side readiness evidence. The actual task prompts are dispatched only after every 1–3 worker is freshly READY. If any worker is unready, stale, or times out, the helper sends zero actual task prompts and cleans up the staged tabs/scopes.
 
-If helper output has `"ok":true` and `"sent":true`, reply concisely with `parallel_count` and each delegation's `label`, `scope_id`, `workspace`, and `browser_page_id`. Do not continue coding locally.
+After actual dispatch, the helper stays in the foreground until every worker has an authoritative terminal state. `COMPLETED` comes only from `completion_check.ready=true`; `BLOCKED` comes from the existing task-state/task-update path; transport/control-plane failures are reported as `FAILED` or `LOST`. Worker text that says READY, done, blocked, or failed is never authoritative.
 
-If the helper fails, report the exact failure and stop. Never fall back to OMO/Anthropic subagents."#,
+When helper JSON has `"terminal":true`, it is a completed batch result and you must report `parallel_count` plus each delegation's `label`, `scope_id`, `workspace`, `browser_page_id`, `actual_task_sent`, `terminal_state`, and `terminal_detail` when present. `"ok":true` means every worker reached `COMPLETED`. `"ok":false` with `"terminal":true` is still a valid terminal batch result and must be reported as `BLOCKED`, `FAILED`, or `LOST` rather than treated as a transport failure. Do not continue coding locally.
+
+If the helper process itself fails before returning a terminal batch result, report the exact failure and stop. Never fall back to OMO/Anthropic subagents."#,
         bin = bin,
     )
 }
@@ -255,10 +257,13 @@ metadata:
 - Never use OMO Task/background/subagent/team dispatch as a substitute or fallback.
 - OMO decides which repository/worktree each task uses. The bridge never creates or chooses worktrees.
 - Invoke `{bin} --batch-stdin --json` exactly once with a JSON manifest containing 1–3 tasks.
-- The helper creates one fresh ChatGPT Web conversation and one omo-bridge scope per task, then starts the Web prompts concurrently.
-- `omo-relay` routes each scope's continuation directly back to its stored ChatGPT browser page.
+- The helper creates one fresh ChatGPT Web conversation and independent omo-bridge scope per task, sends a bootstrap-only prompt first, and accepts readiness only from a successful scoped MCP `task_state` call recorded server-side.
+- Actual task prompts are sent concurrently only after every worker is freshly READY; any unready/stale/timeout worker makes the whole batch fail closed with zero actual task dispatches and staged tab/scope cleanup.
+- After task dispatch the helper remains attached until all workers are terminal: authoritative `COMPLETED` requires `completion_check.ready=true`, while `BLOCKED`, `FAILED`, and `LOST` are also terminal and are returned to OMO immediately when the batch is fully decided.
+- `omo-relay` routes each scope's continuation directly back to its stored `browser_page_id`; ChatGPT generation/idle gating remains in the Orca send path.
+- Never trust textual READY/completion/blocker claims as lifecycle evidence.
 - More than three tasks must be merged into at most three coherent tracks before dispatch; never queue a fourth Web worker.
-- On helper failure, report the error and stop. Never fall back to provider-specific coding agents.
+- A helper process error before a terminal batch result is a transport failure; a returned `terminal=true` batch with `ok=false` is an authoritative BLOCKED/FAILED/LOST result, not a reason to fall back to another coding agent.
 "#,
         bin = delegate_bin.display(),
     )
@@ -324,6 +329,17 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_documents_authoritative_readiness_and_terminal_results() {
+        let prompt = render_coordinator_prompt(Path::new("/tmp/delegate_to_chatgpt_web"));
+        assert!(prompt.contains("sends only a readiness bootstrap first"));
+        assert!(prompt.contains("successfully call MCP `task_state`"));
+        assert!(prompt.contains("zero actual task prompts"));
+        assert!(prompt.contains("`completion_check.ready=true`"));
+        assert!(prompt.contains("`\"terminal\":true`"));
+        assert!(prompt.contains("`\"ok\":false` with `\"terminal\":true`"));
+    }
+
+    #[test]
     fn open_code_command_disables_subtask_mode() {
         let command = render_open_code_command("body");
         assert!(command.contains("subtask: false"));
@@ -343,6 +359,9 @@ mod tests {
         assert!(skill.contains("name: delegate-web"));
         assert!(skill.contains("Hard maximum: **3 parallel ChatGPT Web workers**"));
         assert!(skill.contains("OMO decides which repository/worktree"));
+        assert!(skill.contains("successful scoped MCP `task_state`"));
+        assert!(skill.contains("authoritative `COMPLETED`"));
+        assert!(skill.contains("stored `browser_page_id`"));
         assert!(skill.contains("opencode/slash: \"false\""));
     }
 

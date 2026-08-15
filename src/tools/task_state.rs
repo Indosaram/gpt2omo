@@ -29,6 +29,30 @@ impl TaskStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DelegationTerminalState {
+    Completed,
+    Blocked,
+    Failed,
+    Lost,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DelegationLifecycle {
+    pub version: u32,
+    pub scope_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_state: Option<DelegationTerminalState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_detail: Option<String>,
+    pub updated_ms: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskItem {
     pub id: String,
@@ -142,6 +166,7 @@ pub fn handle_task_update(
             "Invalid task status; expected pending, in_progress, done, or blocked",
         );
     };
+    let becomes_blocked = parsed_status == TaskStatus::Blocked;
 
     let mut state = match load_task_state(ws, scope_id) {
         Ok(Some(state)) => state,
@@ -160,29 +185,66 @@ pub fn handle_task_update(
         .map(str::to_string);
     state.updated_ms = now_ms();
 
-    match save_task_state(ws, scope_id, &state) {
-        Ok(()) => ToolCallResult::ok(serde_json::json!({
-            "active": true,
-            "scope_id": scope_id,
-            "state": state,
-        })),
-        Err(e) => ToolCallResult::err(e),
+    if let Err(error) = save_task_state(ws, scope_id, &state) {
+        return ToolCallResult::err(error);
     }
+
+    if becomes_blocked {
+        let detail = state
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .map(blocked_item_detail)
+            .unwrap_or_else(|| format!("{} marked blocked", item_id));
+        if let Err(error) = record_terminal_evidence(
+            ws,
+            scope_id,
+            DelegationTerminalState::Blocked,
+            Some(&detail),
+        ) {
+            return ToolCallResult::err(error);
+        }
+    }
+
+    ToolCallResult::ok(serde_json::json!({
+        "active": true,
+        "scope_id": scope_id,
+        "state": state,
+    }))
 }
 
 pub fn handle_task_state(ws: &Workspace, scope_id: &str) -> ToolCallResult {
-    match load_task_state(ws, scope_id) {
-        Ok(Some(state)) => ToolCallResult::ok(serde_json::json!({
+    let state = match load_task_state(ws, scope_id) {
+        Ok(state) => state,
+        Err(e) => return ToolCallResult::err(e),
+    };
+
+    if let Err(error) = record_readiness_evidence(ws, scope_id) {
+        return ToolCallResult::err(error);
+    }
+
+    if let Some(detail) = state.as_ref().and_then(blocked_state_detail) {
+        if let Err(error) = record_terminal_evidence(
+            ws,
+            scope_id,
+            DelegationTerminalState::Blocked,
+            Some(&detail),
+        ) {
+            return ToolCallResult::err(error);
+        }
+    }
+
+    match state {
+        Some(state) => ToolCallResult::ok(serde_json::json!({
             "active": true,
             "scope_id": scope_id,
             "state": state,
         })),
-        Ok(None) => ToolCallResult::ok(serde_json::json!({
+        None => ToolCallResult::ok(serde_json::json!({
             "active": false,
             "scope_id": scope_id,
             "state": null,
         })),
-        Err(e) => ToolCallResult::err(e),
     }
 }
 
@@ -256,7 +318,7 @@ pub fn load_task_state(
     ws: &Workspace,
     scope_id: &str,
 ) -> std::result::Result<Option<TaskState>, String> {
-    let path = state_path(ws, scope_id)?;
+    let path = task_state_path(ws, scope_id)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -267,40 +329,174 @@ pub fn load_task_state(
     Ok(Some(state))
 }
 
+pub fn load_delegation_lifecycle(
+    ws: &Workspace,
+    scope_id: &str,
+) -> std::result::Result<Option<DelegationLifecycle>, String> {
+    let path = lifecycle_path(ws, scope_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes =
+        fs::read(&path).map_err(|e| format!("Failed to read delegation lifecycle: {}", e))?;
+    let state: DelegationLifecycle = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("Failed to parse delegation lifecycle: {}", e))?;
+    if state.version != 1 || state.scope_id != scope_id {
+        return Err(format!(
+            "Invalid delegation lifecycle state for {}",
+            scope_id
+        ));
+    }
+    Ok(Some(state))
+}
+
+pub fn record_terminal_evidence(
+    ws: &Workspace,
+    scope_id: &str,
+    terminal_state: DelegationTerminalState,
+    detail: Option<&str>,
+) -> std::result::Result<DelegationLifecycle, String> {
+    let mut lifecycle =
+        load_delegation_lifecycle(ws, scope_id)?.unwrap_or_else(|| new_lifecycle(scope_id));
+    if lifecycle.terminal_state.is_none() {
+        let now = now_ms();
+        lifecycle.terminal_state = Some(terminal_state);
+        lifecycle.terminal_ms = Some(now);
+        lifecycle.terminal_detail = detail
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        lifecycle.updated_ms = now;
+        save_lifecycle(ws, scope_id, &lifecycle)?;
+    }
+    Ok(lifecycle)
+}
+
+pub fn clear_delegation_lifecycle(
+    ws: &Workspace,
+    scope_id: &str,
+) -> std::result::Result<(), String> {
+    let path = lifecycle_path(ws, scope_id)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to remove delegation lifecycle: {}", error)),
+    }
+}
+
+fn record_readiness_evidence(
+    ws: &Workspace,
+    scope_id: &str,
+) -> std::result::Result<DelegationLifecycle, String> {
+    let mut lifecycle =
+        load_delegation_lifecycle(ws, scope_id)?.unwrap_or_else(|| new_lifecycle(scope_id));
+    if lifecycle.ready_ms.is_none() {
+        let now = now_ms();
+        lifecycle.ready_ms = Some(now);
+        lifecycle.updated_ms = now;
+        save_lifecycle(ws, scope_id, &lifecycle)?;
+    }
+    Ok(lifecycle)
+}
+
+fn new_lifecycle(scope_id: &str) -> DelegationLifecycle {
+    DelegationLifecycle {
+        version: 1,
+        scope_id: scope_id.to_string(),
+        ready_ms: None,
+        terminal_state: None,
+        terminal_ms: None,
+        terminal_detail: None,
+        updated_ms: now_ms(),
+    }
+}
+
+fn blocked_state_detail(state: &TaskState) -> Option<String> {
+    let blocked = state
+        .items
+        .iter()
+        .filter(|item| item.status == TaskStatus::Blocked)
+        .map(blocked_item_detail)
+        .collect::<Vec<_>>();
+    if blocked.is_empty() {
+        None
+    } else {
+        Some(blocked.join("; "))
+    }
+}
+
+fn blocked_item_detail(item: &TaskItem) -> String {
+    match item.note.as_deref() {
+        Some(note) => format!("{} {}: {}", item.id, item.title, note),
+        None => format!("{} {}", item.id, item.title),
+    }
+}
+
 fn save_task_state(
     ws: &Workspace,
     scope_id: &str,
     state: &TaskState,
 ) -> std::result::Result<(), String> {
-    let path = state_path(ws, scope_id)?;
+    let path = task_state_path(ws, scope_id)?;
+    atomic_write_json(&path, state, "task state")
+}
+
+fn save_lifecycle(
+    ws: &Workspace,
+    scope_id: &str,
+    state: &DelegationLifecycle,
+) -> std::result::Result<(), String> {
+    let path = lifecycle_path(ws, scope_id)?;
+    atomic_write_json(&path, state, "delegation lifecycle")
+}
+
+fn atomic_write_json<T: Serialize>(
+    path: &PathBuf,
+    state: &T,
+    label: &str,
+) -> std::result::Result<(), String> {
     let parent = path
         .parent()
-        .ok_or_else(|| "Task state path has no parent".to_string())?;
+        .ok_or_else(|| format!("{} path has no parent", label))?;
     fs::create_dir_all(parent)
-        .map_err(|e| format!("Failed to create task state directory: {}", e))?;
+        .map_err(|e| format!("Failed to create {} directory: {}", label, e))?;
 
     let bytes = serde_json::to_vec_pretty(state)
-        .map_err(|e| format!("Failed to serialize task state: {}", e))?;
-    let temp = parent.join(format!(".task-state-{}.tmp", uuid::Uuid::new_v4()));
-    fs::write(&temp, bytes).map_err(|e| format!("Failed to write task state: {}", e))?;
-    fs::rename(&temp, &path).map_err(|e| {
+        .map_err(|e| format!("Failed to serialize {}: {}", label, e))?;
+    let temp = parent.join(format!(
+        ".{}-{}.tmp",
+        label.replace(' ', "-"),
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&temp, bytes).map_err(|e| format!("Failed to write {}: {}", label, e))?;
+    fs::rename(&temp, path).map_err(|e| {
         let _ = fs::remove_file(&temp);
-        format!("Failed to atomically persist task state: {}", e)
+        format!("Failed to atomically persist {}: {}", label, e)
     })?;
     Ok(())
 }
 
-fn state_path(ws: &Workspace, scope_id: &str) -> std::result::Result<PathBuf, String> {
-    uuid::Uuid::parse_str(scope_id).map_err(|_| "Invalid task scope id".to_string())?;
-    let root = ws.root().to_string_lossy();
-    let key = format!(
-        "{:x}",
-        Sha256::digest(format!("{}:{}", root, scope_id).as_bytes())
-    );
+fn task_state_path(ws: &Workspace, scope_id: &str) -> std::result::Result<PathBuf, String> {
     Ok(std::env::temp_dir()
         .join("omo-bridge")
         .join("task-state")
-        .join(format!("{}.json", key)))
+        .join(format!("{}.json", scope_key(ws, scope_id)?)))
+}
+
+fn lifecycle_path(ws: &Workspace, scope_id: &str) -> std::result::Result<PathBuf, String> {
+    Ok(std::env::temp_dir()
+        .join("omo-bridge")
+        .join("delegation-lifecycle")
+        .join(format!("{}.json", scope_key(ws, scope_id)?)))
+}
+
+fn scope_key(ws: &Workspace, scope_id: &str) -> std::result::Result<String, String> {
+    uuid::Uuid::parse_str(scope_id).map_err(|_| "Invalid task scope id".to_string())?;
+    let root = ws.root().to_string_lossy();
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(format!("{}:{}", root, scope_id).as_bytes())
+    ))
 }
 
 fn now_ms() -> u64 {
@@ -338,6 +534,86 @@ mod tests {
         assert_eq!(state.goal, "Implement feature");
         assert_eq!(state.items[0].status, TaskStatus::Done);
         assert_eq!(state.items[0].note.as_deref(), Some("inspected"));
+    }
+
+    #[test]
+    fn successful_task_state_records_authoritative_readiness() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+
+        let result = handle_task_state(&ws, SCOPE_A);
+        assert!(result.success);
+        let lifecycle = load_delegation_lifecycle(&ws, SCOPE_A).unwrap().unwrap();
+        assert!(lifecycle.ready_ms.is_some());
+        assert!(lifecycle.terminal_state.is_none());
+    }
+
+    #[test]
+    fn blocked_task_update_records_authoritative_terminal_state() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        handle_task_plan(&ws, SCOPE_A, "Blocked task", vec!["Reach service".into()]);
+
+        let result = handle_task_update(
+            &ws,
+            SCOPE_A,
+            "T1",
+            "blocked",
+            Some("external service unavailable"),
+        );
+        assert!(result.success);
+        let lifecycle = load_delegation_lifecycle(&ws, SCOPE_A).unwrap().unwrap();
+        assert_eq!(
+            lifecycle.terminal_state,
+            Some(DelegationTerminalState::Blocked)
+        );
+        assert!(lifecycle
+            .terminal_detail
+            .as_deref()
+            .unwrap()
+            .contains("external service unavailable"));
+    }
+
+    #[test]
+    fn task_state_reconciles_existing_blocked_plan_into_terminal_evidence() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        handle_task_plan(&ws, SCOPE_A, "Blocked task", vec!["Reach service".into()]);
+        handle_task_update(&ws, SCOPE_A, "T1", "blocked", Some("blocked"));
+        clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+
+        assert!(handle_task_state(&ws, SCOPE_A).success);
+        let lifecycle = load_delegation_lifecycle(&ws, SCOPE_A).unwrap().unwrap();
+        assert!(lifecycle.ready_ms.is_some());
+        assert_eq!(
+            lifecycle.terminal_state,
+            Some(DelegationTerminalState::Blocked)
+        );
+    }
+
+    #[test]
+    fn terminal_evidence_is_first_writer_wins() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        record_terminal_evidence(
+            &ws,
+            SCOPE_A,
+            DelegationTerminalState::Failed,
+            Some("transport failed"),
+        )
+        .unwrap();
+        let state = record_terminal_evidence(
+            &ws,
+            SCOPE_A,
+            DelegationTerminalState::Completed,
+            Some("late completion"),
+        )
+        .unwrap();
+        assert_eq!(state.terminal_state, Some(DelegationTerminalState::Failed));
+        assert_eq!(state.terminal_detail.as_deref(), Some("transport failed"));
     }
 
     #[test]

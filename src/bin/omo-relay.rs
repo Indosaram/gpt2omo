@@ -270,7 +270,7 @@ async fn relay_continuation(
         return Ok(());
     }
 
-    let scope = mux.lookup(scope_id)?;
+    let scope = continuation_scope(mux, scope_id)?;
     if let Some(page) = scope.browser_page_id.as_deref() {
         if cli.dry_run {
             info!(scope_id, seq, browser_page_id = page, prompt = %prompt, "dry-run continuation relay to ChatGPT Web");
@@ -330,6 +330,10 @@ async fn relay_continuation(
     Ok(())
 }
 
+fn continuation_scope(mux: &WorkspaceMux, scope_id: &str) -> Result<omo_bridge::WorkspaceScope> {
+    Ok(mux.lookup(scope_id)?)
+}
+
 fn events_port(events_url: &str) -> Result<u16> {
     let parsed = Url::parse(events_url)
         .with_context(|| format!("invalid events URL for scope routing: {events_url}"))?;
@@ -341,6 +345,7 @@ fn events_port(events_url: &str) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_scoped_continuation_payload_shape() {
@@ -360,6 +365,36 @@ mod tests {
         );
         assert_eq!(payload["data"]["prompt"], "continue");
         assert_eq!(payload["data"]["relay_to_same_chat"], true);
+    }
+
+    #[test]
+    fn continuation_scope_routes_each_scope_to_its_exact_browser_page_id() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let states = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), states.path()).unwrap();
+        let first = mux
+            .register_browser(&project, "browser-page-a".into())
+            .unwrap();
+        let second = mux
+            .register_browser(&project, "browser-page-b".into())
+            .unwrap();
+
+        assert_eq!(
+            continuation_scope(&mux, &first.scope_id)
+                .unwrap()
+                .browser_page_id
+                .as_deref(),
+            Some("browser-page-a")
+        );
+        assert_eq!(
+            continuation_scope(&mux, &second.scope_id)
+                .unwrap()
+                .browser_page_id
+                .as_deref(),
+            Some("browser-page-b")
+        );
     }
 
     #[test]

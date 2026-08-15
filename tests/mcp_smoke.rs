@@ -1,5 +1,8 @@
 use axum::body::{to_bytes, Body};
 use http::{Request, StatusCode};
+use omo_bridge::tools::task_state::{
+    clear_delegation_lifecycle, load_delegation_lifecycle, DelegationTerminalState,
+};
 use omo_bridge::{create_router, AppState, Cli, EventBus, WorkspaceMux};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -25,6 +28,23 @@ fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String
         events: events.clone(),
     });
     (app, events, mux, scope.scope_id)
+}
+
+fn app_for_mux(mount: &TempDir, scope_dir: std::path::PathBuf, mux: &WorkspaceMux) -> axum::Router {
+    let cli = Cli {
+        mount_root: mount.path().to_path_buf(),
+        scope_dir: Some(scope_dir),
+        bind: "127.0.0.1:0".into(),
+        token: None,
+        max_file_bytes: 10 * 1024 * 1024,
+        command_timeout_ms: 5_000,
+    };
+    let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
+    create_router(AppState {
+        workspace: Arc::new(mux.clone()),
+        cli: Arc::new(cli),
+        events,
+    })
 }
 
 async fn rpc(app: axum::Router, payload: Value) -> Value {
@@ -72,6 +92,11 @@ async fn initialize_and_tools_list_smoke() {
     )
     .await;
     let tools = tools["result"]["tools"].as_array().unwrap();
+    assert_eq!(
+        tools.len(),
+        15,
+        "the MCP schema must remain exactly 15 tools"
+    );
     let names: Vec<&str> = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
@@ -95,6 +120,93 @@ async fn initialize_and_tools_list_smoke() {
             .unwrap()
             .iter()
             .any(|value| value.as_str() == Some("scope_id")));
+    }
+}
+
+#[tokio::test]
+async fn actual_mcp_one_worker_readiness_smoke() {
+    let mount = tempfile::tempdir().unwrap();
+    let project = mount.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let scope_dir = mount.path().join("scopes");
+    let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
+    let scope = mux.register_browser(&project, "page-one".into()).unwrap();
+    let workspace = mux.resolve(&scope.scope_id).unwrap();
+    clear_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
+    let app = app_for_mux(&mount, scope_dir, &mux);
+
+    let response = rpc(
+        app,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 200,
+            "method": "tools/call",
+            "params": {
+                "name": "task_state",
+                "arguments": {"scope_id": scope.scope_id}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(response["result"]["isError"], false);
+
+    let lifecycle = load_delegation_lifecycle(&workspace, &scope.scope_id)
+        .unwrap()
+        .expect("successful MCP task_state must record readiness");
+    assert!(lifecycle.ready_ms.is_some());
+    assert!(lifecycle.ready_ms.unwrap() >= scope.created_ms);
+    assert!(lifecycle.terminal_state.is_none());
+}
+
+#[tokio::test]
+async fn actual_mcp_three_worker_readiness_smoke() {
+    let mount = tempfile::tempdir().unwrap();
+    let project = mount.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let scope_dir = mount.path().join("scopes");
+    let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
+    let scopes = (1..=3)
+        .map(|index| {
+            mux.register_browser(&project, format!("page-{index}"))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for scope in &scopes {
+        let workspace = mux.resolve(&scope.scope_id).unwrap();
+        clear_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
+    }
+    let app = app_for_mux(&mount, scope_dir, &mux);
+
+    for (index, scope) in scopes.iter().enumerate() {
+        let response = rpc(
+            app.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 210 + index,
+                "method": "tools/call",
+                "params": {
+                    "name": "task_state",
+                    "arguments": {"scope_id": scope.scope_id}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false);
+    }
+
+    for (index, scope) in scopes.iter().enumerate() {
+        let workspace = mux.resolve(&scope.scope_id).unwrap();
+        let lifecycle = load_delegation_lifecycle(&workspace, &scope.scope_id)
+            .unwrap()
+            .expect("each successful MCP task_state must record readiness");
+        assert!(lifecycle.ready_ms.is_some());
+        assert_eq!(
+            mux.lookup(&scope.scope_id)
+                .unwrap()
+                .browser_page_id
+                .as_deref(),
+            Some(format!("page-{}", index + 1).as_str())
+        );
     }
 }
 
@@ -351,6 +463,16 @@ async fn verification_completion_and_continuation_events_keep_scope() {
     let completion = completion.expect("completion event was not published");
     assert_eq!(completion.data["scope_id"], scope_id);
     assert_eq!(completion.data["ready"], true);
+
+    let workspace = dir.path();
+    let completed_lifecycle =
+        load_delegation_lifecycle(&omo_bridge::Workspace::open(workspace).unwrap(), &scope_id)
+            .unwrap()
+            .expect("ready completion must leave terminal evidence");
+    assert_eq!(
+        completed_lifecycle.terminal_state,
+        Some(DelegationTerminalState::Completed)
+    );
 
     rpc(
         app,

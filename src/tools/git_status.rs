@@ -3,6 +3,8 @@ use crate::tools::ToolCallResult;
 use std::process::Command;
 
 const MAX_DIFF_CHARS: usize = 120_000;
+const NON_GIT_MESSAGE: &str =
+    "Workspace is not a Git repository; git status/diff checks were skipped";
 
 pub(crate) struct WorktreeCheck {
     pub ok: bool,
@@ -10,6 +12,19 @@ pub(crate) struct WorktreeCheck {
 }
 
 pub fn handle_git_status(ws: &Workspace) -> ToolCallResult {
+    if !is_git_worktree(ws) {
+        return ToolCallResult::ok(serde_json::json!({
+            "is_git_repo": false,
+            "status": "",
+            "diff_stat": "",
+            "diff": "",
+            "diff_truncated": false,
+            "diff_check_ok": true,
+            "diff_check_output": NON_GIT_MESSAGE,
+            "is_clean": true
+        }));
+    }
+
     let status_out = match run_git(ws, &["status", "--porcelain", "--untracked-files=all"]) {
         Ok(out) => out,
         Err(e) => return ToolCallResult::err(e),
@@ -43,6 +58,7 @@ pub fn handle_git_status(ws: &Workspace) -> ToolCallResult {
     let check = check_worktree_whitespace(ws);
 
     ToolCallResult::ok(serde_json::json!({
+        "is_git_repo": true,
         "status": status_out,
         "diff_stat": diff_stat,
         "diff": diff,
@@ -53,7 +69,26 @@ pub fn handle_git_status(ws: &Workspace) -> ToolCallResult {
     }))
 }
 
+pub(crate) fn is_git_worktree(ws: &Workspace) -> bool {
+    let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(ws.root())
+        .output()
+    else {
+        return false;
+    };
+
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+}
+
 pub(crate) fn check_worktree_whitespace(ws: &Workspace) -> WorktreeCheck {
+    if !is_git_worktree(ws) {
+        return WorktreeCheck {
+            ok: true,
+            output: NON_GIT_MESSAGE.into(),
+        };
+    }
+
     let mut problems = Vec::new();
 
     if let Err(e) = run_git(ws, &["diff", "--check"]) {
@@ -242,9 +277,26 @@ mod tests {
         let result = handle_git_status(&ws);
         assert!(result.success);
         let data = result.data.unwrap();
+        assert_eq!(data["is_git_repo"], true);
         assert!(data["diff"].as_str().unwrap().contains("+two"));
         assert!(!data["is_clean"].as_bool().unwrap());
         assert!(data["diff_check_ok"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_git_status_reports_non_git_workspace_without_error() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+
+        let result = handle_git_status(&ws);
+        assert!(result.success);
+        let data = result.data.unwrap();
+        assert_eq!(data["is_git_repo"], false);
+        assert_eq!(data["diff_check_ok"], true);
+        assert!(data["diff_check_output"]
+            .as_str()
+            .unwrap()
+            .contains("not a Git repository"));
     }
 
     #[test]
@@ -287,5 +339,15 @@ mod tests {
         let ws = Workspace::open(dir.path()).unwrap();
         let check = check_worktree_whitespace(&ws);
         assert!(check.ok, "{}", check.output);
+    }
+
+    #[test]
+    fn test_worktree_check_skips_non_git_workspace() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+
+        let check = check_worktree_whitespace(&ws);
+        assert!(check.ok, "{}", check.output);
+        assert!(check.output.contains("not a Git repository"));
     }
 }
