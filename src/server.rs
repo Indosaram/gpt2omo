@@ -441,13 +441,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "completion_check",
-            "description": "Deterministic completion audit for direct ChatGPT coding: checks task-plan completion, successful verification after the latest bridge edit, working-tree evidence when requested, and git diff --check. If ready=false, continue working.",
+            "description": "Deterministic completion audit for direct ChatGPT coding: checks task-plan completion, successful verification after the latest bridge edit, working-tree change evidence, and git diff --check. Working-tree changes are always required; if ready=false, continue working.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "require_task_plan": { "type": "boolean", "enum": [true], "description": "Legacy compatibility field; if supplied it must be true because a fully-done task plan is always required" },
                     "require_verification": { "type": "boolean", "enum": [true], "description": "Legacy compatibility field; if supplied it must be true because post-mutation verification is always required" },
-                    "require_changes": { "type": "boolean", "enum": [true], "description": "Legacy compatibility field; if supplied it must be true because coding completion always requires working-tree changes" }
+                    "require_changes": { "type": "boolean", "enum": [true], "description": "Legacy compatibility field; if supplied it must be true because working-tree change evidence is always required" }
                 }
             }
         }),
