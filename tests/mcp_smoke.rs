@@ -491,7 +491,7 @@ async fn verification_completion_and_continuation_events_keep_scope() {
                     "scope_id": scope_id,
                     "require_task_plan": true,
                     "require_verification": true,
-                    "require_changes": false
+                    "require_changes": true
                 }
             }
         }),
@@ -551,7 +551,7 @@ async fn verification_completion_and_continuation_events_keep_scope() {
                     "scope_id": scope_id,
                     "require_task_plan": true,
                     "require_verification": true,
-                    "require_changes": false
+                    "require_changes": true
                 }
             }
         }),
