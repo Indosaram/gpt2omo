@@ -3,8 +3,8 @@
 ```
  ██████╗ ███╗   ███╗ ██████╗       ██████╗ ██████╗  ██╗██████╗   ██████╗ ███████╗
 ██╔═══██╗████╗ ████║██╔═══██╗      ██╔══██╗██╔══██╗██║██╔══██╗ ██╔════╝ ██╔════╝
-██║   ██║██╔████╔██║██║   ██║█████╗██████╔╝██████╔╝██║██║  ██║ ██║  ███╗█████╗  
-██║   ██║██║╚██╔╝██║██║   ██║╚════╝██╔══██╗██╔══██╗██║██║  ██║ ██║   ██║██╔══╝  
+██║   ██║██╔████╔██║██║   ██║█████╗██████╔╝██████╔╝██║██║  ██║ ██║  ███╗█████╗
+██║   ██║██║╚██╔╝██║██║   ██║╚════╝██╔══██╗██╔══██╗██║██║  ██║ ██║   ██║██╔══╝
 ╚██████╔╝██║ ╚═╝ ██║╚██████╔╝      ██████╔╝██║  ██║██║██████╔╝ ╚██████╔╝███████╗
  ╚═════╝ ╚═╝     ╚═╝ ╚═════╝       ╚═════╝ ╚═╝  ╚═╝╚═╝╚═════╝   ╚═════╝ ╚══════╝
 ```
@@ -51,7 +51,7 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
 │                (Task Decomposition & Worktree Selection)                    │
 └──────────────────────────────────────┬──────────────────────────────────────┘
                                        │
-                                       │ 1. Fan-out Manifest (1-2 Workers)
+                                       │ 1. Fan-out Manifest (1-3 Workers)
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    OMO-BRIDGE CONTROL PLANE & HELPER                        │
@@ -71,7 +71,7 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
                                         │
                                         ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                      CHATGPT WEB WORKERS (1 to 2 Max)                       │
+│                      CHATGPT WEB WORKERS (1 to 3 Max)                       │
 │                  - Autonomous Reasoning & Implementation                    │
 │                  - No direct access to host shell or filesystem             │
 └───────────────────────────────────────┬─────────────────────────────────────┘
@@ -110,7 +110,7 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
   - `BLOCKED`: Explicit server-side blocker recording via `task_update` / `task_state`.
   - `FAILED` / `LOST`: Monitored and reported immediately to callers.
 - 🔄 **Resumable Session Lifecycle**: Terminal sessions are retained in an `IDLE_RETAINED` state (120-minute lease by default). Follow-ups seamlessly resume the exact ChatGPT conversation, reopen blocked tasks, or replace completed plans with fresh iterations.
-- ⚡ **Strict Concurrency Limits**: Hard maximum of 2 concurrent workers per batch. Batches requesting 3 or more workers are rejected immediately. Additional independent tracks are dispatched in subsequent turns.
+- ⚡ **Strict Concurrency Limits**: Hard maximum of 3 concurrent workers per batch. Batches requesting 4 or more workers are rejected immediately, and parallel tracks must be independent.
 - 🧩 **15 Standard MCP Tools**: Complete tool surface covering file I/O, AST structural search (`ast-grep`), Language Server Protocol (LSP) diagnostics/navigation, whitelisted execution, and task tracking.
 
 ---
