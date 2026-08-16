@@ -11,7 +11,7 @@ pub(crate) struct WorktreeCheck {
     pub output: String,
 }
 
-pub fn handle_git_status(ws: &Workspace) -> ToolCallResult {
+pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallResult {
     if !is_git_worktree(ws) {
         return ToolCallResult::ok(serde_json::json!({
             "is_git_repo": false,
@@ -25,40 +25,51 @@ pub fn handle_git_status(ws: &Workspace) -> ToolCallResult {
         }));
     }
 
-    let status_out = match run_git(ws, &["status", "--porcelain", "--untracked-files=all"]) {
-        Ok(out) => out,
-        Err(e) => return ToolCallResult::err(e),
+    let p = target_path.map(str::trim).filter(|s| !s.is_empty() && *s != ".");
+
+    let status_out = if let Some(path) = p {
+        run_git(ws, &["status", "--porcelain", "--", path]).unwrap_or_default()
+    } else {
+        run_git(ws, &["status", "--porcelain", "--untracked-files=no"]).unwrap_or_default()
     };
 
-    let unstaged_stat = run_git(ws, &["diff", "--stat"]).unwrap_or_default();
-    let staged_stat = run_git(ws, &["diff", "--cached", "--stat"]).unwrap_or_default();
-    let diff_stat = match (unstaged_stat.is_empty(), staged_stat.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => unstaged_stat,
-        (true, false) => format!("# Staged changes\n{}", staged_stat),
-        (false, false) => format!(
-            "# Unstaged changes\n{}\n# Staged changes\n{}",
-            unstaged_stat, staged_stat
-        ),
+    let (diff_stat, combined) = if let Some(path) = p {
+        let unstaged_stat = run_git(ws, &["diff", "--stat", "--", path]).unwrap_or_default();
+        let staged_stat = run_git(ws, &["diff", "--cached", "--stat", "--", path]).unwrap_or_default();
+        let stat = match (unstaged_stat.is_empty(), staged_stat.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => unstaged_stat,
+            (true, false) => format!("# Staged changes\n{}", staged_stat),
+            (false, false) => format!("# Unstaged changes\n{}\n# Staged changes\n{}", unstaged_stat, staged_stat),
+        };
+        let unstaged = run_git(ws, &["diff", "--no-ext-diff", "--unified=3", "--", path]).unwrap_or_default();
+        let staged = run_git(ws, &["diff", "--cached", "--no-ext-diff", "--unified=3", "--", path]).unwrap_or_default();
+        let diff_comb = match (unstaged.is_empty(), staged.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => unstaged,
+            (true, false) => format!("# Staged changes\n{}", staged),
+            (false, false) => format!("# Unstaged changes\n{}\n# Staged changes\n{}", unstaged, staged),
+        };
+        (stat, diff_comb)
+    } else {
+        let unstaged_stat = run_git(ws, &["diff", "--stat"]).unwrap_or_default();
+        let staged_stat = run_git(ws, &["diff", "--cached", "--stat"]).unwrap_or_default();
+        let stat = match (unstaged_stat.is_empty(), staged_stat.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => unstaged_stat,
+            (true, false) => format!("# Staged changes\n{}", staged_stat),
+            (false, false) => format!("# Unstaged changes\n{}\n# Staged changes\n{}", unstaged_stat, staged_stat),
+        };
+        let msg = "# Notice: Entire repository diff scan is disabled for performance. Pass `path` parameter (e.g. `path: \"src/my_file.rs\"`) to inspect exact file diffs.";
+        (stat, msg.to_string())
     };
 
-    let unstaged = run_git(ws, &["diff", "--no-ext-diff", "--unified=3"]).unwrap_or_default();
-    let staged =
-        run_git(ws, &["diff", "--cached", "--no-ext-diff", "--unified=3"]).unwrap_or_default();
-    let combined = match (unstaged.is_empty(), staged.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => unstaged,
-        (true, false) => format!("# Staged changes\n{}", staged),
-        (false, false) => format!(
-            "# Unstaged changes\n{}\n# Staged changes\n{}",
-            unstaged, staged
-        ),
-    };
     let (diff, diff_truncated) = truncate_chars(&combined, MAX_DIFF_CHARS);
-    let check = check_worktree_whitespace(ws);
+    let check = check_worktree_whitespace(ws, p);
 
     ToolCallResult::ok(serde_json::json!({
         "is_git_repo": true,
+        "path": p.unwrap_or(""),
         "status": status_out,
         "diff_stat": diff_stat,
         "diff": diff,
@@ -81,7 +92,7 @@ pub(crate) fn is_git_worktree(ws: &Workspace) -> bool {
     output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
 }
 
-pub(crate) fn check_worktree_whitespace(ws: &Workspace) -> WorktreeCheck {
+pub(crate) fn check_worktree_whitespace(ws: &Workspace, target_path: Option<&str>) -> WorktreeCheck {
     if !is_git_worktree(ws) {
         return WorktreeCheck {
             ok: true,
@@ -91,11 +102,20 @@ pub(crate) fn check_worktree_whitespace(ws: &Workspace) -> WorktreeCheck {
 
     let mut problems = Vec::new();
 
-    if let Err(e) = run_git(ws, &["diff", "--check"]) {
-        problems.push(e);
-    }
-    if let Err(e) = run_git(ws, &["diff", "--cached", "--check"]) {
-        problems.push(e);
+    if let Some(path) = target_path {
+        if let Err(e) = run_git(ws, &["diff", "--check", "--", path]) {
+            problems.push(e);
+        }
+        if let Err(e) = run_git(ws, &["diff", "--cached", "--check", "--", path]) {
+            problems.push(e);
+        }
+    } else {
+        if let Err(e) = run_git(ws, &["diff", "--check"]) {
+            problems.push(e);
+        }
+        if let Err(e) = run_git(ws, &["diff", "--cached", "--check"]) {
+            problems.push(e);
+        }
     }
 
     WorktreeCheck {
@@ -188,7 +208,7 @@ mod tests {
         fs::write(dir.path().join("a.txt"), "two\n").unwrap();
 
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_git_status(&ws);
+        let result = handle_git_status(&ws, Some("a.txt"));
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["is_git_repo"], true);
@@ -202,7 +222,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
 
-        let result = handle_git_status(&ws);
+        let result = handle_git_status(&ws, None);
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["is_git_repo"], false);
@@ -225,7 +245,7 @@ mod tests {
             .unwrap();
 
         let ws = Workspace::open(dir.path()).unwrap();
-        let check = check_worktree_whitespace(&ws);
+        let check = check_worktree_whitespace(&ws, None);
         assert!(!check.ok);
         assert!(check.output.contains("whitespace"));
     }
@@ -235,7 +255,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
 
-        let check = check_worktree_whitespace(&ws);
+        let check = check_worktree_whitespace(&ws, None);
         assert!(check.ok, "{}", check.output);
         assert!(check.output.contains("not a Git repository"));
     }

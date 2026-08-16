@@ -124,7 +124,7 @@ fn handle_completion_check_inner(
 
     let is_git_repo = is_git_worktree(ws);
     let (git_status_text, git_status_ok) = if is_git_repo {
-        match git_output(ws, &["status", "--porcelain", "--untracked-files=all"]) {
+        match git_output(ws, &["status", "--porcelain", "--untracked-files=no"]) {
             Ok(text) => (text, true),
             Err(e) => (e, false),
         }
@@ -144,7 +144,7 @@ fn handle_completion_check_inner(
         blockers.push("Unable to verify working-tree changes with git status".into());
     }
 
-    let worktree_check = check_worktree_whitespace(ws);
+    let worktree_check = check_worktree_whitespace(ws, None);
     if !worktree_check.ok {
         blockers.push("Working tree contains whitespace/errors".into());
     }

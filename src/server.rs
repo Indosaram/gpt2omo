@@ -426,8 +426,10 @@ fn tool_definitions(subagent_enabled: bool) -> Vec<Value> {
         ),
         tool_definition(
             "git_status_diff",
-            "Inspect git porcelain status, diff stat, bounded staged/unstaged unified diff, and git diff --check results before completion.",
-            serde_json::json!({}),
+            "Inspect git porcelain status, diff stat, and targeted file diffs. Pass path (e.g. path: 'src/main.rs') to inspect exact unified diff for a specific file or directory. Entire repo diff scanning without path is disabled to prevent timeout overruns.",
+            serde_json::json!({
+                "path": { "type": "string", "description": "Optional workspace-relative file or directory to scan diff for. Highly recommended." }
+            }),
             &[],
         ),
         tool_definition(
@@ -809,7 +811,10 @@ fn dispatch_tool(
             let command_id = args.get("command_id").and_then(Value::as_str).unwrap_or("");
             commands.cancel_command(ws, scope_id, command_id)
         }
-        "git_status_diff" => handle_git_status(ws),
+        "git_status_diff" => {
+            let path = args.get("path").and_then(Value::as_str);
+            handle_git_status(ws, path)
+        }
         "task_plan" => {
             let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
             let Some(raw_items) = args.get("items").and_then(Value::as_array) else {
