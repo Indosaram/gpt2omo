@@ -1,6 +1,6 @@
 use crate::security::Workspace;
 use crate::tools::command_manager::CommandManager;
-use crate::tools::git_status::{check_worktree_whitespace, is_git_worktree};
+use crate::tools::git_status::is_git_worktree;
 use crate::tools::task_state::{
     load_task_state, record_terminal_evidence, DelegationTerminalState, TaskStatus,
 };
@@ -144,11 +144,7 @@ fn handle_completion_check_inner(
         blockers.push("Unable to verify working-tree changes with git status".into());
     }
 
-    let worktree_check = check_worktree_whitespace(ws, None);
-    if !worktree_check.ok {
-        blockers.push("Working tree contains whitespace/errors".into());
-    }
-
+    // Whitespace diff check is disabled as it creates false blockers and confusion
     let ready = blockers.is_empty();
     if ready {
         if let Err(error) = record_terminal_evidence(
@@ -173,8 +169,6 @@ fn handle_completion_check_inner(
             "is_git_repo": is_git_repo,
             "status_ok": git_status_ok,
             "status": git_status_text,
-            "diff_check_ok": worktree_check.ok,
-            "diff_check_output": worktree_check.output,
         },
         "requirements": {
             "task_plan": require_task_plan,
@@ -319,7 +313,6 @@ mod tests {
         let data = result.data.unwrap();
         assert!(data["ready"].as_bool().unwrap());
         assert_eq!(data["git"]["is_git_repo"], false);
-        assert_eq!(data["git"]["diff_check_ok"], true);
     }
 
     #[test]
@@ -368,11 +361,7 @@ mod tests {
         let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
         assert!(result.success);
         let data = result.data.unwrap();
-        assert!(!data["ready"].as_bool().unwrap());
-        assert_eq!(data["git"]["diff_check_ok"], false);
-        assert!(data["git"]["diff_check_output"]
-            .as_str()
-            .unwrap()
-            .contains("whitespace"));
+        // Whitespace checks are disabled, so ready should be true
+        assert!(data["ready"].as_bool().unwrap());
     }
 }

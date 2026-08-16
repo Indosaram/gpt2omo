@@ -854,7 +854,7 @@ fn build_staged_delegation(
     StagedDelegation {
         scope_id: scope.scope_id.clone(),
         workspace: scope.workspace.clone(),
-        label,
+        label: label.clone(),
         browser_page_id: page,
         generation: lifecycle.generation,
         generation_started_ms: lifecycle.generation_started_ms,
@@ -864,6 +864,8 @@ fn build_staged_delegation(
             workspace_path,
             lifecycle.generation,
             resumed,
+            label.as_deref(),
+            task,
         )),
         task_prompt: Some(build_delegation_prompt(
             &scope.scope_id,
@@ -1713,19 +1715,48 @@ fn build_bootstrap_prompt(
     workspace: &Path,
     generation: u64,
     resumed: bool,
+    label: Option<&str>,
+    task: &str,
 ) -> String {
     let mode = if resumed {
         "This is a resume readiness handshake for the existing ChatGPT Web conversation."
     } else {
         "This is a readiness handshake for a fresh ChatGPT Web worker."
     };
+    let title_line = match label {
+        Some(lbl) if !lbl.trim().is_empty() => {
+            let task_summary = task
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            if !task_summary.is_empty() {
+                format!("# [Task: {}] {}\n\n", lbl.trim(), task_summary)
+            } else {
+                format!("# [Task: {}]\n\n", lbl.trim())
+            }
+        }
+        _ => {
+            let task_summary = task
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            if !task_summary.is_empty() {
+                format!("# [Task] {}\n\n", task_summary)
+            } else {
+                String::new()
+            }
+        }
+    };
     format!(
-        "[OMO-BRIDGE READINESS BOOTSTRAP]\n\
+        "{}[OMO-BRIDGE READINESS BOOTSTRAP]\n\
 SCOPE_ID: {}\n\
 WORKSPACE: {}\n\
 GENERATION: {}\n\n\
 {} The actual coding task for this generation has NOT been sent yet. Your only allowed readiness action now is to call the omo-bridge MCP tool task_state with exactly scope_id={}. If the task_state tool schema is not loaded yet, you may perform only the minimal connector/tool discovery required to expose that exact task_state tool, then call it immediately. Do not inspect files, edit, run commands, delegate, or start coding.\n\n\
 A textual READY/OK/complete message is ignored and provides no readiness evidence. Readiness exists only if the scoped task_state MCP call succeeds and the bridge records it for this generation. After that successful tool call, stop and wait for the actual task prompt.",
+        title_line,
         scope_id,
         workspace.display(),
         generation,
@@ -2071,12 +2102,20 @@ mod tests {
     #[test]
     fn bootstrap_and_followup_prompts_encode_generation_and_resume_contract() {
         let scope = "44444444-4444-4444-8444-444444444444";
-        let bootstrap = build_bootstrap_prompt(scope, Path::new("/tmp/project"), 2, true);
+        let bootstrap = build_bootstrap_prompt(
+            scope,
+            Path::new("/tmp/project"),
+            2,
+            true,
+            Some("test-task"),
+            "fix tests and verify output",
+        );
+        assert!(bootstrap.starts_with("# [Task: test-task] fix tests and verify output\n\n"));
         assert!(bootstrap.contains("GENERATION: 2"));
         assert!(bootstrap.contains("resume readiness handshake"));
         assert!(bootstrap.contains("task_state"));
         assert!(bootstrap.contains("minimal connector/tool discovery"));
-        assert!(!bootstrap.contains("fix tests"));
+        assert!(bootstrap.contains("[OMO-BRIDGE READINESS BOOTSTRAP]"));
 
         let task = build_delegation_prompt(scope, Path::new("/tmp/project"), 2, true, "fix tests");
         assert!(task.contains("GENERATION: 2"));
