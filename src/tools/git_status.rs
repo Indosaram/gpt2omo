@@ -3,13 +3,6 @@ use crate::tools::ToolCallResult;
 use std::process::Command;
 
 const MAX_DIFF_CHARS: usize = 30_000;
-const NON_GIT_MESSAGE: &str =
-    "Workspace is not a Git repository; git status/diff checks were skipped";
-
-pub(crate) struct WorktreeCheck {
-    pub ok: bool,
-    pub output: String,
-}
 
 pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallResult {
     if !is_git_worktree(ws) {
@@ -19,8 +12,6 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
             "diff_stat": "",
             "diff": "",
             "diff_truncated": false,
-            "diff_check_ok": true,
-            "diff_check_output": NON_GIT_MESSAGE,
             "is_clean": true
         }));
     }
@@ -65,7 +56,6 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
     };
 
     let (diff, diff_truncated) = truncate_chars(&combined, MAX_DIFF_CHARS);
-    let check = check_worktree_whitespace(ws, p);
 
     ToolCallResult::ok(serde_json::json!({
         "is_git_repo": true,
@@ -74,8 +64,6 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
         "diff_stat": diff_stat,
         "diff": diff,
         "diff_truncated": diff_truncated,
-        "diff_check_ok": check.ok,
-        "diff_check_output": check.output,
         "is_clean": status_out.trim().is_empty()
     }))
 }
@@ -92,37 +80,7 @@ pub(crate) fn is_git_worktree(ws: &Workspace) -> bool {
     output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
 }
 
-pub(crate) fn check_worktree_whitespace(ws: &Workspace, target_path: Option<&str>) -> WorktreeCheck {
-    if !is_git_worktree(ws) {
-        return WorktreeCheck {
-            ok: true,
-            output: NON_GIT_MESSAGE.into(),
-        };
-    }
 
-    let mut problems = Vec::new();
-
-    if let Some(path) = target_path {
-        if let Err(e) = run_git(ws, &["diff", "--check", "--", path]) {
-            problems.push(e);
-        }
-        if let Err(e) = run_git(ws, &["diff", "--cached", "--check", "--", path]) {
-            problems.push(e);
-        }
-    } else {
-        if let Err(e) = run_git(ws, &["diff", "--check"]) {
-            problems.push(e);
-        }
-        if let Err(e) = run_git(ws, &["diff", "--cached", "--check"]) {
-            problems.push(e);
-        }
-    }
-
-    WorktreeCheck {
-        ok: problems.is_empty(),
-        output: problems.join("\n"),
-    }
-}
 
 fn run_git(ws: &Workspace, args: &[&str]) -> std::result::Result<String, String> {
     let output = Command::new("git")
@@ -214,7 +172,6 @@ mod tests {
         assert_eq!(data["is_git_repo"], true);
         assert!(data["diff"].as_str().unwrap().contains("+two"));
         assert!(!data["is_clean"].as_bool().unwrap());
-        assert!(data["diff_check_ok"].as_bool().unwrap());
     }
 
     #[test]
@@ -226,37 +183,7 @@ mod tests {
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["is_git_repo"], false);
-        assert_eq!(data["diff_check_ok"], true);
-        assert!(data["diff_check_output"]
-            .as_str()
-            .unwrap()
-            .contains("not a Git repository"));
     }
 
-    #[test]
-    fn test_worktree_check_catches_staged_whitespace() {
-        let dir = tempdir().unwrap();
-        init_git(dir.path());
-        fs::write(dir.path().join("staged.txt"), "bad trailing   \n").unwrap();
-        Command::new("git")
-            .args(["add", "staged.txt"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
 
-        let ws = Workspace::open(dir.path()).unwrap();
-        let check = check_worktree_whitespace(&ws, None);
-        assert!(!check.ok);
-        assert!(check.output.contains("whitespace"));
-    }
-
-    #[test]
-    fn test_worktree_check_skips_non_git_workspace() {
-        let dir = tempdir().unwrap();
-        let ws = Workspace::open(dir.path()).unwrap();
-
-        let check = check_worktree_whitespace(&ws, None);
-        assert!(check.ok, "{}", check.output);
-        assert!(check.output.contains("not a Git repository"));
-    }
 }
