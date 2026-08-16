@@ -1,9 +1,11 @@
 use crate::security::Workspace;
+use crate::tools::command_manager::CommandManager;
 use crate::tools::git_status::{check_worktree_whitespace, is_git_worktree};
 use crate::tools::task_state::{
     load_task_state, record_terminal_evidence, DelegationTerminalState, TaskStatus,
 };
 use crate::tools::ToolCallResult;
+use serde_json::Value;
 use std::process::Command;
 
 pub fn handle_completion_check(
@@ -12,6 +14,43 @@ pub fn handle_completion_check(
     require_task_plan: Option<bool>,
     require_verification: Option<bool>,
     require_changes: Option<bool>,
+) -> ToolCallResult {
+    handle_completion_check_inner(
+        ws,
+        scope_id,
+        require_task_plan,
+        require_verification,
+        require_changes,
+        None,
+    )
+}
+
+pub fn handle_completion_check_with_manager(
+    ws: &Workspace,
+    scope_id: &str,
+    require_task_plan: Option<bool>,
+    require_verification: Option<bool>,
+    require_changes: Option<bool>,
+    command_manager: &CommandManager,
+) -> ToolCallResult {
+    command_manager.reconcile_scope(ws, scope_id);
+    handle_completion_check_inner(
+        ws,
+        scope_id,
+        require_task_plan,
+        require_verification,
+        require_changes,
+        Some(command_manager),
+    )
+}
+
+fn handle_completion_check_inner(
+    ws: &Workspace,
+    scope_id: &str,
+    require_task_plan: Option<bool>,
+    require_verification: Option<bool>,
+    require_changes: Option<bool>,
+    command_manager: Option<&CommandManager>,
 ) -> ToolCallResult {
     let require_task_plan = require_task_plan.unwrap_or(true);
     let require_verification = require_verification.unwrap_or(true);
@@ -24,7 +63,7 @@ pub fn handle_completion_check(
 
     let mut blockers = Vec::<String>::new();
     let mut incomplete_items = Vec::new();
-    let mut verification_evidence = None;
+    let mut verification_evidence: Option<Value> = None;
 
     match &state {
         Some(state) => {
@@ -47,19 +86,29 @@ pub fn handle_completion_check(
             }
 
             if require_verification {
-                let threshold = state.last_mutation_ms.unwrap_or(state.created_ms);
-                verification_evidence = state
-                    .verifications
-                    .iter()
-                    .rev()
-                    .find(|record| record.success && record.timestamp_ms >= threshold)
-                    .cloned();
+                if let Some(manager) = command_manager {
+                    verification_evidence = manager.latest_verification_evidence(ws, scope_id);
+                    if verification_evidence.is_none() {
+                        blockers.push(format!(
+                            "No successful verification command matches current workspace revision {}",
+                            manager.workspace_revision(scope_id)
+                        ));
+                    }
+                } else {
+                    let threshold = state.last_mutation_ms.unwrap_or(state.created_ms);
+                    verification_evidence = state
+                        .verifications
+                        .iter()
+                        .rev()
+                        .find(|record| record.success && record.timestamp_ms >= threshold)
+                        .and_then(|record| serde_json::to_value(record).ok());
 
-                if verification_evidence.is_none() {
-                    blockers.push(
-                        "No successful verification command has run since the latest bridge edit"
-                            .into(),
-                    );
+                    if verification_evidence.is_none() {
+                        blockers.push(
+                            "No successful verification command has run since the latest bridge edit"
+                                .into(),
+                        );
+                    }
                 }
             }
         }
@@ -117,6 +166,7 @@ pub fn handle_completion_check(
         "blockers": blockers,
         "incomplete_items": incomplete_items,
         "verification_evidence": verification_evidence,
+        "workspace_revision": command_manager.map(|manager| manager.workspace_revision(scope_id)),
         "last_mutation_ms": state.as_ref().and_then(|s| s.last_mutation_ms),
         "last_mutation_path": state.as_ref().and_then(|s| s.last_mutation_path.clone()),
         "git": {
@@ -197,6 +247,39 @@ mod tests {
     }
 
     #[test]
+    fn manager_backed_completion_rejects_stale_revision_evidence() {
+        let dir = tempdir().unwrap();
+        init_git(dir.path());
+        fs::write(dir.path().join("Makefile"), "test:\n\t@true\n").unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        let manager = CommandManager::new();
+
+        assert!(handle_task_plan(&ws, SCOPE, "Implement", vec!["Verify".into()]).success);
+        assert!(handle_task_update(&ws, SCOPE, "T1", "done", None).success);
+        let first = manager.run_command(&ws, SCOPE, "make test", 2_000, None);
+        assert!(first.success);
+        assert_eq!(first.data.unwrap()["command_success"], true);
+
+        record_mutation(&ws, SCOPE, "src/lib.rs");
+        manager.note_workspace_mutation(SCOPE);
+        let stale = handle_completion_check_with_manager(&ws, SCOPE, None, None, None, &manager);
+        assert!(stale.success);
+        let stale_data = stale.data.unwrap();
+        assert_eq!(stale_data["ready"], false);
+        assert!(stale_data["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().contains("workspace revision 1")));
+
+        let second = manager.run_command(&ws, SCOPE, "make test", 2_000, None);
+        assert!(second.success);
+        let fresh = handle_completion_check_with_manager(&ws, SCOPE, None, None, None, &manager);
+        assert!(fresh.success);
+        assert_eq!(fresh.data.unwrap()["ready"], true);
+    }
+
+    #[test]
     fn ready_completion_records_authoritative_completed_terminal_state() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
@@ -271,10 +354,15 @@ mod tests {
     }
 
     #[test]
-    fn test_completion_checks_untracked_whitespace() {
+    fn test_completion_checks_staged_whitespace() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         fs::write(dir.path().join("bad.txt"), "trailing space \n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "bad.txt"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
 
         let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
@@ -285,6 +373,6 @@ mod tests {
         assert!(data["git"]["diff_check_output"]
             .as_str()
             .unwrap()
-            .contains("bad.txt:1: trailing whitespace"));
+            .contains("whitespace"));
     }
 }

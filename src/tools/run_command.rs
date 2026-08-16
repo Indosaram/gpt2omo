@@ -1,19 +1,24 @@
 use crate::security::Workspace;
+use crate::tools::command_manager::CommandManager;
 use crate::tools::ToolCallResult;
-use std::io::Read;
 use std::path::{Component, Path};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
 
-const MAX_CAPTURE_BYTES: usize = 120_000;
+const LEGACY_SCOPE_ID: &str = "00000000-0000-4000-8000-000000000000";
 
-pub fn handle_run_command(ws: &Workspace, cmd_str: &str, timeout_ms: u64) -> ToolCallResult {
-    let parts = match split_command_line(cmd_str) {
-        Ok(parts) if !parts.is_empty() => parts,
-        Ok(_) => return ToolCallResult::err("Empty command string"),
-        Err(e) => return ToolCallResult::err(e),
-    };
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedCommand {
+    pub(crate) binary: String,
+    pub(crate) args: Vec<String>,
+}
+
+pub(crate) fn prepare_command(
+    ws: &Workspace,
+    cmd_str: &str,
+) -> std::result::Result<PreparedCommand, String> {
+    let parts = split_command_line(cmd_str)?;
+    if parts.is_empty() {
+        return Err("Empty command string".into());
+    }
 
     let binary = &parts[0];
     let args = &parts[1..];
@@ -22,76 +27,25 @@ pub fn handle_run_command(ws: &Workspace, cmd_str: &str, timeout_ms: u64) -> Too
     // repository build/test/verification and narrowly-scoped git operations only.
     let allowed = ["cargo", "npm", "git", "pytest", "vitest", "go", "make"];
     if !allowed.contains(&binary.as_str()) {
-        return ToolCallResult::err(format!(
+        return Err(format!(
             "Command '{}' is not in the allowed execution whitelist",
             binary
         ));
     }
 
-    if let Err(e) = validate_command_shape(binary, args) {
-        return ToolCallResult::err(e);
-    }
-    if let Err(e) = validate_obvious_path_escapes(ws, args) {
-        return ToolCallResult::err(e);
-    }
+    validate_command_shape(binary, args)?;
+    validate_obvious_path_escapes(ws, args)?;
 
-    let start = Instant::now();
-    let mut child = match Command::new(binary)
-        .args(args)
-        .current_dir(ws.root())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return ToolCallResult::err(format!("Failed to execute command: {}", e)),
-    };
+    Ok(PreparedCommand {
+        binary: binary.clone(),
+        args: args.to_vec(),
+    })
+}
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_reader = thread::spawn(move || read_pipe(stdout));
-    let stderr_reader = thread::spawn(move || read_pipe(stderr));
-
-    let timeout = Duration::from_millis(timeout_ms.max(1));
-    let (status, timed_out) = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break (Some(status), false),
-            Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let status = child.wait().ok();
-                break (status, true);
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return ToolCallResult::err(format!("Failed while waiting for command: {}", e));
-            }
-        }
-    };
-
-    let stdout_bytes = stdout_reader.join().unwrap_or_default();
-    let stderr_bytes = stderr_reader.join().unwrap_or_default();
-    let (stdout, stdout_truncated) = truncate_output(&stdout_bytes);
-    let (stderr, stderr_truncated) = truncate_output(&stderr_bytes);
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let exit_code = status.as_ref().and_then(|s| s.code());
-    let command_success = status.as_ref().is_some_and(|s| s.success()) && !timed_out;
-
-    ToolCallResult::ok(serde_json::json!({
-        "command": cmd_str,
-        "success": command_success,
-        "exit_code": exit_code,
-        "timed_out": timed_out,
-        "stdout": stdout,
-        "stderr": stderr,
-        "stdout_truncated": stdout_truncated,
-        "stderr_truncated": stderr_truncated,
-        "duration_ms": duration_ms
-    }))
+/// Compatibility wrapper for in-process callers. The MCP server owns a single shared
+/// `CommandManager`; callers that need polling/cancellation should use that manager directly.
+pub fn handle_run_command(ws: &Workspace, cmd_str: &str, timeout_ms: u64) -> ToolCallResult {
+    CommandManager::new().run_command(ws, LEGACY_SCOPE_ID, cmd_str, timeout_ms, None)
 }
 
 fn validate_command_shape(binary: &str, args: &[String]) -> std::result::Result<(), String> {
@@ -149,33 +103,6 @@ fn validate_command_shape(binary: &str, args: &[String]) -> std::result::Result<
         }
     }
     Ok(())
-}
-
-fn read_pipe<R: Read>(pipe: Option<R>) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    if let Some(mut pipe) = pipe {
-        let _ = pipe.read_to_end(&mut bytes);
-    }
-    bytes
-}
-
-fn truncate_output(bytes: &[u8]) -> (String, bool) {
-    if bytes.len() <= MAX_CAPTURE_BYTES {
-        return (String::from_utf8_lossy(bytes).to_string(), false);
-    }
-
-    let half = MAX_CAPTURE_BYTES / 2;
-    let head = String::from_utf8_lossy(&bytes[..half]);
-    let tail = String::from_utf8_lossy(&bytes[bytes.len() - half..]);
-    (
-        format!(
-            "{}\n\n...[output truncated by omo-bridge; {} bytes omitted]...\n\n{}",
-            head,
-            bytes.len().saturating_sub(MAX_CAPTURE_BYTES),
-            tail
-        ),
-        true,
-    )
 }
 
 fn split_command_line(input: &str) -> std::result::Result<Vec<String>, String> {
@@ -275,7 +202,7 @@ mod tests {
 
         let ok_res = handle_run_command(&ws, "git --version", 5000);
         assert!(ok_res.success);
-        assert!(ok_res.data.unwrap()["success"].as_bool().unwrap());
+        assert!(ok_res.data.unwrap()["command_success"].as_bool().unwrap());
 
         let denied_res = handle_run_command(&ws, "python3 -c \"print('escape')\"", 5000);
         assert!(!denied_res.success);
@@ -299,11 +226,10 @@ mod tests {
     fn test_absolute_path_outside_workspace_is_denied() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_run_command(&ws, "git status --git-dir=/tmp/outside", 5000);
-        assert!(!result.success);
+        let result = prepare_command(&ws, "git status --git-dir=/tmp/outside");
+        assert!(result.is_err());
         assert!(result
-            .error
-            .unwrap()
+            .unwrap_err()
             .contains("outside the mounted workspace"));
     }
 
@@ -311,9 +237,9 @@ mod tests {
     fn test_parent_traversal_inside_option_value_is_denied() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_run_command(&ws, "cargo test --manifest-path=../Cargo.toml", 5000);
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("Parent-directory traversal"));
+        let result = prepare_command(&ws, "cargo test --manifest-path=../Cargo.toml");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Parent-directory traversal"));
     }
 
     #[test]
@@ -325,6 +251,6 @@ mod tests {
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["timed_out"], true);
-        assert_eq!(data["success"], false);
+        assert_eq!(data["command_success"], false);
     }
 }

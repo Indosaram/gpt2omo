@@ -20,3 +20,5 @@
 *.swo
 .pi/
 .senpi/
+.omo/
+omo-bridge-local-excludes

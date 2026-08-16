@@ -26,7 +26,11 @@ const DEFAULT_SESSION_GC_INTERVAL_SECS: u64 = 60;
 )]
 struct Cli {
     /// omo-bridge SSE event endpoint.
-    #[arg(long, default_value = "http://127.0.0.1:18800/events")]
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:18800/events",
+        env = "OMO_BRIDGE_EVENTS_URL"
+    )]
     events_url: String,
 
     /// Broad mount root used by the bridge daemon.
@@ -34,7 +38,7 @@ struct Cli {
     mount_root: PathBuf,
 
     /// Override the shared directory containing per-delegation workspace scopes.
-    #[arg(long)]
+    #[arg(long, env = "OMO_SCOPE_DIR")]
     scope_dir: Option<PathBuf>,
 
     /// Orca worktree selector used for browser pages and legacy terminal discovery.
@@ -118,6 +122,7 @@ impl SseFrame {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    omo_bridge::load_dotenv_if_present();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -412,9 +417,13 @@ fn continuation_scope(mux: &WorkspaceMux, scope_id: &str) -> Result<omo_bridge::
 fn events_port(events_url: &str) -> Result<u16> {
     let parsed = Url::parse(events_url)
         .with_context(|| format!("invalid events URL for scope routing: {events_url}"))?;
-    parsed
+    let port = parsed
         .port_or_known_default()
-        .ok_or_else(|| anyhow!("events URL has no resolvable port: {events_url}"))
+        .ok_or_else(|| anyhow!("events URL has no resolvable port: {events_url}"))?;
+    if port == 80 || port == 443 {
+        return Ok(18800);
+    }
+    Ok(port)
 }
 
 fn session_ttl_ms(minutes: u64) -> Result<u64> {

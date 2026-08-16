@@ -1128,6 +1128,7 @@ dependencies = [
  "hex",
  "http",
  "ignore",
+ "libc",
  "reqwest",
  "rmcp",
  "schemars",

@@ -20,12 +20,17 @@ fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String
         token: None,
         max_file_bytes: 10 * 1024 * 1024,
         command_timeout_ms: 5_000,
+        subagent_endpoint: None,
+        subagent_api_key: None,
+        subagent_model: "deepseek-v4-flash-free".into(),
+        subagent_allow_remote: false,
     };
     let events = Arc::new(EventBus::new(dir.path().to_string_lossy().to_string()));
     let app = create_router(AppState {
         workspace: Arc::new(mux.clone()),
         cli: Arc::new(cli),
         events: events.clone(),
+        commands: Arc::new(omo_bridge::tools::CommandManager::new()),
     });
     (app, events, mux, scope.scope_id)
 }
@@ -38,12 +43,17 @@ fn app_for_mux(mount: &TempDir, scope_dir: std::path::PathBuf, mux: &WorkspaceMu
         token: None,
         max_file_bytes: 10 * 1024 * 1024,
         command_timeout_ms: 5_000,
+        subagent_endpoint: None,
+        subagent_api_key: None,
+        subagent_model: "deepseek-v4-flash-free".into(),
+        subagent_allow_remote: false,
     };
     let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
     create_router(AppState {
         workspace: Arc::new(mux.clone()),
         cli: Arc::new(cli),
         events,
+        commands: Arc::new(omo_bridge::tools::CommandManager::new()),
     })
 }
 
@@ -58,6 +68,11 @@ async fn rpc(app: axum::Router, payload: Value) -> Value {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+fn nested_tool_result(response: &Value) -> Value {
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    serde_json::from_str(text).unwrap()
 }
 
 #[tokio::test]
@@ -76,10 +91,10 @@ async fn initialize_and_tools_list_smoke() {
     )
     .await;
     assert_eq!(init["result"]["serverInfo"]["version"], "0.7.0");
-    assert!(init["result"]["instructions"]
-        .as_str()
-        .unwrap()
-        .contains("scope_id"));
+    let instructions = init["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("scope_id"));
+    assert!(instructions.contains("detached_running"));
+    assert!(instructions.contains("stale_revision"));
 
     let tools = rpc(
         app,
@@ -94,8 +109,8 @@ async fn initialize_and_tools_list_smoke() {
     let tools = tools["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        15,
-        "the MCP schema must remain exactly 15 tools"
+        18,
+        "the MCP schema must expose 18 standard tools when subagent support is disabled"
     );
     let names: Vec<&str> = tools
         .iter()
@@ -108,11 +123,16 @@ async fn initialize_and_tools_list_smoke() {
         "lsp_definition",
         "lsp_references",
         "lsp_symbols",
+        "run_command",
+        "poll_command",
+        "list_commands",
+        "cancel_command",
         "task_plan",
         "completion_check",
     ] {
         assert!(names.contains(&required), "missing tool: {}", required);
     }
+    assert!(!names.contains(&"query_subagent"));
     for tool in tools {
         assert!(tool["inputSchema"]["properties"]["scope_id"].is_object());
         assert!(tool["inputSchema"]["required"]
@@ -239,11 +259,105 @@ async fn tools_call_dispatches_search_text_smoke() {
     .await;
 
     assert_eq!(response["result"]["isError"], false);
-    let text = response["result"]["content"][0]["text"].as_str().unwrap();
-    let nested: Value = serde_json::from_str(text).unwrap();
+    let nested = nested_tool_result(&response);
     assert_eq!(nested["success"], true);
     assert_eq!(nested["data"]["match_count"], 1);
     assert_eq!(nested["data"]["matches"][0]["path"], "sample.rs");
+}
+
+#[tokio::test]
+async fn command_endpoints_share_daemon_state_and_idempotency() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _, _, scope_id) = test_app(&dir);
+
+    let first = rpc(
+        app.clone(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 300,
+            "method": "tools/call",
+            "params": {
+                "name": "run_command",
+                "arguments": {
+                    "scope_id": scope_id,
+                    "command": "git --version",
+                    "client_request_id": "quick-sync-1"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(first["result"]["isError"], false);
+    let first_nested = nested_tool_result(&first);
+    assert_eq!(first_nested["data"]["status"], "completed");
+    assert_eq!(first_nested["data"]["command_success"], true);
+    let command_id = first_nested["data"]["command_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let retry = rpc(
+        app.clone(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 301,
+            "method": "tools/call",
+            "params": {
+                "name": "run_command",
+                "arguments": {
+                    "scope_id": scope_id,
+                    "command": "git --version",
+                    "client_request_id": "quick-sync-1"
+                }
+            }
+        }),
+    )
+    .await;
+    let retry_nested = nested_tool_result(&retry);
+    assert_eq!(retry_nested["data"]["command_id"], command_id);
+    assert_eq!(retry_nested["data"]["idempotent_replay"], true);
+
+    let polled = rpc(
+        app.clone(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 302,
+            "method": "tools/call",
+            "params": {
+                "name": "poll_command",
+                "arguments": {
+                    "scope_id": scope_id,
+                    "command_id": command_id,
+                    "wait_timeout_ms": 15000
+                }
+            }
+        }),
+    )
+    .await;
+    let polled_nested = nested_tool_result(&polled);
+    assert_eq!(polled_nested["data"]["status"], "completed");
+    assert_eq!(polled_nested["data"]["command_success"], true);
+
+    let listed = rpc(
+        app,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 303,
+            "method": "tools/call",
+            "params": {
+                "name": "list_commands",
+                "arguments": {"scope_id": scope_id}
+            }
+        }),
+    )
+    .await;
+    let listed_nested = nested_tool_result(&listed);
+    assert_eq!(listed_nested["data"]["active_count"], 0);
+    assert!(listed_nested["data"]["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["command_id"] == command_id));
 }
 
 #[tokio::test]
@@ -343,12 +457,17 @@ async fn two_scopes_access_separate_workspaces_without_global_switch() {
         token: None,
         max_file_bytes: 1024,
         command_timeout_ms: 5_000,
+        subagent_endpoint: None,
+        subagent_api_key: None,
+        subagent_model: "deepseek-v4-flash-free".into(),
+        subagent_allow_remote: false,
     };
     let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
     let app = create_router(AppState {
         workspace: Arc::new(mux),
         cli: Arc::new(cli),
         events,
+        commands: Arc::new(omo_bridge::tools::CommandManager::new()),
     });
 
     let first_read = rpc(

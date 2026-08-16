@@ -6,6 +6,7 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    omo_bridge::load_dotenv_if_present();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -35,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
         workspace: Arc::new(workspaces),
         cli: Arc::new(cli.clone()),
         events,
+        commands: Arc::new(omo_bridge::tools::CommandManager::new()),
     };
 
     let router = create_router(state);

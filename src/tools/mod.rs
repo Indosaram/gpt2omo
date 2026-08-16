@@ -28,6 +28,7 @@ impl ToolCallResult {
 }
 
 pub mod ast_grep;
+pub mod command_manager;
 pub mod completion;
 pub mod git_status;
 pub mod list_files;
@@ -36,10 +37,12 @@ pub mod patch_file;
 pub mod read_file;
 pub mod run_command;
 pub mod search_text;
+pub mod subagent;
 pub mod task_state;
 
 pub use ast_grep::handle_ast_grep;
-pub use completion::handle_completion_check;
+pub use command_manager::CommandManager;
+pub use completion::{handle_completion_check, handle_completion_check_with_manager};
 pub use git_status::handle_git_status;
 pub use list_files::handle_list_files;
 pub use lsp::{handle_lsp, LspOperation};
@@ -47,6 +50,7 @@ pub use patch_file::handle_patch_file;
 pub use read_file::handle_read_file;
 pub use run_command::handle_run_command;
 pub use search_text::handle_search_text;
+pub use subagent::handle_query_subagent;
 pub use task_state::{
     handle_task_plan, handle_task_state, handle_task_update, record_mutation, record_verification,
 };

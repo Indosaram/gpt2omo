@@ -2,11 +2,15 @@ use crate::security::Workspace;
 use crate::tools::ToolCallResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_VERIFICATION_HISTORY: usize = 50;
+const TERMINAL_CLAIM_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const TERMINAL_CLAIM_LOCK_RETRY: Duration = Duration::from_millis(2);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -496,8 +500,64 @@ pub fn record_terminal_evidence(
     terminal_state: DelegationTerminalState,
     detail: Option<&str>,
 ) -> std::result::Result<DelegationLifecycle, String> {
-    let mut lifecycle =
-        load_delegation_lifecycle(ws, scope_id)?.unwrap_or_else(|| new_lifecycle(scope_id, 1));
+    let lifecycle_path = lifecycle_path(ws, scope_id)?;
+    let _claim_lock = LifecycleClaimLock::acquire(&lifecycle_path)?;
+    let expected_generation = load_delegation_lifecycle(ws, scope_id)?
+        .map(|lifecycle| lifecycle.generation)
+        .unwrap_or(1);
+    record_terminal_evidence_locked(
+        ws,
+        scope_id,
+        expected_generation,
+        terminal_state,
+        detail,
+        true,
+    )
+}
+
+pub fn record_terminal_evidence_if_active(
+    ws: &Workspace,
+    scope_id: &str,
+    expected_generation: u64,
+    terminal_state: DelegationTerminalState,
+    detail: Option<&str>,
+) -> std::result::Result<DelegationLifecycle, String> {
+    if expected_generation == 0 {
+        return Err("Expected delegation generation must be greater than zero".to_string());
+    }
+    let lifecycle_path = lifecycle_path(ws, scope_id)?;
+    let _claim_lock = LifecycleClaimLock::acquire(&lifecycle_path)?;
+    record_terminal_evidence_locked(
+        ws,
+        scope_id,
+        expected_generation,
+        terminal_state,
+        detail,
+        false,
+    )
+}
+
+fn record_terminal_evidence_locked(
+    ws: &Workspace,
+    scope_id: &str,
+    expected_generation: u64,
+    terminal_state: DelegationTerminalState,
+    detail: Option<&str>,
+    create_if_missing: bool,
+) -> std::result::Result<DelegationLifecycle, String> {
+    let mut lifecycle = match load_delegation_lifecycle(ws, scope_id)? {
+        Some(lifecycle) => lifecycle,
+        None if create_if_missing => new_lifecycle(scope_id, expected_generation),
+        None => return Err("No active delegation lifecycle exists".to_string()),
+    };
+
+    if lifecycle.generation != expected_generation {
+        return Err(format!(
+            "Refusing terminal claim for stale generation {} (current {})",
+            expected_generation, lifecycle.generation
+        ));
+    }
+
     if lifecycle.terminal_state.is_none() {
         let now = now_ms();
         lifecycle.terminal_state = Some(terminal_state);
@@ -510,6 +570,56 @@ pub fn record_terminal_evidence(
         save_lifecycle(ws, scope_id, &lifecycle)?;
     }
     Ok(lifecycle)
+}
+
+struct LifecycleClaimLock {
+    path: PathBuf,
+}
+
+impl LifecycleClaimLock {
+    fn acquire(lifecycle_path: &Path) -> std::result::Result<Self, String> {
+        let parent = lifecycle_path
+            .parent()
+            .ok_or_else(|| "Delegation lifecycle path has no parent".to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create lifecycle directory: {}", error))?;
+        let file_name = lifecycle_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "Delegation lifecycle path has no file name".to_string())?;
+        let lock_path = parent.join(format!(".{}.terminal-claim.lock", file_name));
+        let started = Instant::now();
+
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(Self { path: lock_path }),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if started.elapsed() >= TERMINAL_CLAIM_LOCK_TIMEOUT {
+                        return Err(
+                            "Timed out acquiring delegation terminal claim lock".to_string()
+                        );
+                    }
+                    thread::sleep(TERMINAL_CLAIM_LOCK_RETRY);
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to acquire delegation terminal claim lock: {}",
+                        error
+                    ))
+                }
+            }
+        }
+    }
+}
+
+impl Drop for LifecycleClaimLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 pub fn clear_delegation_lifecycle(
@@ -659,6 +769,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
     use tempfile::tempdir;
 
     const SCOPE_A: &str = "11111111-1111-4111-8111-111111111111";
@@ -894,6 +1005,81 @@ mod tests {
         .unwrap();
         assert_eq!(state.terminal_state, Some(DelegationTerminalState::Failed));
         assert_eq!(state.terminal_detail.as_deref(), Some("transport failed"));
+    }
+
+    #[test]
+    fn concurrent_terminal_claims_are_atomic_and_first_writer_wins() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let ws = Workspace::open(&root).unwrap();
+        clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+
+        let worker_count = 16;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let mut handles = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let root = root.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let ws = Workspace::open(&root).unwrap();
+                let state = if index % 2 == 0 {
+                    DelegationTerminalState::Completed
+                } else {
+                    DelegationTerminalState::Blocked
+                };
+                let detail = if index % 2 == 0 {
+                    "worker_completed"
+                } else {
+                    "helper_blocked"
+                };
+                barrier.wait();
+                record_terminal_evidence_if_active(&ws, SCOPE_A, 1, state, Some(detail)).unwrap()
+            }));
+        }
+
+        let claims = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let final_state = load_delegation_lifecycle(&ws, SCOPE_A).unwrap().unwrap();
+        assert!(final_state.terminal_state.is_some());
+        for claim in claims {
+            assert_eq!(claim.terminal_state, final_state.terminal_state);
+            assert_eq!(claim.terminal_detail, final_state.terminal_detail);
+        }
+    }
+
+    #[test]
+    fn terminal_claim_rejects_stale_generation_without_mutating_current_generation() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        clear_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        record_terminal_evidence_if_active(
+            &ws,
+            SCOPE_A,
+            1,
+            DelegationTerminalState::Completed,
+            Some("generation_one_done"),
+        )
+        .unwrap();
+        retain_session_with_lease(&ws, SCOPE_A, 10_000).unwrap();
+        let next = start_next_delegation_generation(&ws, SCOPE_A, false).unwrap();
+        assert_eq!(next.generation, 2);
+
+        let error = record_terminal_evidence_if_active(
+            &ws,
+            SCOPE_A,
+            1,
+            DelegationTerminalState::Blocked,
+            Some("stale_helper"),
+        )
+        .unwrap_err();
+        assert!(error.contains("stale generation"));
+        let current = load_delegation_lifecycle(&ws, SCOPE_A).unwrap().unwrap();
+        assert_eq!(current.generation, 2);
+        assert!(current.terminal_state.is_none());
     }
 
     #[test]
