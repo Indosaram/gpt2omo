@@ -2,7 +2,7 @@ use crate::security::Workspace;
 use crate::tools::ToolCallResult;
 use std::process::Command;
 
-const MAX_DIFF_CHARS: usize = 120_000;
+const MAX_DIFF_CHARS: usize = 30_000;
 const NON_GIT_MESSAGE: &str =
     "Workspace is not a Git repository; git status/diff checks were skipped";
 
