@@ -393,7 +393,7 @@ fn tool_definitions(subagent_enabled: bool) -> Vec<Value> {
         ),
         tool_definition(
             "run_command",
-            "Spawn a whitelisted build/test/verification command through the daemon-owned CommandManager. The MCP request waits at most 15 seconds; longer work returns status=detached_running with command_id and bounded partial output. Verification evidence is revision-aware.",
+            "Spawn a build/test/verification command through the daemon-owned CommandManager. The MCP request waits at most 15 seconds; longer work returns status=detached_running with command_id and bounded partial output. Verification evidence is revision-aware.",
             serde_json::json!({
                 "command": { "type": "string", "description": "Command such as cargo test, cargo clippy -- -D warnings, npm test, pytest, vitest, go test, or git status" },
                 "timeout_ms": { "type": "integer", "minimum": 1, "description": "Optional process lifetime timeout; clamped to the daemon command timeout" },

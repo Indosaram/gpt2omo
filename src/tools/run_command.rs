@@ -23,17 +23,6 @@ pub(crate) fn prepare_command(
     let binary = &parts[0];
     let args = &parts[1..];
 
-    // Deliberately no shell or general-purpose interpreter is exposed here. This runner is for
-    // repository build/test/verification and narrowly-scoped git operations only.
-    let allowed = ["cargo", "npm", "git", "pytest", "vitest", "go", "make"];
-    if !allowed.contains(&binary.as_str()) {
-        return Err(format!(
-            "Command '{}' is not in the allowed execution whitelist",
-            binary
-        ));
-    }
-
-    validate_command_shape(binary, args)?;
     validate_obvious_path_escapes(ws, args)?;
 
     Ok(PreparedCommand {
@@ -48,62 +37,7 @@ pub fn handle_run_command(ws: &Workspace, cmd_str: &str, timeout_ms: u64) -> Too
     CommandManager::new().run_command(ws, LEGACY_SCOPE_ID, cmd_str, timeout_ms, None)
 }
 
-fn validate_command_shape(binary: &str, args: &[String]) -> std::result::Result<(), String> {
-    let first = args.first().map(String::as_str).unwrap_or("");
-    match binary {
-        "cargo" => {
-            if !["test", "check", "clippy", "build", "fmt"].contains(&first) {
-                return Err(format!("cargo subcommand '{}' is not allowed", first));
-            }
-        }
-        "npm" => match first {
-            "test" => {}
-            "run" => {
-                let script = args.get(1).map(String::as_str).unwrap_or("");
-                if !["test", "build", "lint", "typecheck"].contains(&script) {
-                    return Err(format!("npm run script '{}' is not allowed", script));
-                }
-            }
-            _ => return Err(format!("npm subcommand '{}' is not allowed", first)),
-        },
-        "git" => {
-            if first == "--version" {
-                return Ok(());
-            }
-            if ![
-                "status",
-                "diff",
-                "add",
-                "commit",
-                "rev-parse",
-                "log",
-                "show",
-            ]
-            .contains(&first)
-            {
-                return Err(format!("git subcommand '{}' is not allowed", first));
-            }
-        }
-        "go" => {
-            if !["test", "vet"].contains(&first) {
-                return Err(format!("go subcommand '{}' is not allowed", first));
-            }
-        }
-        "make" => {
-            if !["test", "check"].contains(&first) {
-                return Err(format!("make target '{}' is not allowed", first));
-            }
-        }
-        "pytest" | "vitest" => {}
-        _ => {
-            return Err(format!(
-                "Unsupported command '{}'; whitelist is inconsistent",
-                binary
-            ))
-        }
-    }
-    Ok(())
-}
+// Command line parsing
 
 fn split_command_line(input: &str) -> std::result::Result<Vec<String>, String> {
     let mut parts = Vec::new();
@@ -196,24 +130,13 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_run_command_whitelist_and_subcommands() {
+    fn test_run_command_execution() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
 
         let ok_res = handle_run_command(&ws, "git --version", 5000);
         assert!(ok_res.success);
         assert!(ok_res.data.unwrap()["command_success"].as_bool().unwrap());
-
-        let denied_res = handle_run_command(&ws, "python3 -c \"print('escape')\"", 5000);
-        assert!(!denied_res.success);
-        assert!(denied_res
-            .error
-            .unwrap()
-            .contains("not in the allowed execution whitelist"));
-
-        let denied_git = handle_run_command(&ws, "git config --global user.name attacker", 5000);
-        assert!(!denied_git.success);
-        assert!(denied_git.error.unwrap().contains("git subcommand"));
     }
 
     #[test]
