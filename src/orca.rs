@@ -239,7 +239,7 @@ pub struct ChatgptPageProbe {
 
 const CHATGPT_UI_PROBE_EXPRESSION: &str = r#"(() => {
   const MESSAGE_SELECTOR = '[data-message-author-role], article, [data-testid^="conversation-turn"], [data-message-id]';
-  const SYSTEM_SELECTOR = '[role="alert"], [role="dialog"], [data-sonner-toast], [data-testid*="toast"], [data-testid*="notification"], [class~="toast"], [class~="notification"]';
+  const SYSTEM_SELECTOR = '[data-testid*="rate-limit"], [data-testid*="modal"], [role="alert"], [role="dialog"], [data-sonner-toast], [data-testid*="toast"], [data-testid*="notification"], [class~="toast"], [class~="notification"], [class*="modal"], [class*="popover"]';
   const isVisible = (el) => {
     if (!el || !(el instanceof Element)) return false;
     const style = window.getComputedStyle(el);
@@ -266,7 +266,7 @@ const CHATGPT_UI_PROBE_EXPRESSION: &str = r#"(() => {
   const ready = !!composer && isVisible(composer);
 
   const rateReason = (text) => {
-    if (/\btoo many (?:requests|messages)\b|\brate limit(?:ed| reached)?\b/.test(text)) return 'too_many_requests';
+    if (/\btoo many (?:requests|messages)\b|\brate limit(?:ed| reached)?\b|\bmaking requests too quickly\b|\btemporarily limited access\b|\blimited access to your conversations\b|\bwait a few minutes before trying again\b/.test(text)) return 'too_many_requests';
     if (/\b(?:at|over) capacity\b|\bcapacity (?:limit|reached)\b/.test(text)) return 'capacity';
     if (/\b(?:model|gpt[-\w]*)[^.\n]{0,80}\b(?:usage )?limit\b|\blimit[^.\n]{0,80}\b(?:model|gpt[-\w]*)\b/.test(text)) return 'model_quota';
     if (/\b(?:you(?:'ve| have)? )?(?:reached|hit) (?:the )?(?:current )?(?:usage |message )?limit\b|\busage limit\b|\blimit reached\b/.test(text)) return 'usage_limit';

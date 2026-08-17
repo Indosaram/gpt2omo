@@ -612,14 +612,38 @@ fn prepare_tasks(cli: &Cli) -> Result<Vec<PreparedTask>> {
         .collect()
 }
 
+fn max_parallel_workers() -> usize {
+    std::env::var("OMO_MAX_WEB_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(MAX_PARALLEL_WEB_WORKERS)
+}
+
+fn count_active_in_flight_workers(mux: &WorkspaceMux) -> Result<usize> {
+    let scopes = mux.list_scopes()?;
+    let mut count = 0;
+    for scope in scopes {
+        if let Ok(workspace) = mux.resolve(&scope.scope_id) {
+            if let Ok(Some(lifecycle)) = load_delegation_lifecycle(&workspace, &scope.scope_id) {
+                if lifecycle.terminal_state.is_none() {
+                    count += 1;
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
 fn validate_parallel_count(count: usize) -> Result<()> {
+    let max = max_parallel_workers();
     if count == 0 {
         return Err(anyhow!("at least one Web delegation task is required"));
     }
-    if count > MAX_PARALLEL_WEB_WORKERS {
+    if count > max {
         return Err(anyhow!(
             "parallel Web delegation is limited to {} workers; received {}",
-            MAX_PARALLEL_WEB_WORKERS,
+            max,
             count
         ));
     }
@@ -663,6 +687,17 @@ async fn stage_browser_delegations(
     orca: &OrcaConfig,
     tasks: &[PreparedTask],
 ) -> Result<Vec<StagedDelegation>> {
+    let max = max_parallel_workers();
+    let active = count_active_in_flight_workers(mux)?;
+    if active + tasks.len() > max {
+        return Err(anyhow!(
+            "active concurrent Web delegations limit reached (currently {} active in-flight worker(s), requested {}, max concurrent limit is {})",
+            active,
+            tasks.len(),
+            max
+        ));
+    }
+
     let mut staged = Vec::with_capacity(tasks.len());
     for task in tasks {
         let page = match create_chatgpt_tab(orca).await {
@@ -716,6 +751,16 @@ async fn stage_resume_delegation(
     scope_id: &str,
     task: &str,
 ) -> Result<ResumeStage> {
+    let max = max_parallel_workers();
+    let active = count_active_in_flight_workers(mux)?;
+    if active >= max {
+        return Err(anyhow!(
+            "active concurrent Web delegations limit reached (currently {} active in-flight worker(s), max concurrent limit is {})",
+            active,
+            max
+        ));
+    }
+
     let scope_lock = mux.lock_scope(scope_id)?;
     let (scope, workspace, previous) = load_resumable_scope(mux, scope_id)?;
     let page = scope
@@ -1929,6 +1974,35 @@ mod tests {
         assert!(validate_parallel_count(3).is_ok());
         let error = validate_parallel_count(4).unwrap_err().to_string();
         assert!(error.contains("limited to 3 workers"));
+    }
+
+    #[test]
+    fn active_in_flight_workers_are_counted_correctly() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let scopes = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
+
+        let s1 = mux.register_browser(&project, "page-1".into()).unwrap();
+        let ws1 = mux.resolve(&s1.scope_id).unwrap();
+        start_fresh_delegation_lifecycle(&ws1, &s1.scope_id).unwrap();
+
+        let s2 = mux.register_browser(&project, "page-2".into()).unwrap();
+        let ws2 = mux.resolve(&s2.scope_id).unwrap();
+        start_fresh_delegation_lifecycle(&ws2, &s2.scope_id).unwrap();
+
+        assert_eq!(count_active_in_flight_workers(&mux).unwrap(), 2);
+
+        record_terminal_evidence(
+            &ws1,
+            &s1.scope_id,
+            DelegationTerminalState::Completed,
+            Some("done"),
+        )
+        .unwrap();
+
+        assert_eq!(count_active_in_flight_workers(&mux).unwrap(), 1);
     }
 
     #[test]
