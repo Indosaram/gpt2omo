@@ -221,19 +221,22 @@ __OMO_DELEGATE_WEB_BATCH__
 
 ### Session Retention Policy
 
-- **All sessions are `IDLE_RETAINED` by default** (120 min lease).
-- **Do NOT pass `--close-on-terminal` automatically**: Whether the task is coding, planning, code review, or question answering, keep the session retained so that plan/review output remains available for inspection, extraction, and follow-up iterations in the same browser conversation.
-- `--close-on-terminal` is an optional override strictly reserved for explicit one-shot throwaway dispatches where closing the browser tab immediately is specifically intended.
+- **Dispatch with `IDLE_RETAINED` by default** (120 min lease).
+- **Do NOT pass `--close-on-terminal` on initial dispatch**: Keep the session retained until you receive, inspect, and extract the complete output/plan/changes without risking premature tab closure.
+- `--close-on-terminal` is strictly reserved for throwaway executions where the output is not needed.
 
-## After a terminal result
+## When and How to Close a Session
 
-- `COMPLETED`, `BLOCKED`, and `FAILED` sessions remain retained and resumable by default.
-- You can inspect the conversation in the browser or resume the session for follow-ups.
-- If the user explicitly asks to close the tab, you can close it with:
-  ```bash
-  {bin} --close-scope '<exact-scope-id>' --json
-  ```
-- `LOST` is automatically cleaned up.
+- **Explicitly close the session when it is no longer needed**:
+  - Once you have extracted and verified the full plan/review/code results,
+  - When the task is complete and accepted, or
+  - When switching to a new/unrelated task and no further follow-up prompts will be sent to this worker.
+  - Run:
+    ```bash
+    {bin} --close-scope '<exact-scope-id>' --json
+    ```
+- Do not leave inactive finished tabs open indefinitely; clean them up once their results are secured and the task is done.
+- `LOST` sessions are automatically cleaned up.
 
 ## Resume an existing retained Web conversation
 
@@ -295,9 +298,9 @@ metadata:
 `/delegate-web` separates **task terminal state** from **browser-session lifetime**.
 
 - Fresh work supports **1–3 parallel ChatGPT Web workers**; four or more are hard-rejected.
-- All Web sessions are **IDLE_RETAINED by default** (120 min lease). Do NOT pass `--close-on-terminal` automatically for plans or reviews.
+- All Web sessions are **IDLE_RETAINED by default** (120 min lease) on dispatch to prevent premature closure before results are read (`--close-on-terminal` is only for throwaway tasks).
 - `COMPLETED`, `BLOCKED`, and safely usable `FAILED` sessions remain resumable; `LOST` is cleaned up.
-- Close a session with `{bin} --close-scope '<scope-id>' --json` ONLY if the user explicitly requests closing it.
+- **Close the session once it is no longer needed**: After the coordinator has extracted the full plan/output, verified completion, and concluded that no further follow-ups are needed, explicitly run `{bin} --close-scope '<scope-id>' --json` to reclaim browser tab resources.
 - A retained result exposes `scope_id`, exact `browser_page_id`, `generation`, `session_state:IDLE_RETAINED`, `session_retained:true`, `lease_expires_ms`, and `resumable:true`.
 - Resume exactly one retained session with `{bin} --resume-scope '<scope-id>' --stdin --json`; never pass `--workspace` and never open a replacement tab.
 - Resume verifies the exact stored ChatGPT page, consumes the prior idle lease, increments generation, and automatically obtains a fresh lease when that generation becomes terminal.
