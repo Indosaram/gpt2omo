@@ -178,13 +178,13 @@ fn canonical_file(path: &Path) -> Result<PathBuf> {
 
 fn render_open_code_command(coordinator: &str) -> String {
     format!(
-        "---\ndescription: Delegate coding work to one to three parallel ChatGPT Web workers\nsubtask: false\n---\n\n{coordinator}\n"
+        "---\ndescription: Delegate coding work to one or two parallel ChatGPT Web workers\nsubtask: false\n---\n\n{coordinator}\n"
     )
 }
 
 fn render_omo_prompt(coordinator: &str) -> String {
     format!(
-        "---\ndescription: Delegate coding work to one to three parallel ChatGPT Web workers\nargument-hint: <task>\n---\n\n{coordinator}\n"
+        "---\ndescription: Delegate coding work to one or two parallel ChatGPT Web workers\nargument-hint: <task>\n---\n\n{coordinator}\n"
     )
 }
 
@@ -198,20 +198,19 @@ $ARGUMENTS
 
 Do not implement, edit, test, research, or debug the user's coding task yourself. Do not call Task/background/subagent/team tools and do not dispatch Anthropic, OMO, OpenCode, Codex, or other coding agents. Your only job is to choose a fresh Web delegation, resume an exact retained Web session, or explicitly close a retained session, then invoke the helper.
 
-## Fresh fan-out policy — hard maximum 3
+## Fresh fan-out policy — hard maximum 2
 
-Choose exactly 1, 2, or 3 workers for a fresh delegation.
+Choose exactly 1 or 2 workers for a fresh delegation.
 
 - Default to **1 worker**. Use one when the task is tightly coupled, mostly sequential, touches the same core files/state, or parallelism would create coordination risk.
 - Use **2 workers** only for two genuinely independent implementation tracks with clear ownership boundaries.
-- Use **3 workers** only for three genuinely independent tracks.
-- Never create a fourth worker. The helper independently hard-rejects more than 3 tasks.
+- Never create a third worker. The helper independently hard-rejects more than 2 tasks.
 - Do not split merely to increase parallelism.
 - OMO owns repository/worktree selection. The bridge never creates or switches worktrees.
 
 ## Fresh dispatch
 
-Construct one JSON manifest with **1–3** entries and invoke the helper once:
+Construct one JSON manifest with **1–2** entries and invoke the helper once:
 
 ```bash
 cat <<'__OMO_DELEGATE_WEB_BATCH__' | {bin} --batch-stdin --json
@@ -297,7 +296,7 @@ metadata:
 
 `/delegate-web` separates **task terminal state** from **browser-session lifetime**.
 
-- Fresh work supports **1–3 parallel ChatGPT Web workers**; four or more are hard-rejected.
+- Fresh work supports **1–2 parallel ChatGPT Web workers**; three or more are hard-rejected.
 - All Web sessions are **IDLE_RETAINED by default** (120 min lease) on dispatch to prevent premature closure before results are read (`--close-on-terminal` is only for throwaway tasks).
 - `COMPLETED`, `BLOCKED`, and safely usable `FAILED` sessions remain resumable; `LOST` is cleaned up.
 - **Close the session once it is no longer needed**: After the coordinator has extracted the full plan/output, verified completion, and concluded that no further follow-ups are needed, explicitly run `{bin} --close-scope '<scope-id>' --json` to reclaim browser tab resources.
@@ -375,8 +374,8 @@ mod tests {
     #[test]
     fn coordinator_enforces_three_worker_cap_and_forbids_subagents() {
         let prompt = render_coordinator_prompt(Path::new("/tmp/delegate_to_chatgpt_web"));
-        assert!(prompt.contains("hard maximum 3"));
-        assert!(prompt.contains("Choose exactly 1, 2, or 3 workers"));
+        assert!(prompt.contains("hard maximum 2"));
+        assert!(prompt.contains("Choose exactly 1 or 2 workers"));
         assert!(prompt.contains("--batch-stdin --json"));
         assert!(prompt.contains("Do not call Task/background/subagent/team tools"));
         assert!(prompt.contains("OMO owns repository/worktree selection"));
@@ -441,7 +440,7 @@ mod tests {
     fn skill_documents_retained_session_lifecycle() {
         let skill = render_skill(Path::new("/tmp/delegate_to_chatgpt_web"));
         assert!(skill.contains("name: delegate-web"));
-        assert!(skill.contains("**1–3 parallel ChatGPT Web workers**"));
+        assert!(skill.contains("**1–2 parallel ChatGPT Web workers**"));
         assert!(skill.contains("IDLE_RETAINED by default"));
         assert!(skill.contains("--close-on-terminal"));
         assert!(skill.contains("--resume-scope '<scope-id>'"));
