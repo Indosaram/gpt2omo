@@ -30,6 +30,7 @@ pub enum TelemetryModelHint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TelemetryEventType {
+    Dispatched,
     RateLimited,
     DeliveryError,
     AuthenticationRequired,
@@ -46,6 +47,7 @@ pub enum TelemetryEventType {
 #[serde(rename_all = "snake_case")]
 pub enum TelemetryErrorCode {
     None,
+    Dispatched,
     RateLimited,
     DeliveryError,
     AuthenticationRequired,
@@ -102,6 +104,55 @@ pub fn append_best_effort(event: &TelemetryEvent) {
             break;
         }
     }
+}
+
+pub fn read_recent_events(window_ms: u64, now_ms: u64) -> Vec<TelemetryEvent> {
+    let cutoff = now_ms.saturating_sub(window_ms);
+    let mut events = Vec::new();
+    for path in telemetry_candidate_paths() {
+        if let Ok(content) = fs::read_to_string(&path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(event) = serde_json::from_str::<TelemetryEvent>(line) {
+                    if event.timestamp_ms >= cutoff && event.timestamp_ms <= now_ms {
+                        events.push(event);
+                    }
+                }
+            }
+            if !events.is_empty() {
+                break;
+            }
+        }
+    }
+    events
+}
+
+pub fn active_rate_limit_lockout(now_ms: u64) -> Option<(u64, Option<u64>)> {
+    let recent = read_recent_events(3600 * 1000, now_ms);
+    for event in recent.iter().rev() {
+        if event.event_type == TelemetryEventType::RateLimited {
+            let reset_ms = event
+                .reset_after_seconds
+                .map(|sec| event.timestamp_ms + sec * 1000)
+                .unwrap_or_else(|| event.timestamp_ms + 15 * 60 * 1000);
+            if reset_ms > now_ms {
+                let remaining_secs = (reset_ms - now_ms) / 1000;
+                return Some((event.timestamp_ms, Some(remaining_secs)));
+            }
+        }
+    }
+    None
+}
+
+pub fn recent_dispatches_in_window(window_ms: u64, now_ms: u64) -> usize {
+    let recent = read_recent_events(window_ms, now_ms);
+    recent
+        .iter()
+        .filter(|event| event.event_type == TelemetryEventType::Dispatched)
+        .count()
 }
 
 fn telemetry_candidate_paths() -> Vec<PathBuf> {

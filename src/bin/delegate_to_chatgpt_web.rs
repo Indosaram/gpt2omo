@@ -6,7 +6,8 @@ use omo_bridge::orca::{
     verify_chatgpt_page, BrowserDriverKind, ChatgptRateLimitReason, ChatgptUiCondition, OrcaConfig,
 };
 use omo_bridge::telemetry::{
-    append_best_effort, TelemetryErrorCode, TelemetryEvent, TelemetryEventType, TelemetryModelHint,
+    active_rate_limit_lockout, append_best_effort, recent_dispatches_in_window, TelemetryErrorCode,
+    TelemetryEvent, TelemetryEventType, TelemetryModelHint,
 };
 use omo_bridge::tools::task_state::{
     clear_delegation_lifecycle, load_delegation_lifecycle, record_terminal_evidence,
@@ -620,6 +621,48 @@ fn max_parallel_workers() -> usize {
         .unwrap_or(MAX_PARALLEL_WEB_WORKERS)
 }
 
+fn window_rate_limit_params() -> (u64, usize) {
+    let window_minutes: u64 = std::env::var("OMO_WEB_WINDOW_MINUTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(60);
+    let max_dispatches: usize = std::env::var("OMO_WEB_WINDOW_MAX_DISPATCHES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(15);
+    (window_minutes * 60 * 1000, max_dispatches)
+}
+
+fn check_rate_limit_and_window_guards(additional_tasks: usize) -> Result<()> {
+    let now = epoch_ms();
+    if let Some((_, remaining_secs)) = active_rate_limit_lockout(now) {
+        let wait_msg = match remaining_secs {
+            Some(secs) if secs > 60 => format!("{} minute(s)", (secs + 59) / 60),
+            Some(secs) => format!("{secs} second(s)"),
+            None => "a few minutes".to_string(),
+        };
+        return Err(anyhow!(
+            "ChatGPT Web is currently rate-limited (Too Many Requests). New delegations are blocked by bridge telemetry until reset in {wait_msg}."
+        ));
+    }
+
+    let (window_ms, max_dispatches) = window_rate_limit_params();
+    let recent = recent_dispatches_in_window(window_ms, now);
+    if recent + additional_tasks > max_dispatches {
+        let window_mins = window_ms / (60 * 1000);
+        return Err(anyhow!(
+            "ChatGPT Web sliding window dispatch limit reached: {} dispatch(es) recorded in the last {} minutes (limit: {}). Wait for previous window slots to expire before creating new delegations.",
+            recent,
+            window_mins,
+            max_dispatches
+        ));
+    }
+
+    Ok(())
+}
+
 fn count_active_in_flight_workers(mux: &WorkspaceMux) -> Result<usize> {
     let scopes = mux.list_scopes()?;
     let mut count = 0;
@@ -687,6 +730,8 @@ async fn stage_browser_delegations(
     orca: &OrcaConfig,
     tasks: &[PreparedTask],
 ) -> Result<Vec<StagedDelegation>> {
+    check_rate_limit_and_window_guards(tasks.len())?;
+
     let max = max_parallel_workers();
     let active = count_active_in_flight_workers(mux)?;
     if active + tasks.len() > max {
@@ -733,14 +778,23 @@ async fn stage_browser_delegations(
                 return Err(anyhow!(error));
             }
         };
-        staged.push(build_staged_delegation(
+        let staged_item = build_staged_delegation(
             &scope,
             Some(page),
             task.label.clone(),
             &task.task,
             &lifecycle,
             false,
-        ));
+        );
+        let driver = orca.detect().await.map(|(k, _)| k).unwrap_or(BrowserDriverKind::Maho);
+        emit_telemetry(
+            &staged_item,
+            driver,
+            TelemetryEventType::Dispatched,
+            None,
+            TelemetryErrorCode::Dispatched,
+        );
+        staged.push(staged_item);
     }
     Ok(staged)
 }
@@ -751,6 +805,8 @@ async fn stage_resume_delegation(
     scope_id: &str,
     task: &str,
 ) -> Result<ResumeStage> {
+    check_rate_limit_and_window_guards(1)?;
+
     let max = max_parallel_workers();
     let active = count_active_in_flight_workers(mux)?;
     if active >= max {
@@ -834,15 +890,17 @@ async fn stage_resume_delegation(
     let reopen_blocked = previous.terminal_state == Some(DelegationTerminalState::Blocked);
     let lifecycle = start_next_delegation_generation(&workspace, scope_id, reopen_blocked)
         .map_err(anyhow::Error::msg)?;
-    drop(scope_lock);
-    Ok(ResumeStage::Ready(build_staged_delegation(
-        &scope,
-        Some(page),
+    let staged = build_staged_delegation(&scope, Some(page), None, task, &lifecycle, true);
+    let driver = orca.detect().await.map(|(k, _)| k).unwrap_or(BrowserDriverKind::Maho);
+    emit_telemetry(
+        &staged,
+        driver,
+        TelemetryEventType::Dispatched,
         None,
-        task,
-        &lifecycle,
-        true,
-    )))
+        TelemetryErrorCode::Dispatched,
+    );
+    drop(scope_lock);
+    Ok(ResumeStage::Ready(staged))
 }
 
 fn load_resumable_scope(
