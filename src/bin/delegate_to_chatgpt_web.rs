@@ -29,6 +29,7 @@ use url::Url;
 
 const MAX_PARALLEL_WEB_WORKERS: usize = 2;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
+const SPAWN_STAGGER_DELAY: Duration = Duration::from_secs(10);
 const READINESS_TIMEOUT: Duration = Duration::from_secs(180);
 const READINESS_RETRY_AFTER: Duration = Duration::from_secs(45);
 const READINESS_FRESHNESS_MS: u64 = 240_000;
@@ -744,7 +745,11 @@ async fn stage_browser_delegations(
     }
 
     let mut staged = Vec::with_capacity(tasks.len());
-    for task in tasks {
+    for (index, task) in tasks.iter().enumerate() {
+        if index > 0 {
+            // Anti-burst stagger delay to avoid triggering Cloudflare/WAF and ChatGPT concurrent tab rate limits
+            sleep(SPAWN_STAGGER_DELAY).await;
+        }
         let page = match create_chatgpt_tab(orca).await {
             Ok(page) => page,
             Err(error) => {
