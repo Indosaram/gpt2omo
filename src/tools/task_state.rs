@@ -1,4 +1,4 @@
-use crate::security::Workspace;
+use crate::security::{default_bridge_base_dir, Workspace};
 use crate::tools::ToolCallResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -737,15 +737,13 @@ fn atomic_write_json<T: Serialize>(
 }
 
 fn task_state_path(ws: &Workspace, scope_id: &str) -> std::result::Result<PathBuf, String> {
-    Ok(std::env::temp_dir()
-        .join("omo-bridge")
+    Ok(default_bridge_base_dir()
         .join("task-state")
         .join(format!("{}.json", scope_key(ws, scope_id)?)))
 }
 
 fn lifecycle_path(ws: &Workspace, scope_id: &str) -> std::result::Result<PathBuf, String> {
-    Ok(std::env::temp_dir()
-        .join("omo-bridge")
+    Ok(default_bridge_base_dir()
         .join("delegation-lifecycle")
         .join(format!("{}.json", scope_key(ws, scope_id)?)))
 }

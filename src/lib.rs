@@ -11,7 +11,9 @@ pub mod web_session;
 pub use cli::Cli;
 pub use error::{BridgeError, Result};
 pub use events::{EventBus, HarnessEvent};
-pub use security::{default_scope_dir, Workspace, WorkspaceMux, WorkspaceScope};
+pub use security::{
+    default_bridge_base_dir, default_scope_dir, Workspace, WorkspaceMux, WorkspaceScope,
+};
 pub use server::{create_router, AppState};
 
 pub fn load_dotenv_if_present() {

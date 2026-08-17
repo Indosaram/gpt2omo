@@ -1,4 +1,4 @@
-use crate::security::Workspace;
+use crate::security::{default_bridge_base_dir, Workspace};
 use crate::tools::task_state::load_delegation_lifecycle;
 use crate::tools::ToolCallResult;
 use futures::StreamExt;
@@ -288,8 +288,7 @@ fn quota_state_path(ws: &Workspace, scope_id: &str) -> PathBuf {
         "{:x}",
         Sha256::digest(format!("{}:{}", ws.root().to_string_lossy(), scope_id).as_bytes())
     );
-    std::env::temp_dir()
-        .join("omo-bridge")
+    default_bridge_base_dir()
         .join("subagent-quota")
         .join(format!("{key}.json"))
 }

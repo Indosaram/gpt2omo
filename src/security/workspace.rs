@@ -304,10 +304,22 @@ impl WorkspaceMux {
     }
 }
 
+pub fn default_bridge_base_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("OMO_BRIDGE_HOME") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path.trim());
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            return PathBuf::from(home.trim()).join(".omo").join("bridge");
+        }
+    }
+    std::env::temp_dir().join("omo-bridge")
+}
+
 pub fn default_scope_dir(port: u16) -> PathBuf {
-    std::env::temp_dir()
-        .join("omo-bridge")
-        .join(format!("scopes-{}", port))
+    default_bridge_base_dir().join(format!("scopes-{}", port))
 }
 
 fn validate_scope_id(scope_id: &str) -> Result<()> {
