@@ -55,6 +55,10 @@ struct Cli {
     #[arg(long, conflicts_with = "batch_stdin")]
     stdin: bool,
 
+    /// Optional task label for single task execution (used for ChatGPT Web title).
+    #[arg(long, env = "OMO_DELEGATE_LABEL")]
+    label: Option<String>,
+
     /// Read a JSON batch manifest from stdin: {"tasks":[{"task":"...","workspace":"...","label":"..."}]}.
     #[arg(long, conflicts_with = "stdin")]
     batch_stdin: bool,
@@ -584,7 +588,7 @@ fn prepare_tasks(cli: &Cli) -> Result<Vec<PreparedTask>> {
         vec![BatchTask {
             task,
             workspace: None,
-            label: None,
+            label: cli.label.clone(),
         }]
     };
 
@@ -1829,6 +1833,37 @@ fn validate_bridge_health(value: &Value, base_url: &str) -> Result<()> {
     Ok(())
 }
 
+fn extract_clean_task_title(task: &str) -> String {
+    for line in task.lines() {
+        let mut trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        while trimmed.starts_with('#') {
+            trimmed = trimmed.trim_start_matches('#').trim();
+        }
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("task:") {
+            trimmed = trimmed[5..].trim();
+        } else if lower.starts_with("objective:") {
+            trimmed = trimmed[10..].trim();
+        } else if trimmed.starts_with("목표:") {
+            trimmed = trimmed[7..].trim();
+        } else if trimmed.starts_with("목표 :") {
+            trimmed = trimmed[8..].trim();
+        }
+        if !trimmed.is_empty() {
+            let char_count = trimmed.chars().count();
+            if char_count > 80 {
+                let truncated: String = trimmed.chars().take(77).collect();
+                return format!("{}...", truncated);
+            }
+            return trimmed.to_string();
+        }
+    }
+    String::new()
+}
+
 fn build_bootstrap_prompt(
     scope_id: &str,
     workspace: &Path,
@@ -1842,13 +1877,9 @@ fn build_bootstrap_prompt(
     } else {
         "This is a readiness handshake for a fresh ChatGPT Web worker."
     };
+    let task_summary = extract_clean_task_title(task);
     let title_line = match label {
         Some(lbl) if !lbl.trim().is_empty() => {
-            let task_summary = task
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("")
-                .trim();
             if !task_summary.is_empty() {
                 format!("# [Task: {}] {}\n\n", lbl.trim(), task_summary)
             } else {
@@ -1856,11 +1887,6 @@ fn build_bootstrap_prompt(
             }
         }
         _ => {
-            let task_summary = task
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("")
-                .trim();
             if !task_summary.is_empty() {
                 format!("# [Task] {}\n\n", task_summary)
             } else {
@@ -1937,6 +1963,7 @@ mod tests {
         Cli {
             task: Vec::new(),
             stdin: false,
+            label: None,
             batch_stdin: false,
             resume_scope: None,
             close_scope: None,
