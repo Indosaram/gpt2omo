@@ -267,6 +267,14 @@ This is a browser-session lifecycle decision, not a task-completion signal. Do n
 
 TTL is a safety net, not evidence that a task completed and not a substitute for an explicit close when the user requests one.
 
+## Rate Limiting & Safety Contract — Strictly No Bypasses
+
+- **Never bypass rate-limit or window guards**: When the helper returns a sliding window limit or rate-limit error (e.g. `ChatGPT Web sliding window dispatch limit reached...` or `rate-limited until reset in X minute(s)`):
+  - **Do NOT set environment variables like `OMO_WEB_WINDOW_MAX_DISPATCHES` or `OMO_MAX_WEB_WORKERS` to force-override the limit**.
+  - **Do NOT repeatedly retry or open new tabs**.
+  - Inform the user of the exact reset wait time, or resume an existing retained session (`--resume-scope`) instead of creating a new worker.
+- **Enforced defaults**: 60-minute window limit (12 dispatches), max 2 fresh workers per batch, and max 3 concurrent in-flight sessions.
+
 ## Authoritative task lifecycle
 
 Fresh and resumed generations send a bootstrap-only prompt first. Each worker must successfully call scoped MCP `task_state`; actual task prompts are sent only after authoritative readiness. `COMPLETED` comes only from `completion_check.ready=true`; `BLOCKED`, `FAILED`, and `LOST` are terminal. Textual READY/done/blocked/failed claims are never authoritative.
@@ -309,6 +317,7 @@ metadata:
 - `OMO_WEB_SESSION_TTL_MINUTES` controls the default TTL; helper invocations also opportunistically clean stale sessions.
 - Scope-level filesystem locks serialize resume/close/GC and prevent a TTL janitor from racing a resume.
 - Fresh and resumed generations accept readiness only from successful scoped MCP `task_state` evidence.
+- **Strictly obey rate-limit and window guards**: Never inject environment variable overrides (such as `OMO_WEB_WINDOW_MAX_DISPATCHES`) to bypass local rate limits or sliding window protections. Report the wait time honestly to the user when limits are hit.
 - `run_command` is daemon-owned and waits at most 15 seconds; `status:detached_running` is resumed with `poll_command`/`list_commands`, not by starting a duplicate command.
 - `client_request_id` makes command retries idempotent within one `(scope_id, generation)`; `cancel_command` explicitly terminates obsolete work.
 - Successful `patch_file` calls advance `workspace_revision`; verification with `evidence_status:stale_revision` is never accepted for completion.
