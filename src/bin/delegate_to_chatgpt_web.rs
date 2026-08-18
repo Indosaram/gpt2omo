@@ -16,7 +16,9 @@ use omo_bridge::tools::task_state::{
     DelegationLifecycle, DelegationTerminalState,
 };
 use omo_bridge::web_session::cleanup_expired_retained_sessions;
-use omo_bridge::{default_scope_dir, Workspace, WorkspaceMux, WorkspaceScope};
+use omo_bridge::{
+    default_bridge_base_dir, default_scope_dir, Workspace, WorkspaceMux, WorkspaceScope,
+};
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use serde_json::Value;
@@ -620,35 +622,50 @@ fn prepare_tasks(cli: &Cli) -> Result<Vec<PreparedTask>> {
         .collect()
 }
 
+fn load_bridge_runtime_policy() -> (usize, usize, u64, usize) {
+    // Read strictly from persistent bridge directory ~/.omo/bridge/config.json if customized by host/admin,
+    // otherwise fallback to compiled daemon safety constants.
+    // Client CLI environment variables (e.g. OMO_WEB_WINDOW_MAX_DISPATCHES) are deliberately NOT inspected
+    // so client agents cannot bypass rate-limiting or concurrency limits.
+    let config_path = default_bridge_base_dir().join("config.json");
+    let (mut max_new, mut max_concurrent, mut window_minutes, mut max_dispatches) = (
+        MAX_NEW_DISPATCH_WORKERS,
+        MAX_CONCURRENT_IN_FLIGHT_WORKERS,
+        60u64,
+        12usize,
+    );
+
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(val) = serde_json::from_str::<Value>(&content) {
+            if let Some(v) = val.get("max_new_dispatch_workers").and_then(Value::as_u64) {
+                if v > 0 { max_new = v as usize; }
+            }
+            if let Some(v) = val.get("max_concurrent_in_flight_workers").and_then(Value::as_u64) {
+                if v > 0 { max_concurrent = v as usize; }
+            }
+            if let Some(v) = val.get("window_minutes").and_then(Value::as_u64) {
+                if v > 0 { window_minutes = v; }
+            }
+            if let Some(v) = val.get("max_dispatches_per_window").and_then(Value::as_u64) {
+                if v > 0 { max_dispatches = v as usize; }
+            }
+        }
+    }
+
+    (max_new, max_concurrent, window_minutes * 60 * 1000, max_dispatches)
+}
+
 fn max_new_dispatch_workers() -> usize {
-    std::env::var("OMO_MAX_NEW_WEB_WORKERS")
-        .or_else(|_| std::env::var("OMO_MAX_WEB_WORKERS"))
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(MAX_NEW_DISPATCH_WORKERS)
+    load_bridge_runtime_policy().0
 }
 
 fn max_concurrent_in_flight_workers() -> usize {
-    std::env::var("OMO_MAX_CONCURRENT_WEB_WORKERS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(MAX_CONCURRENT_IN_FLIGHT_WORKERS)
+    load_bridge_runtime_policy().1
 }
 
 fn window_rate_limit_params() -> (u64, usize) {
-    let window_minutes: u64 = std::env::var("OMO_WEB_WINDOW_MINUTES")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(60);
-    let max_dispatches: usize = std::env::var("OMO_WEB_WINDOW_MAX_DISPATCHES")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(12);
-    (window_minutes * 60 * 1000, max_dispatches)
+    let (_, _, window_ms, max_dispatches) = load_bridge_runtime_policy();
+    (window_ms, max_dispatches)
 }
 
 fn check_rate_limit_and_window_guards(additional_tasks: usize) -> Result<()> {
