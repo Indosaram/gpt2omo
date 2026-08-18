@@ -241,7 +241,8 @@ fn js_python_and_docs_preserve_the_same_workflow_contract() {
 fn wrapper_policy_is_pinned_to_delegate_runtime_guards() {
     let delegate = include_str!("../src/bin/delegate_to_chatgpt_web.rs");
 
-    assert!(delegate.contains("const MAX_PARALLEL_WEB_WORKERS: usize = 2;"));
+    assert!(delegate.contains("const MAX_NEW_DISPATCH_WORKERS: usize = 2;"));
+    assert!(delegate.contains("const MAX_CONCURRENT_IN_FLIGHT_WORKERS: usize = 3;"));
     assert!(delegate.contains("const SPAWN_STAGGER_DELAY: Duration = Duration::from_secs(10);"));
     assert!(delegate.contains("check_rate_limit_and_window_guards(tasks.len())?;"));
     assert!(delegate.contains("count_active_in_flight_workers(mux)?"));

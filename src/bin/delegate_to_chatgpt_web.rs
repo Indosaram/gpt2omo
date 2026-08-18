@@ -27,7 +27,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Instant};
 use url::Url;
 
-const MAX_PARALLEL_WEB_WORKERS: usize = 2;
+const MAX_NEW_DISPATCH_WORKERS: usize = 2;
+const MAX_CONCURRENT_IN_FLIGHT_WORKERS: usize = 3;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const SPAWN_STAGGER_DELAY: Duration = Duration::from_secs(10);
 const READINESS_TIMEOUT: Duration = Duration::from_secs(180);
@@ -490,7 +491,8 @@ fn emit_result(
         "session_policy": if cli.close_on_terminal { "CLOSE_ON_TERMINAL" } else { "IDLE_RETAINED" },
         "session_ttl_minutes": cli.session_ttl_minutes,
         "parallel_count": staged.len(),
-        "max_parallel": MAX_PARALLEL_WEB_WORKERS,
+        "max_parallel": max_new_dispatch_workers(),
+        "max_concurrent": max_concurrent_in_flight_workers(),
         "scope_dir": scope_dir.to_string_lossy(),
         "bridge_url": bridge_url,
         "delegations": delegations,
@@ -614,12 +616,21 @@ fn prepare_tasks(cli: &Cli) -> Result<Vec<PreparedTask>> {
         .collect()
 }
 
-fn max_parallel_workers() -> usize {
-    std::env::var("OMO_MAX_WEB_WORKERS")
+fn max_new_dispatch_workers() -> usize {
+    std::env::var("OMO_MAX_NEW_WEB_WORKERS")
+        .or_else(|_| std::env::var("OMO_MAX_WEB_WORKERS"))
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(MAX_PARALLEL_WEB_WORKERS)
+        .unwrap_or(MAX_NEW_DISPATCH_WORKERS)
+}
+
+fn max_concurrent_in_flight_workers() -> usize {
+    std::env::var("OMO_MAX_CONCURRENT_WEB_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(MAX_CONCURRENT_IN_FLIGHT_WORKERS)
 }
 
 fn window_rate_limit_params() -> (u64, usize) {
@@ -680,13 +691,13 @@ fn count_active_in_flight_workers(mux: &WorkspaceMux) -> Result<usize> {
 }
 
 fn validate_parallel_count(count: usize) -> Result<()> {
-    let max = max_parallel_workers();
+    let max = max_new_dispatch_workers();
     if count == 0 {
         return Err(anyhow!("at least one Web delegation task is required"));
     }
     if count > max {
         return Err(anyhow!(
-            "parallel Web delegation is limited to {} workers; received {}",
+            "parallel Web delegation is limited to {} newly spawned workers per batch; received {}",
             max,
             count
         ));
@@ -733,14 +744,14 @@ async fn stage_browser_delegations(
 ) -> Result<Vec<StagedDelegation>> {
     check_rate_limit_and_window_guards(tasks.len())?;
 
-    let max = max_parallel_workers();
+    let max_concurrent = max_concurrent_in_flight_workers();
     let active = count_active_in_flight_workers(mux)?;
-    if active + tasks.len() > max {
+    if active + tasks.len() > max_concurrent {
         return Err(anyhow!(
             "active concurrent Web delegations limit reached (currently {} active in-flight worker(s), requested {}, max concurrent limit is {})",
             active,
             tasks.len(),
-            max
+            max_concurrent
         ));
     }
 
@@ -812,13 +823,13 @@ async fn stage_resume_delegation(
 ) -> Result<ResumeStage> {
     check_rate_limit_and_window_guards(1)?;
 
-    let max = max_parallel_workers();
+    let max_concurrent = max_concurrent_in_flight_workers();
     let active = count_active_in_flight_workers(mux)?;
-    if active >= max {
+    if active >= max_concurrent {
         return Err(anyhow!(
             "active concurrent Web delegations limit reached (currently {} active in-flight worker(s), max concurrent limit is {})",
             active,
-            max
+            max_concurrent
         ));
     }
 
@@ -2036,7 +2047,7 @@ mod tests {
     fn rejects_more_than_max_parallel_tasks() {
         assert!(validate_parallel_count(2).is_ok());
         let error = validate_parallel_count(3).unwrap_err().to_string();
-        assert!(error.contains("limited to 2 workers"));
+        assert!(error.contains("limited to 2 newly spawned workers"));
     }
 
     #[test]
@@ -2323,6 +2334,7 @@ mod tests {
         let cli = cli_for_test();
         assert!(!cli.batch_stdin);
         assert!(cli.resume_scope.is_none());
-        assert_eq!(MAX_PARALLEL_WEB_WORKERS, 2);
+        assert_eq!(MAX_NEW_DISPATCH_WORKERS, 2);
+        assert_eq!(MAX_CONCURRENT_IN_FLIGHT_WORKERS, 3);
     }
 }
