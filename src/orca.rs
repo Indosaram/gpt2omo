@@ -183,14 +183,14 @@ impl BrowserDriverConfig {
             return Ok((*kind, default_bin));
         }
 
+        if is_executable_in_path("orca").await {
+            return Ok((BrowserDriverKind::Orca, PathBuf::from("orca")));
+        }
         if let Some(maho_bin) = resolve_maho_bin() {
             return Ok((BrowserDriverKind::Maho, maho_bin));
         }
         if is_executable_in_path("maho").await {
             return Ok((BrowserDriverKind::Maho, PathBuf::from("maho")));
-        }
-        if is_executable_in_path("orca").await {
-            return Ok((BrowserDriverKind::Orca, PathBuf::from("orca")));
         }
         if is_executable_in_path("agent-browser").await {
             return Ok((
@@ -593,25 +593,27 @@ async fn wait_for_chatgpt_idle(config: &BrowserDriverConfig, page: &str) -> Resu
 }
 
 async fn wait_for_chatgpt_prompt(config: &BrowserDriverConfig, page: &str) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // Give newly created tabs a brief initial grace period to start navigating
+    sleep(Duration::from_millis(500)).await;
+
+    let probe_expr = r#"(() => {
+        const el = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], textarea[placeholder], [contenteditable="true"]');
+        return !!el;
+    })()"#;
+
     loop {
-        if let Ok(value) = eval_json(
-            config,
-            page,
-            "!!(document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable=\"true\"]'))",
-        )
-        .await
-        {
+        if let Ok(value) = eval_json(config, page, probe_expr).await {
             if value.as_bool() == Some(true) {
                 return Ok(());
             }
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(anyhow!(
-                "ChatGPT Web prompt box did not become ready; verify the browser is logged into chatgpt.com"
+                "ChatGPT Web prompt box did not become ready within 60s; verify the browser is logged into chatgpt.com"
             ));
         }
-        sleep(Duration::from_millis(400)).await;
+        sleep(Duration::from_millis(500)).await;
     }
 }
 
