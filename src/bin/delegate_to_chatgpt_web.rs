@@ -632,7 +632,7 @@ fn window_rate_limit_params() -> (u64, usize) {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(8);
+        .unwrap_or(12);
     (window_minutes * 60 * 1000, max_dispatches)
 }
 
