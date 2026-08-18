@@ -862,7 +862,7 @@ async fn terminal_candidates(config: &BrowserDriverConfig) -> Result<Vec<Termina
         if title.to_lowercase().contains("omo") || title.to_lowercase().contains("opencode") {
             score += 50;
         }
-        if output.contains("[OMO-BRIDGE") || output.contains("omo-bridge") {
+        if output.contains("[GPT2OMO") || output.contains("gpt2omo") {
             score += 100;
         }
         if output.contains("task_state") || output.contains("completion_check") {

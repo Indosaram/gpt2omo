@@ -637,6 +637,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpt2omo"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "cap-std",
+ "clap",
+ "diffy",
+ "dunce",
+ "futures",
+ "globset",
+ "hex",
+ "http",
+ "ignore",
+ "libc",
+ "reqwest",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1111,39 +1144,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "omo-bridge"
-version = "0.7.0"
-dependencies = [
- "anyhow",
- "axum",
- "cap-std",
- "clap",
- "diffy",
- "dunce",
- "futures",
- "globset",
- "hex",
- "http",
- "ignore",
- "libc",
- "reqwest",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
 ]
 
 [[package]]

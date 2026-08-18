@@ -315,7 +315,7 @@ pub fn default_bridge_base_dir() -> PathBuf {
             return PathBuf::from(home.trim()).join(".omo").join("bridge");
         }
     }
-    std::env::temp_dir().join("omo-bridge")
+    std::env::temp_dir().join("gpt2omo")
 }
 
 pub fn default_scope_dir(port: u16) -> PathBuf {

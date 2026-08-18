@@ -58,7 +58,7 @@ struct InstallTarget {
 }
 
 fn main() -> Result<()> {
-    omo_bridge::load_dotenv_if_present();
+    gpt2omo::load_dotenv_if_present();
     let cli = Cli::parse();
     let config_root = cli.config_root.unwrap_or(default_config_root()?);
     let omo_agent_dir = cli.omo_agent_dir.unwrap_or(default_omo_agent_dir()?);
@@ -266,7 +266,7 @@ This is a browser-session lifecycle decision, not a task-completion signal. Do n
 
 ## Automatic TTL cleanup
 
-`omo-relay` runs a periodic retained-session janitor. Default lease is 120 minutes; `OMO_WEB_SESSION_TTL_MINUTES` can override it. Helper invocations also opportunistically reap expired scopes. Scope-level filesystem locks serialize resume/close/GC so a janitor cannot close a scope that is simultaneously being resumed.
+`gpt2omo-relay` runs a periodic retained-session janitor. Default lease is 120 minutes; `OMO_WEB_SESSION_TTL_MINUTES` can override it. Helper invocations also opportunistically reap expired scopes. Scope-level filesystem locks serialize resume/close/GC so a janitor cannot close a scope that is simultaneously being resumed.
 
 TTL is a safety net, not evidence that a task completed and not a substitute for an explicit close when the user requests one.
 
@@ -304,7 +304,7 @@ fn render_skill(delegate_bin: &Path) -> String {
         r#"---
 name: delegate-web
 description: Use when delegating coding work to ChatGPT Web, retaining terminal Web conversations for possible follow-up, resuming an exact retained scope, or explicitly closing one. Never uses OMO/Anthropic subagents and preserves OMO ownership of repo/worktree selection.
-compatibility: Requires omo-bridge, omo-relay, Orca browser access, and delegate_to_chatgpt_web.
+compatibility: Requires gpt2omo, gpt2omo-relay, Orca browser access, and delegate_to_chatgpt_web.
 metadata:
   opencode/slash: "false"
 ---
@@ -322,7 +322,7 @@ metadata:
 - Resume verifies the exact stored ChatGPT page, consumes the prior idle lease, increments generation, and automatically obtains a fresh lease when that generation becomes terminal.
 - A prior `COMPLETED` plan may be replaced by a new follow-up plan; prior `BLOCKED` items are reopened as `in_progress` with notes preserved.
 - Explicitly close a retained session with `{bin} --close-scope '<scope-id>' --json` only when the session lifecycle should truly end.
-- Do not automatically close merely because a worker returned terminal. If reuse is uncertain, leave it retained; `omo-relay` periodically reaps expired leases.
+- Do not automatically close merely because a worker returned terminal. If reuse is uncertain, leave it retained; `gpt2omo-relay` periodically reaps expired leases.
 - `OMO_WEB_SESSION_TTL_MINUTES` controls the default TTL; helper invocations also opportunistically clean stale sessions.
 - Scope-level filesystem locks serialize resume/close/GC and prevent a TTL janitor from racing a resume.
 - **Resume Scope Integrity**: `--resume-scope` is strictly reserved for follow-up iterations on the exact same task topic. Never hijack unrelated or completed past sessions to run a new task.
@@ -335,7 +335,7 @@ metadata:
 - Authoritative `COMPLETED` requires `completion_check.ready=true`; never trust textual lifecycle claims.
 - When `query_subagent` is advertised, a Web worker may use it only for a bounded Pattern B second opinion and must treat `trust: "untrusted_advisory"` as non-authoritative text; it is never implementation delegation or completion evidence.
 - The OMO-side coordinator itself never calls Task/background/subagent/team tools.
-- `omo-relay` routes continuation to the exact stored `browser_page_id`; Orca idle/generation gating remains in the send path.
+- `gpt2omo-relay` routes continuation to the exact stored `browser_page_id`; Orca idle/generation gating remains in the send path.
 - OMO decides repository/worktree selection for fresh work. The bridge never creates or chooses worktrees.
 - A returned `terminal=true` / `ok=false` result remains authoritative, not a reason to fall back to another coding agent.
 "#,

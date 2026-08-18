@@ -1,5 +1,5 @@
 [package]
-name = "omo-bridge"
+name = "gpt2omo"
 version = "0.7.0"
 edition = "2021"
 publish = false

@@ -1,4 +1,4 @@
-use omo_bridge::mass_ulw_web::{
+use gpt2omo::mass_ulw_web::{
     DelegateWebConfig, DelegateWebResult, WebTask, DELEGATE_WEB_MAX_WORKERS,
     DELEGATE_WEB_SPAWN_STAGGER_SECS,
 };

@@ -115,7 +115,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
         .collect();
     (
         format!(
-            "{}\n\n...[diff truncated by omo-bridge; {} characters omitted]...\n\n{}",
+            "{}\n\n...[diff truncated by gpt2omo; {} characters omitted]...\n\n{}",
             head,
             count.saturating_sub(max_chars),
             tail

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "omo-bridge",
+    name = "gpt2omo",
     version,
     about = "Sandboxed local MCP HTTP/SSE daemon for ChatGPT"
 )]

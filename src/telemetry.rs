@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-const TELEMETRY_FILE_NAME: &str = "omo-bridge.jsonl";
+const TELEMETRY_FILE_NAME: &str = "gpt2omo.jsonl";
 #[cfg(test)]
 const APPEND_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]

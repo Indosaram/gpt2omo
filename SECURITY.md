@@ -2,7 +2,7 @@
 
 ## Security Model & Threat Boundaries
 
-`omo-bridge` is designed as a sandboxed local Model Context Protocol (MCP) server that provides filesystem, command execution, code intelligence, and verification capabilities to external LLM workers (such as ChatGPT Web) while strictly bounding access.
+`gpt2omo` is designed as a sandboxed local Model Context Protocol (MCP) server that provides filesystem, command execution, code intelligence, and verification capabilities to external LLM workers (such as ChatGPT Web) while strictly bounding access.
 
 ### Core Security Guarantees
 
@@ -32,7 +32,7 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability within `omo-bridge`, please report it responsibly:
+If you discover a security vulnerability within `gpt2omo`, please report it responsibly:
 
 - **Do not open a public GitHub issue.**
 - Send a detailed advisory with reproduction steps, affected versions, and potential impact.

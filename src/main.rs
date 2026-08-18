@@ -1,12 +1,12 @@
 use clap::Parser;
-use omo_bridge::{create_router, default_scope_dir, AppState, Cli, EventBus, WorkspaceMux};
+use gpt2omo::{create_router, default_scope_dir, AppState, Cli, EventBus, WorkspaceMux};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    omo_bridge::load_dotenv_if_present();
+    gpt2omo::load_dotenv_if_present();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -36,11 +36,11 @@ async fn main() -> anyhow::Result<()> {
         workspace: Arc::new(workspaces),
         cli: Arc::new(cli.clone()),
         events,
-        commands: Arc::new(omo_bridge::tools::CommandManager::new()),
+        commands: Arc::new(gpt2omo::tools::CommandManager::new()),
     };
 
     let router = create_router(state);
-    info!("omo-bridge listening on http://{}", addr);
+    info!("gpt2omo listening on http://{}", addr);
     info!("event stream available at http://{}/events", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

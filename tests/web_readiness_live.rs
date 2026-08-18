@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
-use omo_bridge::orca::{close_browser_page, create_chatgpt_tab, send_chatgpt_prompt, OrcaConfig};
-use omo_bridge::tools::task_state::{
+use gpt2omo::orca::{close_browser_page, create_chatgpt_tab, send_chatgpt_prompt, OrcaConfig};
+use gpt2omo::tools::task_state::{
     clear_delegation_lifecycle, load_delegation_lifecycle, start_fresh_delegation_lifecycle,
 };
-use omo_bridge::{default_scope_dir, WorkspaceMux};
+use gpt2omo::{default_scope_dir, WorkspaceMux};
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -44,11 +44,11 @@ fn live_orca_config() -> OrcaConfig {
 
 fn readiness_bootstrap(scope_id: &str, workspace: &Path, generation: u64) -> String {
     format!(
-        "[OMO-BRIDGE READINESS BOOTSTRAP]\n\
+        "[GPT2OMO READINESS BOOTSTRAP]\n\
 SCOPE_ID: {scope_id}\n\
 WORKSPACE: {}\n\
 GENERATION: {generation}\n\n\
-This is a readiness handshake for a fresh ChatGPT Web worker. The actual coding task for this generation has NOT been sent yet. Your only allowed readiness action now is to call the omo-bridge MCP tool task_state with exactly scope_id={scope_id}. If the task_state tool schema is not loaded yet, you may perform only the minimal connector/tool discovery required to expose that exact task_state tool, then call it immediately. Do not inspect files, edit, run commands, delegate, or start coding.\n\n\
+This is a readiness handshake for a fresh ChatGPT Web worker. The actual coding task for this generation has NOT been sent yet. Your only allowed readiness action now is to call the gpt2omo MCP tool task_state with exactly scope_id={scope_id}. If the task_state tool schema is not loaded yet, you may perform only the minimal connector/tool discovery required to expose that exact task_state tool, then call it immediately. Do not inspect files, edit, run commands, delegate, or start coding.\n\n\
 A textual READY/OK/complete message is ignored and provides no readiness evidence. Readiness exists only if the scoped task_state MCP call succeeds and the bridge records it for this generation. After that successful tool call, stop and wait for the actual task prompt.",
         workspace.display(),
     )
@@ -231,14 +231,14 @@ async fn run_live_readiness_smoke(count: usize) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires live Orca browser, logged-in ChatGPT Web, and the running omo-bridge MCP connector"]
+#[ignore = "requires live Orca browser, logged-in ChatGPT Web, and the running gpt2omo MCP connector"]
 async fn live_one_worker_authoritative_readiness_smoke() {
     let _guard = LIVE_SMOKE_LOCK.lock().await;
     run_live_readiness_smoke(1).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires live Orca browser, logged-in ChatGPT Web, and the running omo-bridge MCP connector"]
+#[ignore = "requires live Orca browser, logged-in ChatGPT Web, and the running gpt2omo MCP connector"]
 async fn live_three_worker_authoritative_readiness_smoke() {
     let _guard = LIVE_SMOKE_LOCK.lock().await;
     run_live_readiness_smoke(3).await.unwrap();

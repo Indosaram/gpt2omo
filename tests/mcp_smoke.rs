@@ -1,9 +1,9 @@
 use axum::body::{to_bytes, Body};
 use http::{Request, StatusCode};
-use omo_bridge::tools::task_state::{
+use gpt2omo::tools::task_state::{
     clear_delegation_lifecycle, load_delegation_lifecycle, DelegationTerminalState,
 };
-use omo_bridge::{create_router, AppState, Cli, EventBus, WorkspaceMux};
+use gpt2omo::{create_router, AppState, Cli, EventBus, WorkspaceMux};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -30,7 +30,7 @@ fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String
         workspace: Arc::new(mux.clone()),
         cli: Arc::new(cli),
         events: events.clone(),
-        commands: Arc::new(omo_bridge::tools::CommandManager::new()),
+        commands: Arc::new(gpt2omo::tools::CommandManager::new()),
     });
     (app, events, mux, scope.scope_id)
 }
@@ -53,7 +53,7 @@ fn app_for_mux(mount: &TempDir, scope_dir: std::path::PathBuf, mux: &WorkspaceMu
         workspace: Arc::new(mux.clone()),
         cli: Arc::new(cli),
         events,
-        commands: Arc::new(omo_bridge::tools::CommandManager::new()),
+        commands: Arc::new(gpt2omo::tools::CommandManager::new()),
     })
 }
 
@@ -467,7 +467,7 @@ async fn two_scopes_access_separate_workspaces_without_global_switch() {
         workspace: Arc::new(mux),
         cli: Arc::new(cli),
         events,
-        commands: Arc::new(omo_bridge::tools::CommandManager::new()),
+        commands: Arc::new(gpt2omo::tools::CommandManager::new()),
     });
 
     let first_read = rpc(
@@ -585,7 +585,7 @@ async fn verification_completion_and_continuation_events_keep_scope() {
 
     let workspace = dir.path();
     let completed_lifecycle =
-        load_delegation_lifecycle(&omo_bridge::Workspace::open(workspace).unwrap(), &scope_id)
+        load_delegation_lifecycle(&gpt2omo::Workspace::open(workspace).unwrap(), &scope_id)
             .unwrap()
             .expect("ready completion must leave terminal evidence");
     assert_eq!(

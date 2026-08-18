@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
 use tower_http::cors::CorsLayer;
 
-const CODING_AGENT_INSTRUCTIONS: &str = r#"You are directly responsible for coding in the workspace scope assigned to this delegation by the terminal orchestrator. omo-bridge is an I/O, code-intelligence, daemon-owned command execution, task-state, and verification harness, not another coding agent: do not delegate implementation back to OpenCode, OMO, Codex, or another agent through this bridge. The daemon may have machine-root mount authority, but every MCP coding tool call requires this delegation scope_id and is sandboxed to that scope. Multiple scopes may run concurrently. Never omit or substitute the scope_id from the delegation prompt.
+const CODING_AGENT_INSTRUCTIONS: &str = r#"You are directly responsible for coding in the workspace scope assigned to this delegation by the terminal orchestrator. gpt2omo is an I/O, code-intelligence, daemon-owned command execution, task-state, and verification harness, not another coding agent: do not delegate implementation back to OpenCode, OMO, Codex, or another agent through this bridge. The daemon may have machine-root mount authority, but every MCP coding tool call requires this delegation scope_id and is sandboxed to that scope. Multiple scopes may run concurrently. Never omit or substitute the scope_id from the delegation prompt.
 
 For non-trivial implementation tasks, use this workflow:
 1. Inspect the relevant files, tests, and repository structure before editing. Prefer search_text, ast_grep, LSP queries, and targeted read_file calls over guessing filenames, symbols, references, or APIs.
@@ -83,7 +83,7 @@ pub fn create_router(state: AppState) -> Router {
 async fn healthz_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
-        "service": "omo-bridge",
+        "service": "gpt2omo",
         "version": "0.7.0",
         "events": "/events",
         "workspace_mode": "multiplexed_scopes",
@@ -192,7 +192,7 @@ async fn mcp_post_handler(
 
             let started = Instant::now();
             let tool_res = if scope_id.is_empty() {
-                ToolCallResult::err("scope_id is required for every omo-bridge tool call")
+                ToolCallResult::err("scope_id is required for every gpt2omo tool call")
             } else {
                 match state.workspace.resolve(scope_id) {
                     Ok(workspace) if tool_name == "query_subagent" => {
@@ -278,7 +278,7 @@ fn initialize_result() -> Value {
             }
         },
         "serverInfo": {
-            "name": "omo-bridge",
+            "name": "gpt2omo",
             "version": "0.7.0"
         },
         "instructions": CODING_AGENT_INSTRUCTIONS
@@ -672,7 +672,7 @@ fn publish_specialized_events(
                 .filter(|text| !text.is_empty())
                 .unwrap_or_else(|| "- completion_check did not return ready=true".into());
             let prompt = format!(
-                "The coding task for scope {} is not complete. Continue working in this same ChatGPT conversation.\n\nCompletion blockers:\n{}\n\nUse scope_id {} on every omo-bridge tool call. Recover task_state and list_commands if context was compacted, resolve every blocker, poll or cancel any outstanding commands, rerun revision-fresh verification, inspect git_status_diff, and call completion_check again. Do not stop until completion_check returns ready=true unless an external blocker makes progress impossible.",
+                "The coding task for scope {} is not complete. Continue working in this same ChatGPT conversation.\n\nCompletion blockers:\n{}\n\nUse scope_id {} on every gpt2omo tool call. Recover task_state and list_commands if context was compacted, resolve every blocker, poll or cancel any outstanding commands, rerun revision-fresh verification, inspect git_status_diff, and call completion_check again. Do not stop until completion_check returns ready=true unless an external blocker makes progress impossible.",
                 scope_id, blocker_lines, scope_id
             );
             events.publish(

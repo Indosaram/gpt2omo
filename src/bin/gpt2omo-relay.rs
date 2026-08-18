@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::StreamExt;
-use omo_bridge::orca::{
+use gpt2omo::orca::{
     resolve_terminal, resolve_terminal_for_marker, send_chatgpt_prompt, send_prompt, OrcaConfig,
 };
-use omo_bridge::web_session::cleanup_expired_retained_sessions;
-use omo_bridge::{default_scope_dir, WorkspaceMux};
+use gpt2omo::web_session::cleanup_expired_retained_sessions;
+use gpt2omo::{default_scope_dir, WorkspaceMux};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -20,12 +20,12 @@ const DEFAULT_SESSION_GC_INTERVAL_SECS: u64 = 60;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "omo-relay",
+    name = "gpt2omo-relay",
     version,
-    about = "Route omo-bridge continuation events and reap expired retained ChatGPT Web sessions"
+    about = "Route gpt2omo continuation events and reap expired retained ChatGPT Web sessions"
 )]
 struct Cli {
-    /// omo-bridge SSE event endpoint.
+    /// gpt2omo SSE event endpoint.
     #[arg(
         long,
         default_value = "http://127.0.0.1:18800/events",
@@ -53,7 +53,7 @@ struct Cli {
     #[arg(long, default_value = "orca")]
     orca_bin: String,
 
-    /// Optional bearer token used by omo-bridge.
+    /// Optional bearer token used by gpt2omo.
     #[arg(long, env = "OMO_BRIDGE_TOKEN")]
     token: Option<String>,
 
@@ -122,7 +122,7 @@ impl SseFrame {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    omo_bridge::load_dotenv_if_present();
+    gpt2omo::load_dotenv_if_present();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -235,7 +235,7 @@ async fn consume_events(
         return Err(anyhow!("events endpoint is not SSE: {content_type}"));
     }
 
-    info!(url = %cli.events_url, "subscribed to omo-bridge events");
+    info!(url = %cli.events_url, "subscribed to gpt2omo events");
     let mut stream = response.bytes_stream();
     let mut pending = Vec::<u8>::new();
     let mut frame = SseFrame::default();
@@ -410,7 +410,7 @@ async fn relay_continuation(
     Ok(())
 }
 
-fn continuation_scope(mux: &WorkspaceMux, scope_id: &str) -> Result<omo_bridge::WorkspaceScope> {
+fn continuation_scope(mux: &WorkspaceMux, scope_id: &str) -> Result<gpt2omo::WorkspaceScope> {
     Ok(mux.lookup(scope_id)?)
 }
 

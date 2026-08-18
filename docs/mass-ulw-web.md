@@ -33,7 +33,7 @@ OMO mass-ulw / tool.dag / JS SDK / Python eval
               fan-in / fix loop
 ```
 
-The reusable Rust contract lives in `omo_bridge::mass_ulw_web`. Equivalent zero-dependency helpers for OMO JavaScript and Python eval live in:
+The reusable Rust contract lives in `gpt2omo::mass_ulw_web`. Equivalent zero-dependency helpers for OMO JavaScript and Python eval live in:
 
 - `examples/mass_ulw_web.mjs`
 - `examples/mass_ulw_web.py`

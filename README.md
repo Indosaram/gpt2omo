@@ -1,15 +1,16 @@
 <div align="center">
 
 ```
- ██████╗ ███╗   ███╗ ██████╗       ██████╗ ██████╗  ██╗██████╗   ██████╗ ███████╗
-██╔═══██╗████╗ ████║██╔═══██╗      ██╔══██╗██╔══██╗██║██╔══██╗ ██╔════╝ ██╔════╝
-██║   ██║██╔████╔██║██║   ██║█████╗██████╔╝██████╔╝██║██║  ██║ ██║  ███╗█████╗
-██║   ██║██║╚██╔╝██║██║   ██║╚════╝██╔══██╗██╔══██╗██║██║  ██║ ██║   ██║██╔══╝
-╚██████╔╝██║ ╚═╝ ██║╚██████╔╝      ██████╔╝██║  ██║██║██████╔╝ ╚██████╔╝███████╗
- ╚═════╝ ╚═╝     ╚═╝ ╚═════╝       ╚═════╝ ╚═╝  ╚═╝╚═╝╚═════╝   ╚═════╝ ╚══════╝
+ ██████╗ ██████╗ ████████╗ ██████╗  ██████╗ ███╗   ███╗ ██████╗ 
+██╔════╝ ██╔══██╗╚══██╔══╝ ██╔═══██╗ ██╔═══██╗████╗ ████║██╔═══██╗
+██║  ███╗ ██████╔╝   ██║   ╚════██║ ██║   ██║██╔████╔██║██║   ██║
+██║   ██║ ██╔═══╝    ██║        ██║ ██║   ██║██║╚██╔╝██║██║   ██║
+╚██████╔╝ ██║        ██║   ██   ██║ ╚██████╔╝██║ ╚═╝ ██║╚██████╔╝
+ ╚═════╝  ╚═╝        ╚═╝    ╚████╔╝  ╚═════╝ ╚═╝     ╚═╝ ╚═════╝ 
+                               ╚═══╝                             
 ```
 
-**High-Performance, Capability-Sandboxed MCP Daemon & Web Delegation Harness for OMO in 100% Rust.**
+**High-Performance, Capability-Sandboxed MCP Daemon & Web Delegation Harness: ChatGPT Web Workers → OMO Workspaces, in 100% Rust.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.80+-f74c00?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tokio](https://img.shields.io/badge/Tokio-Async_Runtime-232f3e?style=flat-square&logo=rust&logoColor=white)](https://tokio.rs/)
@@ -23,14 +24,14 @@
 
 ### The Native Control Plane for LLM Coding Delegations
 
-**OMO Bridge** is a low-latency, secure Model Context Protocol (MCP) daemon and browser delegation coordinator written in pure Rust.<br/>
+**gpt2omo** is a low-latency, secure Model Context Protocol (MCP) daemon and browser delegation coordinator written in pure Rust.<br/>
 It acts as a capability-sandboxed I/O, code intelligence, execution, and verification harness—bridging orchestrators like **OMO** to isolated **ChatGPT Web** workers with authoritative state tracking, zero-escape filesystem guarantees, resumable session lifecycles, daemon-owned asynchronous commands, and an optional bounded advisory-model call.
 
 </div>
 
 ---
 
-## ⚡ Why OMO Bridge?
+## ⚡ Why gpt2omo?
 
 Delegating coding tasks to external web-based LLMs presents critical coordination and security challenges:
 
@@ -40,7 +41,7 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
 - **Long-Running Command Timeouts**: Build/test processes can outlive an HTTP request, orphan descendants, or lose verification provenance after subsequent edits.
 - **Ephemeral Context Loss**: Web conversations are traditionally throwaway, discarding valuable reasoning when follow-up iterations are required.
 
-**OMO Bridge solves this** by decoupling orchestration from execution, enforcing strict capability sandboxing, owning command lifecycles inside the daemon, and providing authoritative tool-backed verification gates.
+**gpt2omo solves this** by decoupling orchestration from execution, enforcing strict capability sandboxing, owning command lifecycles inside the daemon, and providing authoritative tool-backed verification gates.
 
 ---
 
@@ -55,7 +56,7 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
                                        │ 1. Fan-out Manifest (1-3 Workers)
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    OMO-BRIDGE CONTROL PLANE & HELPER                        │
+│                    GPT2OMO CONTROL PLANE & HELPER                        │
 │                     (delegate_to_chatgpt_web CLI)                           │
 │                                                                             │
 │  ┌─────────────────────────┐   ┌─────────────────────────────────────────┐  │
@@ -77,7 +78,7 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
                                   │ JSON-RPC MCP Calls
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          OMO-BRIDGE DAEMON (Rust)                           │
+│                          GPT2OMO DAEMON (Rust)                           │
 │  18 standard sandboxed tools + optional query_subagent                      │
 │  - File I/O / Search / AST / LSP / Verification / Task lifecycle            │
 │  - Daemon-owned CommandManager with bounded streaming output                 │
@@ -146,7 +147,7 @@ On Unix the child is placed in its own process group with `setpgid`. Timeout and
 `query_subagent` is **disabled and omitted from `tools/list` unless `--subagent-endpoint` / `OMO_SUBAGENT_ENDPOINT` is set**. The daemon POSTs to `/v1/chat/completions` using the configured model.
 
 ```bash
-./target/release/omo-bridge \
+./target/release/gpt2omo \
   --subagent-endpoint http://127.0.0.1:8000 \
   --subagent-api-key "$OMO_SUBAGENT_API_KEY" \
   --subagent-model deepseek-v4-flash-free
@@ -178,15 +179,15 @@ cargo build --release
 ```
 
 Compiled binaries in `target/release/`:
-- `omo-bridge`: The background MCP HTTP/SSE daemon.
+- `gpt2omo`: The background MCP HTTP/SSE daemon.
 - `delegate_to_chatgpt_web`: The multi-worker batch delegation and resume CLI.
-- `omo-relay`: The bridge-to-orchestrator SSE event relay.
+- `gpt2omo-relay`: The bridge-to-orchestrator SSE event relay.
 - `install_delegate_web`: Automated installer for OMO and OpenCode skills.
 
 ### 2. Start the Daemon
 
 ```bash
-./target/release/omo-bridge --bind 0.0.0.0:18800 --mount-root /
+./target/release/gpt2omo --bind 0.0.0.0:18800 --mount-root /
 ```
 
 Or connect via Cloudflare Tunnel:

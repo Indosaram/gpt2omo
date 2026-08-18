@@ -1,10 +1,10 @@
-use omo_bridge::tools::task_state::{
+use gpt2omo::tools::task_state::{
     handle_task_plan, handle_task_state, handle_task_update, load_delegation_lifecycle,
     load_task_state, record_terminal_evidence, release_session_retention,
     retain_session_with_lease, start_fresh_delegation_lifecycle, start_next_delegation_generation,
     DelegationTerminalState, TaskStatus,
 };
-use omo_bridge::WorkspaceMux;
+use gpt2omo::WorkspaceMux;
 use tempfile::tempdir;
 
 #[test]

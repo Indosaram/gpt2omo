@@ -4,7 +4,7 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use omo_bridge::{create_router, AppState, Cli, EventBus, WorkspaceMux};
+use gpt2omo::{create_router, AppState, Cli, EventBus, WorkspaceMux};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -112,7 +112,7 @@ fn test_app(dir: &TempDir, endpoint: Option<String>) -> (axum::Router, Workspace
         workspace: Arc::new(mux.clone()),
         cli: Arc::new(cli),
         events,
-        commands: Arc::new(omo_bridge::tools::CommandManager::new()),
+        commands: Arc::new(gpt2omo::tools::CommandManager::new()),
     });
     (app, mux, scope.scope_id)
 }

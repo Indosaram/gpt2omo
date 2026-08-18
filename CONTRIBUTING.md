@@ -1,6 +1,6 @@
-# Contributing to OMO Bridge
+# Contributing to gpt2omo
 
-Thank you for contributing to `omo-bridge`. This repository provides the sandboxed Model Context Protocol (MCP) server, Orca browser delegation harness, and authoritative lifecycle management for AI coding workflows.
+Thank you for contributing to `gpt2omo`. This repository provides the sandboxed Model Context Protocol (MCP) server, Orca browser delegation harness, and authoritative lifecycle management for AI coding workflows.
 
 ## Prerequisites
 
@@ -12,8 +12,8 @@ Thank you for contributing to `omo-bridge`. This repository provides the sandbox
 
 1. Clone the repository:
    ```bash
-   git clone <repo-url> omo-bridge
-   cd omo-bridge
+   git clone <repo-url> gpt2omo
+   cd gpt2omo
    ```
 
 2. Build debug and release targets:
