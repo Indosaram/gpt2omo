@@ -275,6 +275,12 @@ TTL is a safety net, not evidence that a task completed and not a substitute for
   - Inform the user of the exact reset wait time, or resume an existing retained session (`--resume-scope`) instead of creating a new worker.
 - **Enforced defaults**: 60-minute window limit (12 dispatches), max 2 fresh workers per batch, and max 3 concurrent in-flight sessions.
 
+## Background Execution & Event Verification Contract
+
+- **Single Native Notification Channel**: When launching `delegate_to_chatgpt_web` in the background (`run_in_background: true`), **NEVER spawn ad-hoc `while ps ...` or `monitor` polling loops**. The harness will automatically wake you and deliver the true completion notification with the final JSON payload and exit code when the helper process terminates.
+- **Strict Session ID & Exit Code Validation**: When a completion event arrives, verify that the event's `bash_id` and `exit_code` match the actual delegation command before assuming the task is finished.
+- **Never Close Tabs on Transitory Errors**: Never proactively kill or remove browser tabs/scope files upon observing temporary errors, rate-limits, or timeouts. Sessions must stay retained until authoritative `completion_check.ready=true` is reached or the user explicitly commands a close.
+
 ## Authoritative task lifecycle
 
 Fresh and resumed generations send a bootstrap-only prompt first. Each worker must successfully call scoped MCP `task_state`; actual task prompts are sent only after authoritative readiness. `COMPLETED` comes only from `completion_check.ready=true`; `BLOCKED`, `FAILED`, and `LOST` are terminal. Textual READY/done/blocked/failed claims are never authoritative.
@@ -318,6 +324,7 @@ metadata:
 - Scope-level filesystem locks serialize resume/close/GC and prevent a TTL janitor from racing a resume.
 - Fresh and resumed generations accept readiness only from successful scoped MCP `task_state` evidence.
 - **Strictly obey rate-limit and window guards**: Never inject environment variable overrides (such as `OMO_WEB_WINDOW_MAX_DISPATCHES`) to bypass local rate limits or sliding window protections. Report the wait time honestly to the user when limits are hit.
+- **Background Execution Contract**: When running delegations in the background, never spawn duplicate `while ps ...` watchers. Rely solely on native completion notifications, validate the session ID and exit code, and never close or delete browser tabs/scope files on temporary errors.
 - `run_command` is daemon-owned and waits at most 15 seconds; `status:detached_running` is resumed with `poll_command`/`list_commands`, not by starting a duplicate command.
 - `client_request_id` makes command retries idempotent within one `(scope_id, generation)`; `cancel_command` explicitly terminates obsolete work.
 - Successful `patch_file` calls advance `workspace_revision`; verification with `evidence_status:stale_revision` is never accepted for completion.
