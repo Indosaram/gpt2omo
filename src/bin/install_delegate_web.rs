@@ -239,7 +239,10 @@ __OMO_DELEGATE_WEB_BATCH__
 
 ## Resume an existing retained Web conversation
 
-When a previous helper result has `session_retained:true` / `resumable:true` AND you have concrete follow-up work for that exact conversation, reuse that exact `scope_id`:
+**CRITICAL RULE FOR RESUME**:
+- **Never hijack an unrelated session**: `--resume-scope` is ONLY for **true follow-up work belonging to that exact same previous task** (e.g. fixing a failing test for the code just written, continuing part 2 of the same plan, or answering a follow-up question on that exact conversation).
+- **NEVER resume a past, completed, or unrelated session for a brand new topic or task**: If the user asks for a new task (e.g. comparing Maho vs Aside, building a new feature, doing a different review), **ALWAYS dispatch a fresh worker**. Do NOT grab a random scope_id from `scopes-*/` or a past code-review tab just because fresh creation hit a timing glitch.
+- When you have concrete follow-up work for that exact conversation, reuse that exact `scope_id`:
 
 ```bash
 cat <<'__OMO_DELEGATE_WEB_RESUME__' | {bin} --resume-scope '<exact-scope-id>' --stdin --json
@@ -322,6 +325,7 @@ metadata:
 - Do not automatically close merely because a worker returned terminal. If reuse is uncertain, leave it retained; `omo-relay` periodically reaps expired leases.
 - `OMO_WEB_SESSION_TTL_MINUTES` controls the default TTL; helper invocations also opportunistically clean stale sessions.
 - Scope-level filesystem locks serialize resume/close/GC and prevent a TTL janitor from racing a resume.
+- **Resume Scope Integrity**: `--resume-scope` is strictly reserved for follow-up iterations on the exact same task topic. Never hijack unrelated or completed past sessions to run a new task.
 - Fresh and resumed generations accept readiness only from successful scoped MCP `task_state` evidence.
 - **Strictly obey rate-limit and window guards**: Never inject environment variable overrides (such as `OMO_WEB_WINDOW_MAX_DISPATCHES`) to bypass local rate limits or sliding window protections. Report the wait time honestly to the user when limits are hit.
 - **Background Execution Contract**: When running delegations in the background, never spawn duplicate `while ps ...` watchers. Rely solely on native completion notifications, validate the session ID and exit code, and never close or delete browser tabs/scope files on temporary errors.
