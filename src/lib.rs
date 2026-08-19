@@ -14,6 +14,7 @@ pub use error::{BridgeError, Result};
 pub use events::{EventBus, HarnessEvent};
 pub use security::{
     default_bridge_base_dir, default_scope_dir, Workspace, WorkspaceMux, WorkspaceScope,
+    WorkspaceScopeLock,
 };
 pub use server::{create_router, AppState};
 

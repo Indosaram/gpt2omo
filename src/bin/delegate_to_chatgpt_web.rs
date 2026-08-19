@@ -18,6 +18,7 @@ use gpt2omo::tools::task_state::{
 use gpt2omo::web_session::cleanup_expired_retained_sessions;
 use gpt2omo::{
     default_bridge_base_dir, default_scope_dir, Workspace, WorkspaceMux, WorkspaceScope,
+    WorkspaceScopeLock,
 };
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
@@ -205,7 +206,7 @@ struct BatchOutcome {
 }
 
 enum ResumeStage {
-    Ready(StagedDelegation),
+    Ready(StagedDelegation, WorkspaceScopeLock),
     Lost {
         staged: StagedDelegation,
         terminal: TerminalObservation,
@@ -289,7 +290,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let staged = if let Some(scope_id) = cli.resume_scope.as_deref() {
+    let (staged, scope_locks) = if let Some(scope_id) = cli.resume_scope.as_deref() {
         if cli.dry_run {
             return Err(anyhow!(
                 "--dry-run is not supported with --resume-scope because resume requires authoritative browser-page liveness verification"
@@ -297,7 +298,7 @@ async fn main() -> Result<()> {
         }
         let task = prepare_resume_task(&cli)?;
         match stage_resume_delegation(&mux, &orca, scope_id, &task).await? {
-            ResumeStage::Ready(item) => vec![item],
+            ResumeStage::Ready(item, lock) => (vec![item], vec![lock]),
             ResumeStage::Lost {
                 staged,
                 terminal,
@@ -366,6 +367,7 @@ async fn main() -> Result<()> {
     };
 
     let terminal = wait_for_terminal_states(&mux, &orca, driver, &staged, TERMINAL_TIMEOUT).await;
+    drop(scope_locks);
     let sessions = finalize_terminal_sessions(
         &mux,
         &orca,
@@ -732,7 +734,27 @@ fn count_active_in_flight_workers(mux: &WorkspaceMux) -> Result<usize> {
         if let Ok(workspace) = mux.resolve(&scope.scope_id) {
             if let Ok(Some(lifecycle)) = load_delegation_lifecycle(&workspace, &scope.scope_id) {
                 if lifecycle.terminal_state.is_none() {
-                    count += 1;
+                    match mux.try_lock_scope(&scope.scope_id) {
+                        Ok(None) => {
+                            // File lock is actively held by a live running worker process
+                            count += 1;
+                        }
+                        Ok(Some(_lock)) => {
+                            // File lock is not held by any process -> ghost scope without a live process
+                            tracing::debug!(
+                                scope_id = %scope.scope_id,
+                                "Ghost scope without active process lock excluded from in-flight worker count"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                scope_id = %scope.scope_id,
+                                error = %error,
+                                "Failed to probe scope lock; counting defensively"
+                            );
+                            count += 1;
+                        }
+                    }
                 }
             }
         }
@@ -767,8 +789,11 @@ fn read_stdin_bounded() -> Result<String> {
     Ok(input)
 }
 
-fn stage_dry_run(mux: &WorkspaceMux, tasks: &[PreparedTask]) -> Result<Vec<StagedDelegation>> {
-    tasks
+fn stage_dry_run(
+    mux: &WorkspaceMux,
+    tasks: &[PreparedTask],
+) -> Result<(Vec<StagedDelegation>, Vec<WorkspaceScopeLock>)> {
+    let staged = tasks
         .iter()
         .map(|task| {
             let scope = mux.register(&task.workspace, None)?;
@@ -784,7 +809,8 @@ fn stage_dry_run(mux: &WorkspaceMux, tasks: &[PreparedTask]) -> Result<Vec<Stage
                 task_prompt: None,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((staged, Vec::new()))
 }
 
 struct DispatchLock {
@@ -829,7 +855,7 @@ async fn stage_browser_delegations(
     mux: &WorkspaceMux,
     orca: &OrcaConfig,
     tasks: &[PreparedTask],
-) -> Result<Vec<StagedDelegation>> {
+) -> Result<(Vec<StagedDelegation>, Vec<WorkspaceScopeLock>)> {
     let _dispatch_lock = DispatchLock::acquire()?;
     check_rate_limit_and_window_guards(tasks.len())?;
 
@@ -845,6 +871,7 @@ async fn stage_browser_delegations(
     }
 
     let mut staged = Vec::with_capacity(tasks.len());
+    let mut scope_locks = Vec::with_capacity(tasks.len());
     for (index, task) in tasks.iter().enumerate() {
         if index > 0 {
             // Anti-burst stagger delay to avoid triggering Cloudflare/WAF and ChatGPT concurrent tab rate limits
@@ -861,6 +888,15 @@ async fn stage_browser_delegations(
             Ok(scope) => scope,
             Err(error) => {
                 let _ = close_browser_page(orca, &page).await;
+                cleanup_unstarted_staged(mux, orca, &staged).await;
+                return Err(error.into());
+            }
+        };
+        let scope_lock = match mux.lock_scope(&scope.scope_id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                let _ = close_browser_page(orca, &page).await;
+                let _ = mux.remove(&scope.scope_id);
                 cleanup_unstarted_staged(mux, orca, &staged).await;
                 return Err(error.into());
             }
@@ -904,8 +940,9 @@ async fn stage_browser_delegations(
             TelemetryErrorCode::Dispatched,
         );
         staged.push(staged_item);
+        scope_locks.push(scope_lock);
     }
-    Ok(staged)
+    Ok((staged, scope_locks))
 }
 
 async fn stage_resume_delegation(
@@ -1013,8 +1050,7 @@ async fn stage_resume_delegation(
         None,
         TelemetryErrorCode::Dispatched,
     );
-    drop(scope_lock);
-    Ok(ResumeStage::Ready(staged))
+    Ok(ResumeStage::Ready(staged, scope_lock))
 }
 
 fn load_resumable_scope(
@@ -2182,10 +2218,12 @@ mod tests {
         let s1 = mux.register_browser(&project, "page-1".into()).unwrap();
         let ws1 = mux.resolve(&s1.scope_id).unwrap();
         start_fresh_delegation_lifecycle(&ws1, &s1.scope_id).unwrap();
+        let _lock1 = mux.lock_scope(&s1.scope_id).unwrap();
 
         let s2 = mux.register_browser(&project, "page-2".into()).unwrap();
         let ws2 = mux.resolve(&s2.scope_id).unwrap();
         start_fresh_delegation_lifecycle(&ws2, &s2.scope_id).unwrap();
+        let _lock2 = mux.lock_scope(&s2.scope_id).unwrap();
 
         assert_eq!(count_active_in_flight_workers(&mux).unwrap(), 2);
 
@@ -2198,6 +2236,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(count_active_in_flight_workers(&mux).unwrap(), 1);
+
+        // Ghost scope whose owning process died (file lock released) is excluded from active count
+        drop(_lock2);
+        assert_eq!(count_active_in_flight_workers(&mux).unwrap(), 0);
     }
 
     #[test]
