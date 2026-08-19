@@ -13,9 +13,6 @@ tower-http = { version = "0.6", features = ["cors", "trace", "request-id"] }
 http = "1.2"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
-# MCP Protocol SDK
-rmcp = { version = "0.1", features = ["server", "transport-sse-server"] }
-
 # Serialization & CLI
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

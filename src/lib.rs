@@ -18,21 +18,14 @@ pub use security::{
 pub use server::{create_router, AppState};
 
 pub fn load_dotenv_if_present() {
-    let candidates = [
-        std::path::PathBuf::from(".env"),
-        std::path::PathBuf::from("../.env"),
-    ];
-    for path in &candidates {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            for line in content.lines() {
-                let Some((key, value)) = parse_dotenv_assignment(line) else {
-                    continue;
-                };
-                if std::env::var_os(key).is_none() {
-                    std::env::set_var(key, value);
-                }
+    if let Ok(content) = std::fs::read_to_string(std::path::Path::new(".env")) {
+        for line in content.lines() {
+            let Some((key, value)) = parse_dotenv_assignment(line) else {
+                continue;
+            };
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, value);
             }
-            break;
         }
     }
 }

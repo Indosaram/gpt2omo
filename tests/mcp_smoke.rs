@@ -1,9 +1,9 @@
 use axum::body::{to_bytes, Body};
-use http::{Request, StatusCode};
 use gpt2omo::tools::task_state::{
     clear_delegation_lifecycle, load_delegation_lifecycle, DelegationTerminalState,
 };
 use gpt2omo::{create_router, AppState, Cli, EventBus, WorkspaceMux};
+use http::{Request, StatusCode};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -18,12 +18,15 @@ fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String
         scope_dir: Some(scope_dir),
         bind: "127.0.0.1:0".into(),
         token: None,
+        token_file: None,
+        insecure_no_auth: true,
         max_file_bytes: 10 * 1024 * 1024,
         command_timeout_ms: 5_000,
         subagent_endpoint: None,
         subagent_api_key: None,
         subagent_model: "deepseek-v4-flash-free".into(),
         subagent_allow_remote: false,
+        allow_arbitrary_commands: false,
     };
     let events = Arc::new(EventBus::new(dir.path().to_string_lossy().to_string()));
     let app = create_router(AppState {
@@ -41,12 +44,15 @@ fn app_for_mux(mount: &TempDir, scope_dir: std::path::PathBuf, mux: &WorkspaceMu
         scope_dir: Some(scope_dir),
         bind: "127.0.0.1:0".into(),
         token: None,
+        token_file: None,
+        insecure_no_auth: true,
         max_file_bytes: 10 * 1024 * 1024,
         command_timeout_ms: 5_000,
         subagent_endpoint: None,
         subagent_api_key: None,
         subagent_model: "deepseek-v4-flash-free".into(),
         subagent_allow_remote: false,
+        allow_arbitrary_commands: false,
     };
     let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
     create_router(AppState {
@@ -455,12 +461,15 @@ async fn two_scopes_access_separate_workspaces_without_global_switch() {
         scope_dir: Some(scope_dir),
         bind: "127.0.0.1:0".into(),
         token: None,
+        token_file: None,
+        insecure_no_auth: true,
         max_file_bytes: 1024,
         command_timeout_ms: 5_000,
         subagent_endpoint: None,
         subagent_api_key: None,
         subagent_model: "deepseek-v4-flash-free".into(),
         subagent_allow_remote: false,
+        allow_arbitrary_commands: false,
     };
     let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
     let app = create_router(AppState {

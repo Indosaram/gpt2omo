@@ -14,7 +14,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.load_token_file()?;
     let addr: SocketAddr = cli.bind.parse()?;
     let scope_dir = cli
         .scope_dir
@@ -36,7 +37,9 @@ async fn main() -> anyhow::Result<()> {
         workspace: Arc::new(workspaces),
         cli: Arc::new(cli.clone()),
         events,
-        commands: Arc::new(gpt2omo::tools::CommandManager::new()),
+        commands: Arc::new(gpt2omo::tools::CommandManager::with_allow_arbitrary(
+            cli.allow_arbitrary_commands,
+        )),
     };
 
     let router = create_router(state);

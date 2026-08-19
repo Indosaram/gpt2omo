@@ -1,10 +1,18 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
+use tokio::sync::OnceCell;
+use tokio::time::{sleep, timeout, Duration};
+
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub const MAX_RESET_AFTER_SECONDS: u64 = 31 * 24 * 60 * 60;
 
@@ -124,6 +132,7 @@ pub struct BrowserDriverConfig {
     pub binary: Option<PathBuf>,
     pub worktree: String,
     pub terminal: Option<String>,
+    resolved: Arc<OnceCell<(BrowserDriverKind, PathBuf)>>,
 }
 
 impl BrowserDriverConfig {
@@ -142,6 +151,7 @@ impl BrowserDriverConfig {
             },
             worktree: worktree.into(),
             terminal,
+            resolved: Arc::new(OnceCell::new()),
         }
     }
 
@@ -156,6 +166,7 @@ impl BrowserDriverConfig {
             binary,
             worktree: worktree.into(),
             terminal,
+            resolved: Arc::new(OnceCell::new()),
         }
     }
 
@@ -168,6 +179,13 @@ impl BrowserDriverConfig {
     }
 
     pub async fn detect(&self) -> Result<(BrowserDriverKind, PathBuf)> {
+        self.resolved
+            .get_or_try_init(|| self.detect_uncached())
+            .await
+            .map(|(kind, bin)| (*kind, bin.clone()))
+    }
+
+    async fn detect_uncached(&self) -> Result<(BrowserDriverKind, PathBuf)> {
         if let Some(kind) = &self.driver {
             if let Some(bin) = &self.binary {
                 return Ok((*kind, bin.clone()));
@@ -220,14 +238,24 @@ fn resolve_maho_bin() -> Option<PathBuf> {
 }
 
 async fn is_executable_in_path(bin_name: &str) -> bool {
-    Command::new("which")
-        .arg(bin_name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    std::env::split_paths(&path).any(|directory| {
+        let candidate = directory.join(bin_name);
+        let Ok(metadata) = fs::metadata(candidate) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+        true
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -705,18 +733,17 @@ fn decode_eval_value(raw: &Value) -> Result<Value> {
 
 pub async fn send_prompt(config: &BrowserDriverConfig, terminal: &str, prompt: &str) -> Result<()> {
     let (_, bin) = config.detect().await?;
-    let result = run_command_json(
+    let result = run_command_json_with_stdin(
         &bin,
         &[
             "terminal",
             "send",
             "--terminal",
             terminal,
-            "--text",
-            prompt,
             "--enter",
             "--json",
         ],
+        prompt,
     )
     .await?;
 
@@ -873,13 +900,123 @@ async fn terminal_candidates(config: &BrowserDriverConfig) -> Result<Vec<Termina
     Ok(candidates)
 }
 
+const MAX_COMMAND_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
 async fn run_command_json(bin: &PathBuf, args: &[&str]) -> Result<Value> {
-    let output = Command::new(bin)
+    let output = execute_command(bin, args, None).await?;
+    parse_command_json(bin, args, output)
+}
+
+async fn run_command_json_with_stdin(
+    bin: &PathBuf,
+    args: &[&str],
+    stdin_text: &str,
+) -> Result<Value> {
+    let output = execute_command(bin, args, Some(stdin_text)).await?;
+    parse_command_json(bin, args, output)
+}
+
+async fn execute_command(
+    bin: &PathBuf,
+    args: &[&str],
+    stdin_text: Option<&str>,
+) -> Result<std::process::Output> {
+    let mut command = Command::new(bin);
+    command
         .args(args)
-        .output()
-        .await
+        .stdin(if stdin_text.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
         .with_context(|| format!("failed to execute {}", bin.display()))?;
 
+    let output = timeout(
+        COMMAND_TIMEOUT,
+        collect_command_output(&mut child, stdin_text),
+    )
+    .await;
+    match output {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(error).with_context(|| format!("failed while waiting for {}", bin.display()))
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(anyhow!(
+                "command {} {:?} timed out after {:?}",
+                bin.display(),
+                args,
+                COMMAND_TIMEOUT
+            ))
+        }
+    }
+}
+
+async fn collect_command_output(
+    child: &mut tokio::process::Child,
+    stdin_text: Option<&str>,
+) -> Result<std::process::Output> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("command stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("command stderr was not piped"))?;
+    let mut stdin = child.stdin.take();
+    let stdin_write = async {
+        if let (Some(stdin), Some(text)) = (stdin.as_mut(), stdin_text) {
+            stdin.write_all(text.as_bytes()).await?;
+        }
+        drop(stdin.take());
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let (stdout, stderr, status, stdin_result) = tokio::join!(
+        read_command_output(stdout),
+        read_command_output(stderr),
+        child.wait(),
+        stdin_write,
+    );
+    stdin_result?;
+    Ok(std::process::Output {
+        status: status?,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
+}
+
+async fn read_command_output<R>(mut reader: R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(output);
+        }
+        if output.len() + read > MAX_COMMAND_OUTPUT_BYTES {
+            return Err(anyhow!(
+                "command output exceeded {} MiB",
+                MAX_COMMAND_OUTPUT_BYTES / (1024 * 1024)
+            ));
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn parse_command_json(bin: &Path, args: &[&str], output: std::process::Output) -> Result<Value> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1021,6 +1158,35 @@ mod tests {
         assert_eq!(
             validate_reset_after_seconds(MAX_RESET_AFTER_SECONDS + 1),
             None
+        );
+    }
+
+    #[test]
+    fn prompt_json_escapes_properly() {
+        let prompt = "test prompt with \"quotes\" and \n newlines";
+        let prompt_json = serde_json::to_string(prompt).unwrap();
+        assert!(prompt_json.starts_with('"') && prompt_json.ends_with('"'));
+    }
+
+    #[tokio::test]
+    async fn detect_caches_resolved_driver_and_binary() {
+        let config = BrowserDriverConfig::with_driver(
+            Some(BrowserDriverKind::Orca),
+            Some(PathBuf::from("/custom/orca")),
+            "worktree",
+            None,
+        );
+        assert!(config.resolved.get().is_none());
+        let first = config.detect().await.unwrap();
+        let second = config.detect().await.unwrap();
+        assert_eq!(
+            first,
+            (BrowserDriverKind::Orca, PathBuf::from("/custom/orca"))
+        );
+        assert_eq!(first, second);
+        assert_eq!(
+            config.resolved.get(),
+            Some(&(BrowserDriverKind::Orca, PathBuf::from("/custom/orca")))
         );
     }
 }

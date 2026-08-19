@@ -187,11 +187,19 @@ Compiled binaries in `target/release/`:
 ### 2. Start the Daemon
 
 ```bash
-./target/release/gpt2omo --bind 0.0.0.0:18800 --mount-root /
+# Local development (default bind is 127.0.0.1:18800 and mount-root is .):
+./target/release/gpt2omo
+
+# Non-loopback exposure (--token is MANDATORY for non-loopback exposure):
+./target/release/gpt2omo --bind 0.0.0.0:18800 --token "$OMO_BRIDGE_TOKEN"
 ```
 
-Or connect via Cloudflare Tunnel:
+Or connect via Cloudflare Tunnel (`--token` is mandatory for non-loopback/remote access exposure):
 ```bash
+# Start daemon with mandatory token authentication:
+./target/release/gpt2omo --token "$OMO_BRIDGE_TOKEN"
+
+# Forward loopback traffic through tunnel:
 cloudflared tunnel --url http://127.0.0.1:18800
 ```
 

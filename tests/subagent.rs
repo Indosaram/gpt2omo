@@ -91,12 +91,15 @@ fn cli_for(dir: &TempDir, scope_dir: std::path::PathBuf, endpoint: Option<String
         scope_dir: Some(scope_dir),
         bind: "127.0.0.1:0".into(),
         token: None,
+        token_file: None,
         max_file_bytes: 10 * 1024 * 1024,
         command_timeout_ms: 5_000,
         subagent_endpoint: endpoint,
         subagent_api_key: Some("test-secret-key".into()),
         subagent_model: "mock-model".into(),
         subagent_allow_remote: false,
+        insecure_no_auth: true,
+        allow_arbitrary_commands: false,
     }
 }
 

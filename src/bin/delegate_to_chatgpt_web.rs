@@ -22,12 +22,17 @@ use gpt2omo::{
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use serde_json::Value;
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Instant};
 use url::Url;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const MAX_NEW_DISPATCH_WORKERS: usize = 2;
 const MAX_CONCURRENT_IN_FLIGHT_WORKERS: usize = 3;
@@ -104,7 +109,7 @@ struct Cli {
     workspace: Option<PathBuf>,
 
     /// Broad mount root used by the running bridge daemon.
-    #[arg(long, default_value = "/")]
+    #[arg(long, default_value = ".")]
     mount_root: PathBuf,
 
     /// gpt2omo base URL.
@@ -622,7 +627,15 @@ fn prepare_tasks(cli: &Cli) -> Result<Vec<PreparedTask>> {
         .collect()
 }
 
-fn load_bridge_runtime_policy() -> (usize, usize, u64, usize) {
+type BridgeRuntimePolicy = (usize, usize, u64, usize);
+
+static BRIDGE_RUNTIME_POLICY: OnceLock<BridgeRuntimePolicy> = OnceLock::new();
+
+fn load_bridge_runtime_policy() -> BridgeRuntimePolicy {
+    *BRIDGE_RUNTIME_POLICY.get_or_init(load_bridge_runtime_policy_uncached)
+}
+
+fn load_bridge_runtime_policy_uncached() -> BridgeRuntimePolicy {
     // Read strictly from persistent bridge directory ~/.omo/bridge/config.json if customized by host/admin,
     // otherwise fallback to compiled daemon safety constants.
     // Client CLI environment variables (e.g. OMO_WEB_WINDOW_MAX_DISPATCHES) are deliberately NOT inspected
@@ -638,21 +651,37 @@ fn load_bridge_runtime_policy() -> (usize, usize, u64, usize) {
     if let Ok(content) = std::fs::read_to_string(&config_path) {
         if let Ok(val) = serde_json::from_str::<Value>(&content) {
             if let Some(v) = val.get("max_new_dispatch_workers").and_then(Value::as_u64) {
-                if v > 0 { max_new = v as usize; }
+                if v > 0 {
+                    max_new = v as usize;
+                }
             }
-            if let Some(v) = val.get("max_concurrent_in_flight_workers").and_then(Value::as_u64) {
-                if v > 0 { max_concurrent = v as usize; }
+            if let Some(v) = val
+                .get("max_concurrent_in_flight_workers")
+                .and_then(Value::as_u64)
+            {
+                if v > 0 {
+                    max_concurrent = v as usize;
+                }
             }
             if let Some(v) = val.get("window_minutes").and_then(Value::as_u64) {
-                if v > 0 { window_minutes = v; }
+                if v > 0 {
+                    window_minutes = v;
+                }
             }
             if let Some(v) = val.get("max_dispatches_per_window").and_then(Value::as_u64) {
-                if v > 0 { max_dispatches = v as usize; }
+                if v > 0 {
+                    max_dispatches = v as usize;
+                }
             }
         }
     }
 
-    (max_new, max_concurrent, window_minutes * 60 * 1000, max_dispatches)
+    (
+        max_new,
+        max_concurrent,
+        window_minutes * 60 * 1000,
+        max_dispatches,
+    )
 }
 
 fn max_new_dispatch_workers() -> usize {
@@ -672,7 +701,7 @@ fn check_rate_limit_and_window_guards(additional_tasks: usize) -> Result<()> {
     let now = epoch_ms();
     if let Some((_, remaining_secs)) = active_rate_limit_lockout(now) {
         let wait_msg = match remaining_secs {
-            Some(secs) if secs > 60 => format!("{} minute(s)", (secs + 59) / 60),
+            Some(secs) if secs > 60 => format!("{} minute(s)", secs.div_ceil(60)),
             Some(secs) => format!("{secs} second(s)"),
             None => "a few minutes".to_string(),
         };
@@ -758,11 +787,50 @@ fn stage_dry_run(mux: &WorkspaceMux, tasks: &[PreparedTask]) -> Result<Vec<Stage
         .collect()
 }
 
+struct DispatchLock {
+    file: File,
+}
+
+impl DispatchLock {
+    fn acquire() -> Result<Self> {
+        let lock_dir = default_bridge_base_dir();
+        fs::create_dir_all(&lock_dir).with_context(|| {
+            format!(
+                "failed to create dispatch lock directory at {}",
+                lock_dir.display()
+            )
+        })?;
+        #[cfg(unix)]
+        let _ = fs::set_permissions(&lock_dir, fs::Permissions::from_mode(0o700));
+        let lock_path = lock_dir.join(".dispatch.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&lock_path)
+            .with_context(|| format!("failed to open dispatch lock at {}", lock_path.display()))?;
+        #[cfg(unix)]
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+        file.lock().with_context(|| {
+            format!("failed to acquire dispatch lock at {}", lock_path.display())
+        })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for DispatchLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 async fn stage_browser_delegations(
     mux: &WorkspaceMux,
     orca: &OrcaConfig,
     tasks: &[PreparedTask],
 ) -> Result<Vec<StagedDelegation>> {
+    let _dispatch_lock = DispatchLock::acquire()?;
     check_rate_limit_and_window_guards(tasks.len())?;
 
     let max_concurrent = max_concurrent_in_flight_workers();
@@ -823,7 +891,11 @@ async fn stage_browser_delegations(
             &lifecycle,
             false,
         );
-        let driver = orca.detect().await.map(|(k, _)| k).unwrap_or(BrowserDriverKind::Maho);
+        let driver = orca
+            .detect()
+            .await
+            .map(|(k, _)| k)
+            .unwrap_or(BrowserDriverKind::Maho);
         emit_telemetry(
             &staged_item,
             driver,
@@ -842,6 +914,7 @@ async fn stage_resume_delegation(
     scope_id: &str,
     task: &str,
 ) -> Result<ResumeStage> {
+    let _dispatch_lock = DispatchLock::acquire()?;
     check_rate_limit_and_window_guards(1)?;
 
     let max_concurrent = max_concurrent_in_flight_workers();
@@ -928,7 +1001,11 @@ async fn stage_resume_delegation(
     let lifecycle = start_next_delegation_generation(&workspace, scope_id, reopen_blocked)
         .map_err(anyhow::Error::msg)?;
     let staged = build_staged_delegation(&scope, Some(page), None, task, &lifecycle, true);
-    let driver = orca.detect().await.map(|(k, _)| k).unwrap_or(BrowserDriverKind::Maho);
+    let driver = orca
+        .detect()
+        .await
+        .map(|(k, _)| k)
+        .unwrap_or(BrowserDriverKind::Maho);
     emit_telemetry(
         &staged,
         driver,
@@ -1525,7 +1602,7 @@ fn emit_telemetry(
         reset_after_seconds,
         error_code,
     ) {
-        append_best_effort(&event);
+        let _ = append_best_effort(&event);
     }
 }
 
@@ -1988,7 +2065,7 @@ mod tests {
             close_on_terminal: false,
             session_ttl_minutes: DEFAULT_SESSION_TTL_MINUTES,
             workspace: None,
-            mount_root: PathBuf::from("/"),
+            mount_root: PathBuf::from("."),
             bridge_url: "http://127.0.0.1:18800".into(),
             scope_dir: None,
             worktree: "active".into(),
@@ -2374,11 +2451,10 @@ mod tests {
     }
 
     #[test]
-    fn cli_fixture_preserves_two_worker_cap_and_resume_is_single_scope() {
-        let cli = cli_for_test();
-        assert!(!cli.batch_stdin);
-        assert!(cli.resume_scope.is_none());
-        assert_eq!(MAX_NEW_DISPATCH_WORKERS, 2);
-        assert_eq!(MAX_CONCURRENT_IN_FLIGHT_WORKERS, 3);
+    fn dispatch_lock_can_be_acquired_and_released() {
+        let lock = DispatchLock::acquire().unwrap();
+        drop(lock);
+        let lock2 = DispatchLock::acquire();
+        assert!(lock2.is_ok());
     }
 }

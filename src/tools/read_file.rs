@@ -60,17 +60,27 @@ pub fn handle_read_file(
         Err(_) => return ToolCallResult::err("Binary file detected (non-UTF8)"),
     };
 
-    let lines: Vec<&str> = text.lines().collect();
-    let total_lines = lines.len();
     let start = start_line.unwrap_or(1).saturating_sub(1);
     let limit = max_lines.unwrap_or(2000);
-    let end = total_lines.min(start.saturating_add(limit));
-    let returned_lines = if start < total_lines { end - start } else { 0 };
-    let sliced = if returned_lines == 0 {
-        String::new()
-    } else {
-        lines[start..end].join("\n")
-    };
+    let end = start.saturating_add(limit);
+    let mut total_lines = 0;
+    let mut returned_lines = 0;
+    let mut sliced = String::new();
+
+    for (line_number, raw_line) in text.split_inclusive('\n').enumerate() {
+        let line = raw_line
+            .strip_suffix("\r\n")
+            .or_else(|| raw_line.strip_suffix('\n'))
+            .unwrap_or(raw_line);
+        if line_number >= start && line_number < end {
+            if returned_lines > 0 {
+                sliced.push('\n');
+            }
+            sliced.push_str(line);
+            returned_lines += 1;
+        }
+        total_lines += 1;
+    }
 
     ToolCallResult::ok(serde_json::json!({
         "path": path_str,

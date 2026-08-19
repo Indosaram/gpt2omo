@@ -17,9 +17,14 @@
    - Symlink traversal, `..` path escapes, and absolute path injection outside the scoped workspace are structurally rejected.
    - Secret files, sensitive credentials (`.env`, `.git/config`, private keys), and system files outside the workspace are denied.
 
-3. **Command Execution Whitelist**:
-   - `run_command` executes only strictly whitelisted build, test, and verification tools (e.g., `cargo`, `npm`, `pnpm`, `pytest`, `vitest`, `go`, `git status`).
-   - Direct shell invocation (`sh`, `bash`, `zsh`) is disabled.
+3. **Command Execution Allowlist & Shell Rejection**:
+   - `run_command` executes only strictly allowed build, test, and verification tools:
+     - `cargo`, `rustc`, `npm`, `pnpm`, `yarn`, `bun`, `node`, `python`, `python3`, `pytest`, `uv`, `go`, `make`, `git`, `vitest`, `jest`, `tsc`, `biome`, `ruff`, `sg`, `ast-grep`.
+   - Direct shell interpreters and command wrapper binaries (`sh`, `bash`, `zsh`, `fish`, `dash`, `env`, `xargs`, `eval`, `perl`, `ruby`, `awk`, `script`, `sudo`, `su`, `doas`, `cmd`, `powershell`, `pwsh`, `ksh`, `csh`, `tcsh`) are explicitly rejected.
+   - Command injection and escape options in tools such as `git` (`-c`, `--exec-path`, `--upload-pack`, `--receive-pack`, `--config-env`) are rejected before execution.
+   - Path arguments are strictly validated to prevent directory traversal (`..`) or absolute path references outside the mounted workspace scope.
+   - Child process environments are sanitized to scrub sensitive daemon secrets (`OMO_BRIDGE_TOKEN`, API keys, tokens).
+   - **Override Flag**: The `--allow-arbitrary-commands` CLI flag (or `OMO_BRIDGE_ALLOW_ARBITRARY_COMMANDS=true` / `1` environment variable) can be enabled to bypass allowlist restrictions when arbitrary execution is explicitly permitted by the host.
    - Commands are executed with per-execution timeouts and bounded output buffers.
 
 4. **Optimistic Concurrency & Atomic Writes**:

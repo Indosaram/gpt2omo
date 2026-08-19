@@ -1,5 +1,7 @@
 use crate::security::Workspace;
-use crate::tools::run_command::{prepare_command, PreparedCommand};
+use crate::tools::run_command::{
+    is_arbitrary_commands_allowed, prepare_command_with_policy, PreparedCommand,
+};
 use crate::tools::task_state::{
     is_verification_command, load_delegation_lifecycle, record_verification,
 };
@@ -26,14 +28,25 @@ const NORMAL_DESCENDANT_GRACE_MS: u64 = 100;
 const WAIT_TICK_MS: u64 = 20;
 const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
-const SENSITIVE_CHILD_ENV: &[&str] = &[
-    "OMO_BRIDGE_TOKEN",
-    "OMO_SUBAGENT_API_KEY",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "GITHUB_TOKEN",
-    "GH_TOKEN",
+const ALLOWED_CHILD_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "SSL_CERT_FILE",
+    "RUSTUP_HOME",
+    "CARGO_HOME",
+    "NODE_PATH",
 ];
+
+// These are non-secret build settings that may be configured by the daemon for the workspace.
+// They are forwarded explicitly rather than allowing the child to inherit anything else.
+const WORKSPACE_CHILD_ENV: &[&str] = &["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET"];
 
 #[derive(Clone)]
 pub struct CommandManager {
@@ -45,6 +58,7 @@ struct CommandManagerInner {
     changed: Condvar,
     sync_wait: Duration,
     kill_grace: Duration,
+    allow_arbitrary: bool,
 }
 
 #[derive(Default)]
@@ -128,14 +142,29 @@ struct OutputPage {
 
 impl BoundedRing {
     fn push(&mut self, chunk: &[u8]) {
-        for byte in chunk {
-            self.bytes.push_back(*byte);
-            self.end_offset = self.end_offset.saturating_add(1);
+        if chunk.is_empty() {
+            return;
         }
-        while self.bytes.len() > MAX_RING_BYTES_PER_STREAM {
-            let _ = self.bytes.pop_front();
-            self.start_offset = self.start_offset.saturating_add(1);
-            self.dropped_bytes = self.dropped_bytes.saturating_add(1);
+        self.end_offset = self.end_offset.saturating_add(chunk.len() as u64);
+        if chunk.len() >= MAX_RING_BYTES_PER_STREAM {
+            let excess = self
+                .bytes
+                .len()
+                .saturating_add(chunk.len())
+                .saturating_sub(MAX_RING_BYTES_PER_STREAM);
+            self.bytes.clear();
+            let keep_slice = &chunk[chunk.len() - MAX_RING_BYTES_PER_STREAM..];
+            self.bytes.extend(keep_slice.iter().copied());
+            self.start_offset = self.start_offset.saturating_add(excess as u64);
+            self.dropped_bytes = self.dropped_bytes.saturating_add(excess as u64);
+        } else {
+            self.bytes.extend(chunk.iter().copied());
+            let excess = self.bytes.len().saturating_sub(MAX_RING_BYTES_PER_STREAM);
+            if excess > 0 {
+                self.bytes.drain(..excess);
+                self.start_offset = self.start_offset.saturating_add(excess as u64);
+                self.dropped_bytes = self.dropped_bytes.saturating_add(excess as u64);
+            }
         }
     }
 
@@ -145,13 +174,20 @@ impl BoundedRing {
         let relative = effective_start.saturating_sub(self.start_offset) as usize;
         let available = self.bytes.len().saturating_sub(relative);
         let take = available.min(MAX_RESPONSE_BYTES_PER_STREAM);
-        let bytes = self
-            .bytes
-            .iter()
-            .skip(relative)
-            .take(take)
-            .copied()
-            .collect::<Vec<_>>();
+        let mut bytes = Vec::with_capacity(take);
+        let (s1, s2) = self.bytes.as_slices();
+        if relative < s1.len() {
+            let chunk1 = &s1[relative..];
+            let take1 = chunk1.len().min(take);
+            bytes.extend_from_slice(&chunk1[..take1]);
+            let remaining = take - take1;
+            if remaining > 0 {
+                bytes.extend_from_slice(&s2[..remaining]);
+            }
+        } else {
+            let offset = relative - s1.len();
+            bytes.extend_from_slice(&s2[offset..offset + take]);
+        }
         let next_offset = effective_start.saturating_add(take as u64);
         OutputPage {
             text: lossy_bounded(&bytes, MAX_RESPONSE_BYTES_PER_STREAM),
@@ -170,19 +206,38 @@ impl Default for CommandManager {
 
 impl CommandManager {
     pub fn new() -> Self {
-        Self::with_limits(
+        Self::with_limits_and_policy(
             Duration::from_millis(DEFAULT_SYNC_WAIT_MS),
             Duration::from_millis(DEFAULT_KILL_GRACE_MS),
+            is_arbitrary_commands_allowed(),
         )
     }
 
+    pub fn with_allow_arbitrary(allow_arbitrary: bool) -> Self {
+        Self::with_limits_and_policy(
+            Duration::from_millis(DEFAULT_SYNC_WAIT_MS),
+            Duration::from_millis(DEFAULT_KILL_GRACE_MS),
+            allow_arbitrary || is_arbitrary_commands_allowed(),
+        )
+    }
+
+    #[cfg(test)]
     fn with_limits(sync_wait: Duration, kill_grace: Duration) -> Self {
+        Self::with_limits_and_policy(sync_wait, kill_grace, is_arbitrary_commands_allowed())
+    }
+
+    fn with_limits_and_policy(
+        sync_wait: Duration,
+        kill_grace: Duration,
+        allow_arbitrary: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(CommandManagerInner {
                 state: Mutex::new(ManagerState::default()),
                 changed: Condvar::new(),
                 sync_wait,
                 kill_grace,
+                allow_arbitrary,
             }),
         }
     }
@@ -215,7 +270,7 @@ impl CommandManager {
         timeout_ms: u64,
         client_request_id: Option<&str>,
     ) -> ToolCallResult {
-        let prepared = match prepare_command(ws, command) {
+        let prepared = match prepare_command_with_policy(ws, command, self.inner.allow_arbitrary) {
             Ok(prepared) => prepared,
             Err(error) => return ToolCallResult::err(error),
         };
@@ -847,10 +902,21 @@ fn spawn_reader<R: Read + Send + 'static>(
 }
 
 fn sanitize_child_environment(command: &mut Command) {
-    for key in SENSITIVE_CHILD_ENV {
-        command.env_remove(key);
-    }
+    command.env_clear();
     command.env("PATH", clean_path());
+    for key in ALLOWED_CHILD_ENV {
+        if *key == "PATH" {
+            continue;
+        }
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    for key in WORKSPACE_CHILD_ENV {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
 }
 
 fn clean_path() -> OsString {
@@ -995,7 +1061,7 @@ mod tests {
     const SCOPE: &str = "55555555-5555-4555-8555-555555555555";
 
     fn test_manager() -> CommandManager {
-        CommandManager::with_limits(Duration::from_millis(100), Duration::from_millis(150))
+        CommandManager::with_limits(Duration::from_millis(500), Duration::from_millis(150))
     }
 
     #[test]
@@ -1019,6 +1085,62 @@ mod tests {
     }
 
     #[test]
+    fn bounded_ring_push_chunks_and_bulk_drain() {
+        let mut ring = BoundedRing::default();
+        ring.push(b"hello ");
+        assert_eq!(ring.bytes.len(), 6);
+        assert_eq!(ring.start_offset, 0);
+        assert_eq!(ring.end_offset, 6);
+        assert_eq!(ring.dropped_bytes, 0);
+
+        ring.push(b"world");
+        assert_eq!(ring.bytes.len(), 11);
+        assert_eq!(ring.start_offset, 0);
+        assert_eq!(ring.end_offset, 11);
+        assert_eq!(ring.dropped_bytes, 0);
+
+        let fill = vec![b'a'; MAX_RING_BYTES_PER_STREAM - 11];
+        ring.push(&fill);
+        assert_eq!(ring.bytes.len(), MAX_RING_BYTES_PER_STREAM);
+        assert_eq!(ring.start_offset, 0);
+        assert_eq!(ring.end_offset, MAX_RING_BYTES_PER_STREAM as u64);
+        assert_eq!(ring.dropped_bytes, 0);
+
+        // Push another small chunk that triggers partial bulk drain
+        ring.push(b"12345");
+        assert_eq!(ring.bytes.len(), MAX_RING_BYTES_PER_STREAM);
+        assert_eq!(ring.start_offset, 5);
+        assert_eq!(ring.end_offset, MAX_RING_BYTES_PER_STREAM as u64 + 5);
+        assert_eq!(ring.dropped_bytes, 5);
+
+        // Push empty chunk
+        ring.push(b"");
+        assert_eq!(ring.bytes.len(), MAX_RING_BYTES_PER_STREAM);
+        assert_eq!(ring.start_offset, 5);
+        assert_eq!(ring.end_offset, MAX_RING_BYTES_PER_STREAM as u64 + 5);
+        assert_eq!(ring.dropped_bytes, 5);
+    }
+
+    #[test]
+    fn bounded_ring_page_from_slice_extraction() {
+        let mut ring = BoundedRing::default();
+        ring.push(b"first section ");
+        ring.push(b"second section ");
+        ring.push(b"third section");
+
+        let page1 = ring.page_from(0);
+        assert_eq!(page1.text, "first section second section third section");
+        assert_eq!(page1.dropped_before, 0);
+        assert_eq!(page1.next_offset, 42);
+        assert!(!page1.more_available);
+
+        let page_partial = ring.page_from(14);
+        assert_eq!(page_partial.text, "second section third section");
+        assert_eq!(page_partial.next_offset, 42);
+        assert!(!page_partial.more_available);
+    }
+
+    #[test]
     fn child_environment_removes_daemon_credentials_and_sets_clean_path() {
         let mut command = Command::new("git");
         command
@@ -1034,8 +1156,10 @@ mod tests {
                 )
             })
             .collect::<HashMap<_, _>>();
-        assert_eq!(envs.get("OMO_BRIDGE_TOKEN"), Some(&None));
-        assert_eq!(envs.get("OMO_SUBAGENT_API_KEY"), Some(&None));
+        assert!(!envs.contains_key("OMO_BRIDGE_TOKEN"));
+        assert!(!envs.contains_key("OMO_SUBAGENT_API_KEY"));
+        assert!(!envs.contains_key("OPENAI_API_KEY"));
+        assert!(!envs.contains_key("RUSTFLAGS"));
         let path = envs
             .get("PATH")
             .and_then(Option::as_deref)
@@ -1059,7 +1183,7 @@ mod tests {
     #[test]
     fn slow_command_auto_detaches_and_long_poll_finishes() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("Makefile"), "test:\n\t@sleep 0.30\n").unwrap();
+        fs::write(dir.path().join("Makefile"), "test:\n\t@sleep 0.80\n").unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         let manager = test_manager();
         let result = manager.run_command(&ws, SCOPE, "make test", 2_000, None);
@@ -1076,23 +1200,27 @@ mod tests {
 
     #[test]
     fn mutation_marks_inflight_verification_stale_revision() {
+        let scope_id = uuid::Uuid::new_v4().to_string();
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("Makefile"), "test:\n\t@sleep 0.30\n").unwrap();
+        fs::write(dir.path().join("Makefile"), "test:\n\t@sleep 0.50\n").unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         let manager = test_manager();
-        assert!(handle_task_plan(&ws, SCOPE, "verify", vec!["run".into()]).success);
-        let result = manager.run_command(&ws, SCOPE, "make test", 2_000, None);
+        assert!(handle_task_plan(&ws, &scope_id, "verify", vec!["run".into()]).success);
+        let result = manager.run_command(&ws, &scope_id, "make test", 2_000, None);
+        if !result.success {
+            panic!("run_command failed: {:?}", result.error);
+        }
         let command_id = result.data.unwrap()["command_id"]
             .as_str()
             .unwrap()
             .to_string();
-        record_mutation(&ws, SCOPE, "src/lib.rs");
-        assert_eq!(manager.note_workspace_mutation(SCOPE), 1);
-        let polled = manager.poll_command(&ws, SCOPE, &command_id, Some(2_000));
+        record_mutation(&ws, &scope_id, "src/lib.rs");
+        assert_eq!(manager.note_workspace_mutation(&scope_id), 1);
+        let polled = manager.poll_command(&ws, &scope_id, &command_id, Some(2_000));
         let data = polled.data.unwrap();
         assert_eq!(data["status"], "completed");
         assert_eq!(data["evidence_status"], "stale_revision");
-        assert!(load_task_state(&ws, SCOPE)
+        assert!(load_task_state(&ws, &scope_id)
             .unwrap()
             .unwrap()
             .verifications

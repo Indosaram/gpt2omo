@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -85,6 +86,10 @@ pub async fn handle_query_subagent(
         Ok(url) => url,
         Err(error) => return ToolCallResult::err(error),
     };
+    let resolved_addresses = match resolve_endpoint(&completion_url, allow_remote).await {
+        Ok(addresses) => addresses,
+        Err(error) => return ToolCallResult::err(error),
+    };
     let model = model.trim();
     if model.is_empty() {
         return ToolCallResult::err("Subagent model must not be empty");
@@ -118,7 +123,14 @@ pub async fn handle_query_subagent(
         Err(error) => return ToolCallResult::err(error),
     };
 
-    let client = match reqwest::Client::builder().redirect(Policy::none()).build() {
+    let mut client_builder = reqwest::Client::builder().redirect(Policy::none());
+    if let Some(addresses) = resolved_addresses.as_deref() {
+        let Some(host) = completion_url.host_str() else {
+            return ToolCallResult::err("Subagent endpoint must include a host");
+        };
+        client_builder = client_builder.resolve_to_addrs(host, addresses);
+    }
+    let client = match client_builder.build() {
         Ok(client) => client,
         Err(_) => return ToolCallResult::err("Subagent HTTP client initialization failed"),
     };
@@ -339,26 +351,120 @@ fn completion_url(endpoint: Option<&str>, allow_remote: bool) -> Result<Url, Str
     if base.query().is_some() || base.fragment().is_some() {
         return Err("Subagent endpoint must not contain a query string or fragment".to_string());
     }
-    if !allow_remote && !is_loopback_endpoint(&base) {
-        return Err(
-            "Remote subagent endpoints are disabled; use --subagent-allow-remote to opt in"
-                .to_string(),
-        );
+    match base.host() {
+        Some(Host::Ipv4(address)) if !allow_remote && !address.is_loopback() => {
+            return Err(
+                "Remote subagent endpoints are disabled; use --subagent-allow-remote to opt in"
+                    .to_string(),
+            );
+        }
+        Some(Host::Ipv6(address)) if !allow_remote && !address.is_loopback() => {
+            return Err(
+                "Remote subagent endpoints are disabled; use --subagent-allow-remote to opt in"
+                    .to_string(),
+            );
+        }
+        Some(Host::Domain(domain)) if !allow_remote && !is_loopback_domain(domain) => {
+            return Err(
+                "Remote subagent endpoints are disabled; use --subagent-allow-remote to opt in"
+                    .to_string(),
+            );
+        }
+        Some(Host::Ipv4(address)) if allow_remote && is_blocked_remote_ipv4(address) => {
+            return Err(
+                "Subagent endpoint targets a blocked private or metadata address".to_string(),
+            );
+        }
+        Some(Host::Ipv6(address)) if allow_remote && is_blocked_remote_ipv6(address) => {
+            return Err(
+                "Subagent endpoint targets a blocked private or metadata address".to_string(),
+            );
+        }
+        Some(Host::Domain(domain)) if allow_remote && is_blocked_remote_domain(domain) => {
+            return Err(
+                "Subagent endpoint targets a blocked private or metadata address".to_string(),
+            );
+        }
+        None => return Err("Subagent endpoint must include a host".to_string()),
+        _ => {}
     }
     base.set_path("/v1/chat/completions");
     Ok(base)
 }
 
-fn is_loopback_endpoint(url: &Url) -> bool {
-    match url.host() {
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        Some(Host::Domain(domain)) => {
-            domain.eq_ignore_ascii_case("localhost")
-                || domain.to_ascii_lowercase().ends_with(".localhost")
-        }
-        None => false,
+async fn resolve_endpoint(
+    url: &Url,
+    allow_remote: bool,
+) -> Result<Option<Vec<SocketAddr>>, String> {
+    let Some(host) = url.host() else {
+        return Err("Subagent endpoint must include a host".to_string());
+    };
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "Subagent endpoint must specify a known port".to_string())?;
+
+    let addresses = match host {
+        Host::Ipv4(address) => vec![SocketAddr::new(IpAddr::V4(address), port)],
+        Host::Ipv6(address) => vec![SocketAddr::new(IpAddr::V6(address), port)],
+        Host::Domain(domain) => tokio::net::lookup_host((domain, port))
+            .await
+            .map_err(|_| "Subagent endpoint DNS resolution failed".to_string())?
+            .collect(),
+    };
+    if addresses.is_empty() {
+        return Err("Subagent endpoint DNS resolution returned no addresses".to_string());
     }
+
+    for address in &addresses {
+        let ip = address.ip();
+        if (!allow_remote && !ip.is_loopback()) || (allow_remote && is_blocked_remote_ip(ip)) {
+            return Err(if allow_remote {
+                "Subagent endpoint resolves to a blocked private or metadata address".to_string()
+            } else {
+                "Subagent endpoint must resolve to a loopback address".to_string()
+            });
+        }
+    }
+
+    Ok(Some(addresses))
+}
+
+fn is_blocked_remote_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_blocked_remote_ipv4(address),
+        IpAddr::V6(address) => is_blocked_remote_ipv6(address),
+    }
+}
+
+fn is_loopback_domain(domain: &str) -> bool {
+    domain.eq_ignore_ascii_case("localhost")
+}
+
+fn is_blocked_remote_ipv4(address: Ipv4Addr) -> bool {
+    address.is_loopback()
+        || address.is_unspecified()
+        || address.is_private()
+        || address.is_link_local()
+        || address == Ipv4Addr::new(169, 254, 169, 254)
+}
+
+fn is_blocked_remote_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    let is_link_local = (segments[0] & 0xffc0) == 0xfe80;
+    let is_unique_local = (segments[0] & 0xfe00) == 0xfc00;
+    let is_ipv4_mapped = address.to_ipv4().is_some_and(is_blocked_remote_ipv4);
+    address.is_loopback()
+        || address.is_unspecified()
+        || is_link_local
+        || is_unique_local
+        || is_ipv4_mapped
+}
+
+fn is_blocked_remote_domain(domain: &str) -> bool {
+    let domain = domain.trim_end_matches('.');
+    domain.eq_ignore_ascii_case("localhost")
+        || domain.to_ascii_lowercase().ends_with(".localhost")
+        || domain.eq_ignore_ascii_case("metadata.google.internal")
 }
 
 fn extract_advice(value: &Value) -> Option<String> {
@@ -413,7 +519,27 @@ mod tests {
     fn endpoint_is_local_by_default_and_normalized() {
         let url = completion_url(Some("http://127.0.0.1:1234/base"), false).unwrap();
         assert_eq!(url.as_str(), "http://127.0.0.1:1234/v1/chat/completions");
+        assert!(completion_url(Some("http://[::1]:1234"), false).is_ok());
+        assert!(completion_url(Some("http://localhost:1234"), false).is_ok());
         assert!(completion_url(Some("https://example.com"), false).is_err());
+    }
+
+    #[test]
+    fn remote_endpoints_reject_private_link_local_and_metadata_addresses() {
+        for endpoint in [
+            "http://10.0.0.1",
+            "http://172.16.0.1",
+            "http://192.168.1.1",
+            "http://169.254.1.1",
+            "http://169.254.169.254",
+            "http://[fe80::1]",
+            "http://metadata.google.internal",
+        ] {
+            assert!(
+                completion_url(Some(endpoint), true).is_err(),
+                "endpoint should be blocked: {endpoint}"
+            );
+        }
         assert!(completion_url(Some("https://example.com"), true).is_ok());
     }
 

@@ -6,14 +6,142 @@ use std::path::{Component, Path};
 const LEGACY_SCOPE_ID: &str = "00000000-0000-4000-8000-000000000000";
 
 #[derive(Clone, Debug)]
-pub(crate) struct PreparedCommand {
-    pub(crate) binary: String,
-    pub(crate) args: Vec<String>,
+pub struct PreparedCommand {
+    pub binary: String,
+    pub args: Vec<String>,
 }
 
-pub(crate) fn prepare_command(
+pub const ALLOWED_BINARIES: &[&str] = &[
+    "cargo", "rustc", "npm", "pnpm", "yarn", "bun", "node", "python", "python3", "pytest", "uv",
+    "go", "make", "git", "vitest", "jest", "tsc", "biome", "ruff", "sg", "ast-grep",
+];
+
+pub const BLOCKED_SHELL_WRAPPERS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "csh",
+    "tcsh",
+    "env",
+    "xargs",
+    "eval",
+    "perl",
+    "ruby",
+    "awk",
+    "script",
+    "sudo",
+    "su",
+    "doas",
+    "cmd",
+    "cmd.exe",
+    "powershell",
+    "powershell.exe",
+    "pwsh",
+    "pwsh.exe",
+];
+
+fn extract_binary_name(binary: &str) -> &str {
+    Path::new(binary)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(binary)
+}
+
+pub(crate) fn is_arbitrary_commands_allowed() -> bool {
+    std::env::args().any(|arg| arg == "--allow-arbitrary-commands")
+        || std::env::var("OMO_BRIDGE_ALLOW_ARBITRARY_COMMANDS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        || std::env::var("OMO_ALLOW_ARBITRARY_COMMANDS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        || std::env::var("ALLOW_ARBITRARY_COMMANDS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+fn get_explicit_whitelisted_binaries() -> Vec<String> {
+    if let Ok(extra) =
+        std::env::var("OMO_ALLOWED_BINARIES").or_else(|_| std::env::var("ALLOWED_BINARIES"))
+    {
+        extra
+            .split([',', ':', ';', ' '])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+pub fn validate_binary(binary: &str) -> std::result::Result<(), String> {
+    let arbitrary = is_arbitrary_commands_allowed();
+    let explicit = get_explicit_whitelisted_binaries();
+    validate_binary_with_policy(binary, arbitrary, &explicit)
+}
+
+pub(crate) fn validate_binary_with_policy(
+    binary: &str,
+    allow_arbitrary: bool,
+    explicit_whitelist: &[String],
+) -> std::result::Result<(), String> {
+    if allow_arbitrary {
+        return Ok(());
+    }
+
+    let bin_name = extract_binary_name(binary);
+    if bin_name.is_empty() {
+        return Err("Empty command binary".into());
+    }
+
+    let bin_lower = bin_name.to_ascii_lowercase();
+    let bin_clean = bin_lower.strip_suffix(".exe").unwrap_or(&bin_lower);
+
+    if BLOCKED_SHELL_WRAPPERS
+        .iter()
+        .any(|&blocked| blocked == bin_clean || blocked == bin_lower)
+    {
+        return Err(format!(
+            "Shell wrapper or indirect command runner '{}' is blocked for security reasons",
+            bin_name
+        ));
+    }
+
+    if explicit_whitelist.iter().any(|w| {
+        w.eq_ignore_ascii_case(bin_clean)
+            || w.eq_ignore_ascii_case(&bin_lower)
+            || w.eq_ignore_ascii_case(bin_name)
+    }) {
+        return Ok(());
+    }
+
+    if ALLOWED_BINARIES
+        .iter()
+        .any(|&allowed| allowed == bin_clean || allowed == bin_lower)
+    {
+        return Ok(());
+    }
+
+    Err(format!(
+        "command binary '{}' is not in the allowed execution whitelist",
+        bin_name
+    ))
+}
+
+pub fn prepare_command(
     ws: &Workspace,
     cmd_str: &str,
+) -> std::result::Result<PreparedCommand, String> {
+    prepare_command_with_policy(ws, cmd_str, is_arbitrary_commands_allowed())
+}
+
+pub(crate) fn prepare_command_with_policy(
+    ws: &Workspace,
+    cmd_str: &str,
+    allow_arbitrary: bool,
 ) -> std::result::Result<PreparedCommand, String> {
     let parts = split_command_line(cmd_str)?;
     if parts.is_empty() {
@@ -23,12 +151,49 @@ pub(crate) fn prepare_command(
     let binary = &parts[0];
     let args = &parts[1..];
 
-    validate_obvious_path_escapes(ws, args)?;
+    validate_binary_with_policy(
+        binary,
+        allow_arbitrary,
+        &get_explicit_whitelisted_binaries(),
+    )?;
+
+    if !allow_arbitrary {
+        let bin_name = extract_binary_name(binary);
+        let bin_lower = bin_name.to_ascii_lowercase();
+        let bin_clean = bin_lower.strip_suffix(".exe").unwrap_or(&bin_lower);
+        if bin_clean == "git" {
+            validate_git_args(args)?;
+        }
+        validate_obvious_path_escapes(ws, args)?;
+    }
 
     Ok(PreparedCommand {
         binary: binary.clone(),
         args: args.to_vec(),
     })
+}
+
+fn validate_git_args(args: &[String]) -> std::result::Result<(), String> {
+    for arg in args {
+        let trimmed = arg.trim();
+        if trimmed == "-c"
+            || trimmed.starts_with("-c")
+            || trimmed == "--exec-path"
+            || trimmed.starts_with("--exec-path=")
+            || trimmed == "--upload-pack"
+            || trimmed.starts_with("--upload-pack=")
+            || trimmed == "--receive-pack"
+            || trimmed.starts_with("--receive-pack=")
+            || trimmed == "--config-env"
+            || trimmed.starts_with("--config-env=")
+        {
+            return Err(format!(
+                "git option '{}' is forbidden for security reasons",
+                arg
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Compatibility wrapper for in-process callers. The MCP server owns a single shared
@@ -175,5 +340,182 @@ mod tests {
         let data = result.data.unwrap();
         assert_eq!(data["timed_out"], true);
         assert_eq!(data["command_success"], false);
+    }
+
+    #[test]
+    fn test_allowed_binaries_pass_validation() {
+        let expected_allowed = [
+            "cargo", "rustc", "npm", "pnpm", "yarn", "bun", "node", "python", "python3", "pytest",
+            "uv", "go", "make", "git", "vitest", "jest", "tsc", "biome", "ruff", "sg", "ast-grep",
+        ];
+        for bin in expected_allowed {
+            assert!(
+                validate_binary(bin).is_ok(),
+                "Expected binary '{}' to be allowed",
+                bin
+            );
+            assert!(
+                validate_binary(&format!("/usr/bin/{}", bin)).is_ok(),
+                "Expected binary path '/usr/bin/{}' to be allowed",
+                bin
+            );
+        }
+    }
+
+    #[test]
+    fn test_shell_wrappers_are_blocked() {
+        let shell_wrappers = [
+            "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "env", "xargs", "eval",
+            "perl", "ruby", "awk", "script", "sudo", "su", "doas",
+        ];
+        for shell in shell_wrappers {
+            let res = validate_binary(shell);
+            assert!(res.is_err(), "Expected shell '{}' to be blocked", shell);
+            assert!(
+                res.unwrap_err().contains("Shell wrapper"),
+                "Expected shell wrapper error for '{}'",
+                shell
+            );
+
+            let res_path = validate_binary(&format!("/bin/{}", shell));
+            assert!(
+                res_path.is_err(),
+                "Expected shell path '/bin/{}' to be blocked",
+                shell
+            );
+            assert!(
+                res_path.unwrap_err().contains("Shell wrapper"),
+                "Expected shell wrapper error for '/bin/{}'",
+                shell
+            );
+        }
+    }
+
+    #[test]
+    fn test_git_escape_options_are_blocked() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+
+        let forbidden_git_cmds = [
+            "git -c core.pager=cat log",
+            "git -c=core.pager=cat log",
+            "git -cfoo=bar status",
+            "git --exec-path=/tmp status",
+            "git --exec-path status",
+            "git --upload-pack=/bin/sh fetch",
+            "git --receive-pack=/bin/sh push",
+            "git --config-env=FOO=BAR status",
+        ];
+
+        for cmd in forbidden_git_cmds {
+            let res = prepare_command(&ws, cmd);
+            assert!(res.is_err(), "Expected git command '{}' to be blocked", cmd);
+            assert!(
+                res.unwrap_err().contains("git option"),
+                "Expected git option error for '{}'",
+                cmd
+            );
+        }
+
+        // Benign git commands succeed
+        assert!(prepare_command(&ws, "git status").is_ok());
+        assert!(prepare_command(&ws, "git diff HEAD").is_ok());
+        assert!(prepare_command(&ws, "git log --oneline").is_ok());
+        assert!(prepare_command(&ws, "git commit -m \"fix: update parser\"").is_ok());
+    }
+
+    #[test]
+    fn test_prepare_command_blocks_shell_wrappers_and_disallowed_binaries() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+
+        let sh_res = prepare_command(&ws, "sh -c 'echo 123'");
+        assert!(sh_res.is_err());
+        assert!(sh_res.unwrap_err().contains("Shell wrapper"));
+
+        let bash_res = prepare_command(&ws, "/bin/bash script.sh");
+        assert!(bash_res.is_err());
+        assert!(bash_res.unwrap_err().contains("Shell wrapper"));
+
+        let env_res = prepare_command(&ws, "env FOO=bar cargo test");
+        assert!(env_res.is_err());
+        assert!(env_res.unwrap_err().contains("Shell wrapper"));
+
+        let xargs_res = prepare_command(&ws, "xargs -n 1 cargo");
+        assert!(xargs_res.is_err());
+        assert!(xargs_res.unwrap_err().contains("Shell wrapper"));
+
+        let eval_res = prepare_command(&ws, "eval echo 123");
+        assert!(eval_res.is_err());
+        assert!(eval_res.unwrap_err().contains("Shell wrapper"));
+
+        let perl_res = prepare_command(&ws, "perl -e 'print 1'");
+        assert!(perl_res.is_err());
+        assert!(perl_res.unwrap_err().contains("Shell wrapper"));
+
+        let ruby_res = prepare_command(&ws, "ruby -e 'puts 1'");
+        assert!(ruby_res.is_err());
+        assert!(ruby_res.unwrap_err().contains("Shell wrapper"));
+
+        let awk_res = prepare_command(&ws, "awk '{print $1}'");
+        assert!(awk_res.is_err());
+        assert!(awk_res.unwrap_err().contains("Shell wrapper"));
+
+        let script_res = prepare_command(&ws, "script output.txt");
+        assert!(script_res.is_err());
+        assert!(script_res.unwrap_err().contains("Shell wrapper"));
+
+        let curl_res = prepare_command(&ws, "curl https://example.com");
+        assert!(curl_res.is_err());
+        assert_eq!(
+            curl_res.unwrap_err(),
+            "command binary 'curl' is not in the allowed execution whitelist"
+        );
+
+        let rm_res = prepare_command(&ws, "rm -rf foo");
+        assert!(rm_res.is_err());
+        assert_eq!(
+            rm_res.unwrap_err(),
+            "command binary 'rm' is not in the allowed execution whitelist"
+        );
+    }
+
+    #[test]
+    fn test_prepare_command_allows_whitelisted_binaries() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+
+        assert!(prepare_command(&ws, "cargo test").is_ok());
+        assert!(prepare_command(&ws, "git status").is_ok());
+        assert!(prepare_command(&ws, "pytest tests/").is_ok());
+        assert!(prepare_command(&ws, "python3 -m unittest").is_ok());
+        assert!(prepare_command(&ws, "biome check").is_ok());
+        assert!(prepare_command(&ws, "ruff check").is_ok());
+        assert!(prepare_command(&ws, "sg -p pattern").is_ok());
+        assert!(prepare_command(&ws, "ast-grep --pattern foo").is_ok());
+    }
+
+    #[test]
+    fn test_policy_arbitrary_and_explicit_whitelist() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+
+        // Arbitrary allowed bypasses checks
+        assert!(validate_binary_with_policy("bash", true, &[]).is_ok());
+        assert!(validate_binary_with_policy("curl", true, &[]).is_ok());
+        assert!(validate_binary_with_policy("sh", true, &[]).is_ok());
+
+        assert!(prepare_command_with_policy(&ws, "bash -c 'echo 123'", true).is_ok());
+        assert!(prepare_command_with_policy(&ws, "curl https://example.com", true).is_ok());
+        assert!(prepare_command_with_policy(&ws, "git -c core.pager=cat status", true).is_ok());
+
+        // Explicit whitelist allows specific custom binaries
+        let explicit = vec!["custom_runner".to_string(), "my-tool".to_string()];
+        assert!(validate_binary_with_policy("custom_runner", false, &explicit).is_ok());
+        assert!(validate_binary_with_policy("my-tool", false, &explicit).is_ok());
+        assert!(
+            validate_binary_with_policy("/usr/local/bin/custom_runner", false, &explicit).is_ok()
+        );
+        assert!(validate_binary_with_policy("unlisted_tool", false, &explicit).is_err());
     }
 }

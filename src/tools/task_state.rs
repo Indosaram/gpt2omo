@@ -2,15 +2,15 @@ use crate::security::{default_bridge_base_dir, Workspace};
 use crate::tools::ToolCallResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const MAX_VERIFICATION_HISTORY: usize = 50;
-const TERMINAL_CLAIM_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const TERMINAL_CLAIM_LOCK_RETRY: Duration = Duration::from_millis(2);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -116,6 +116,11 @@ pub fn handle_task_plan(
         return ToolCallResult::err("Task plan cannot contain more than 100 items");
     }
 
+    let _lock = match TaskStateLock::acquire(ws, scope_id) {
+        Ok(lock) => lock,
+        Err(e) => return ToolCallResult::err(e),
+    };
+
     match load_task_state(ws, scope_id) {
         Ok(Some(existing))
             if existing
@@ -182,6 +187,11 @@ pub fn handle_task_update(
     };
     let becomes_blocked = parsed_status == TaskStatus::Blocked;
 
+    let _lock = match TaskStateLock::acquire(ws, scope_id) {
+        Ok(lock) => lock,
+        Err(e) => return ToolCallResult::err(e),
+    };
+
     let mut state = match load_task_state(ws, scope_id) {
         Ok(Some(state)) => state,
         Ok(None) => return ToolCallResult::err("No active task plan"),
@@ -202,6 +212,7 @@ pub fn handle_task_update(
     if let Err(error) = save_task_state(ws, scope_id, &state) {
         return ToolCallResult::err(error);
     }
+    drop(_lock);
 
     if becomes_blocked {
         let detail = state
@@ -263,6 +274,9 @@ pub fn handle_task_state(ws: &Workspace, scope_id: &str) -> ToolCallResult {
 }
 
 pub fn record_mutation(ws: &Workspace, scope_id: &str, path: &str) {
+    let Ok(_lock) = TaskStateLock::acquire(ws, scope_id) else {
+        return;
+    };
     let Ok(Some(mut state)) = load_task_state(ws, scope_id) else {
         return;
     };
@@ -285,6 +299,9 @@ pub fn record_verification(
         return;
     }
 
+    let Ok(_lock) = TaskStateLock::acquire(ws, scope_id) else {
+        return;
+    };
     let Ok(Some(mut state)) = load_task_state(ws, scope_id) else {
         return;
     };
@@ -392,6 +409,12 @@ pub fn start_next_delegation_generation(
     if previous.terminal_state.is_none() {
         return Err("Delegation session still has an active non-terminal generation".to_string());
     }
+
+    let _task_lock = if reopen_blocked_items {
+        Some(TaskStateLock::acquire(ws, scope_id)?)
+    } else {
+        None
+    };
 
     let original_task_state = if reopen_blocked_items {
         load_task_state(ws, scope_id)?
@@ -573,7 +596,7 @@ fn record_terminal_evidence_locked(
 }
 
 struct LifecycleClaimLock {
-    path: PathBuf,
+    file: File,
 }
 
 impl LifecycleClaimLock {
@@ -583,42 +606,75 @@ impl LifecycleClaimLock {
             .ok_or_else(|| "Delegation lifecycle path has no parent".to_string())?;
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create lifecycle directory: {}", error))?;
+        #[cfg(unix)]
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
         let file_name = lifecycle_path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| "Delegation lifecycle path has no file name".to_string())?;
         let lock_path = parent.join(format!(".{}.terminal-claim.lock", file_name));
-        let started = Instant::now();
-
-        loop {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(_) => return Ok(Self { path: lock_path }),
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    if started.elapsed() >= TERMINAL_CLAIM_LOCK_TIMEOUT {
-                        return Err(
-                            "Timed out acquiring delegation terminal claim lock".to_string()
-                        );
-                    }
-                    thread::sleep(TERMINAL_CLAIM_LOCK_RETRY);
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "Failed to acquire delegation terminal claim lock: {}",
-                        error
-                    ))
-                }
-            }
-        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&lock_path)
+            .map_err(|error| format!("Failed to open delegation terminal claim lock: {}", error))?;
+        #[cfg(unix)]
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+        file.lock().map_err(|error| {
+            format!(
+                "Failed to acquire delegation terminal claim lock: {}",
+                error
+            )
+        })?;
+        Ok(Self { file })
     }
 }
 
 impl Drop for LifecycleClaimLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self.file.unlock();
+    }
+}
+
+struct TaskStateLock {
+    file: File,
+}
+
+impl TaskStateLock {
+    fn acquire(ws: &Workspace, scope_id: &str) -> std::result::Result<Self, String> {
+        let path = task_state_path(ws, scope_id)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Task state path has no parent".to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create task state directory: {}", error))?;
+        #[cfg(unix)]
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "Task state path has no file name".to_string())?;
+        let lock_path = parent.join(format!(".{}.lock", file_name));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&lock_path)
+            .map_err(|error| format!("Failed to open task state lock: {}", error))?;
+        #[cfg(unix)]
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+        file.lock()
+            .map_err(|error| format!("Failed to acquire task state lock: {}", error))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for TaskStateLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -728,11 +784,32 @@ fn atomic_write_json<T: Serialize>(
         label.replace(' ', "-"),
         uuid::Uuid::new_v4()
     ));
-    fs::write(&temp, bytes).map_err(|e| format!("Failed to write {}: {}", label, e))?;
+    let mut file = File::create(&temp).map_err(|e| format!("Failed to write {}: {}", label, e))?;
+    let write_result = file.write_all(&bytes).and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("Failed to persist {}: {}", label, error));
+    }
+
     fs::rename(&temp, path).map_err(|e| {
         let _ = fs::remove_file(&temp);
         format!("Failed to atomically persist {}: {}", label, e)
     })?;
+
+    // Directory fsync is not available on every supported platform/filesystem.
+    // Best effort here still closes the crash-consistency window where the rename
+    // itself has not been persisted even though the file contents have.
+    match File::open(parent).and_then(|directory| directory.sync_all()) {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::debug!(
+                path = %parent.display(),
+                error = %error,
+                "Unable to sync task-state parent directory"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -768,6 +845,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::tempdir;
 
     const SCOPE_A: &str = "11111111-1111-4111-8111-111111111111";
@@ -1129,5 +1207,49 @@ mod tests {
         let blocked = handle_task_plan(&ws, SCOPE_A, "Second task", vec!["Other work".into()]);
         assert!(!blocked.success);
         assert!(blocked.error.unwrap().contains("incomplete task plan"));
+    }
+
+    #[test]
+    fn concurrent_task_verifications_are_synchronized() {
+        let dir = tempdir().unwrap();
+        let ws = Arc::new(Workspace::open(dir.path()).unwrap());
+        handle_task_plan(&ws, SCOPE_A, "Concurrent verifications", vec!["T1".into()]);
+
+        let count = 16;
+        let barrier = Arc::new(Barrier::new(count));
+        let mut handles = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let ws = Arc::clone(&ws);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                record_verification(
+                    &ws,
+                    SCOPE_A,
+                    &format!("cargo test {}", i),
+                    true,
+                    Some(0),
+                    10,
+                );
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let state = load_task_state(&ws, SCOPE_A).unwrap().unwrap();
+        assert_eq!(state.verifications.len(), count);
+    }
+
+    #[test]
+    fn lifecycle_claim_lock_releases_on_drop() {
+        let dir = tempdir().unwrap();
+        let lifecycle_file = dir.path().join("test_lifecycle.json");
+        let lock = LifecycleClaimLock::acquire(&lifecycle_file).unwrap();
+        drop(lock);
+        let lock2 = LifecycleClaimLock::acquire(&lifecycle_file);
+        assert!(lock2.is_ok());
     }
 }

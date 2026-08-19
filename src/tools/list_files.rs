@@ -1,8 +1,11 @@
 use crate::security::{PathPolicy, Workspace};
-use crate::tools::ToolCallResult;
+use crate::tools::{ToolCallResult, SKIPPED_DIR_NAMES};
 use ignore::WalkBuilder;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+const LIST_TIME_BUDGET: Duration = Duration::from_secs(30);
 
 pub fn handle_list_files(
     ws: &Workspace,
@@ -27,12 +30,20 @@ pub fn handle_list_files(
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
     let max_results = limit.unwrap_or(500).clamp(1, 5000);
+    let started = Instant::now();
 
     'roots: for (walk_root, remaining_depth) in walk_roots {
         let mut builder = WalkBuilder::new(&walk_root);
         builder.hidden(false);
         builder.filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
+            if entry
+                .file_type()
+                .is_some_and(|ft| ft.is_dir())
+                && SKIPPED_DIR_NAMES.contains(&name.as_ref())
+            {
+                return false;
+            }
             if name.starts_with('.') {
                 if PathPolicy::is_allowed_dot_component(&name) {
                     return !PathPolicy::is_secret_component(&name);
@@ -46,6 +57,9 @@ pub fn handle_list_files(
         builder.max_depth(Some(remaining_depth));
 
         for entry in builder.build().flatten() {
+            if started.elapsed() >= LIST_TIME_BUDGET {
+                break 'roots;
+            }
             let Ok(rel) = entry.path().strip_prefix(ws.root()) else {
                 continue;
             };

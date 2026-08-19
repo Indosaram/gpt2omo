@@ -36,6 +36,7 @@ impl Workspace {
 
     pub fn resolve_relative(&self, rel: &str) -> Result<PathBuf> {
         let clean = PathPolicy::sanitize_relative_path(rel)?;
+        let _ = self.cap_dir()?;
         let candidate = self.root.join(clean);
 
         let mut existing = candidate.as_path();
@@ -215,7 +216,12 @@ impl WorkspaceMux {
             if uuid::Uuid::parse_str(scope_id).is_err() {
                 continue;
             }
-            scopes.push(self.lookup(scope_id)?);
+            match self.lookup(scope_id) {
+                Ok(scope) => scopes.push(scope),
+                Err(error) => {
+                    tracing::warn!(scope_id, error = %error, "Skipping corrupted scope file");
+                }
+            }
         }
         scopes.sort_by(|left, right| left.scope_id.cmp(&right.scope_id));
         Ok(scopes)
@@ -413,6 +419,26 @@ mod tests {
         assert_eq!(scopes.len(), 2);
         assert!(scopes.iter().any(|scope| scope.scope_id == first.scope_id));
         assert!(scopes.iter().any(|scope| scope.scope_id == second.scope_id));
+    }
+
+    #[test]
+    fn mux_lists_scopes_skipping_corrupted_files() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let state = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), state.path()).unwrap();
+        let valid = mux.register_browser(&project, "page-a".into()).unwrap();
+        let corrupted_id = uuid::Uuid::new_v4().to_string();
+        fs::write(
+            state.path().join(format!("{}.json", corrupted_id)),
+            "{ corrupted json",
+        )
+        .unwrap();
+
+        let scopes = mux.list_scopes().unwrap();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].scope_id, valid.scope_id);
     }
 
     #[test]

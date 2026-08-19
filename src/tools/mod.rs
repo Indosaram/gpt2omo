@@ -27,6 +27,27 @@ impl ToolCallResult {
     }
 }
 
+/// Vendor/build trees that hold hundreds of thousands of generated files and
+/// are never useful for source search or listing.
+pub(crate) const SKIPPED_DIR_NAMES: &[&str] = &[
+    "node_modules",
+    "bower_components",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "Pods",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "vendor",
+    "coverage",
+    "test-results",
+    ".next",
+    ".turbo",
+    ".cache",
+];
+
 pub mod ast_grep;
 pub mod command_manager;
 pub mod completion;

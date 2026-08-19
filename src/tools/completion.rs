@@ -1,12 +1,11 @@
 use crate::security::Workspace;
 use crate::tools::command_manager::CommandManager;
-use crate::tools::git_status::is_git_worktree;
+use crate::tools::git_status::{is_git_worktree, run_git};
 use crate::tools::task_state::{
     load_task_state, record_terminal_evidence, DelegationTerminalState, TaskStatus,
 };
 use crate::tools::ToolCallResult;
 use serde_json::Value;
-use std::process::Command;
 
 pub fn handle_completion_check(
     ws: &Workspace,
@@ -179,18 +178,7 @@ fn handle_completion_check_inner(
 }
 
 fn git_output(ws: &Workspace, args: &[&str]) -> std::result::Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(ws.root())
-        .output()
-        .map_err(|e| format!("Failed to execute git: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git {} failed: {}", args.join(" "), stderr.trim()));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    run_git(ws, args)
 }
 
 #[cfg(test)]
@@ -201,6 +189,7 @@ mod tests {
         load_delegation_lifecycle, record_mutation, record_verification,
     };
     use std::fs;
+    use std::process::Command;
     use tempfile::tempdir;
 
     const SCOPE: &str = "22222222-2222-4222-8222-222222222222";

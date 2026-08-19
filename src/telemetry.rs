@@ -1,23 +1,19 @@
 use crate::orca::{validate_reset_after_seconds, BrowserDriverKind};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use std::thread;
 #[cfg(test)]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const TELEMETRY_FILE_NAME: &str = "gpt2omo.jsonl";
-#[cfg(test)]
-const APPEND_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const APPEND_LOCK_RETRY: Duration = Duration::from_millis(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,36 +94,94 @@ impl TelemetryEvent {
     }
 }
 
-pub fn append_best_effort(event: &TelemetryEvent) {
+pub fn append_best_effort(event: &TelemetryEvent) -> io::Result<()> {
+    let mut last_err = None;
     for path in telemetry_candidate_paths() {
-        if try_append_to_path(&path, event).is_ok() {
-            break;
+        match try_append_to_path(&path, event) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
         }
     }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(ErrorKind::NotFound, "No candidate telemetry path available")
+    }))
 }
+
+const TELEMETRY_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 pub fn read_recent_events(window_ms: u64, now_ms: u64) -> Vec<TelemetryEvent> {
     let cutoff = now_ms.saturating_sub(window_ms);
     let mut events = Vec::new();
     for path in telemetry_candidate_paths() {
-        if let Ok(content) = fs::read_to_string(&path) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(event) = serde_json::from_str::<TelemetryEvent>(line) {
-                    if event.timestamp_ms >= cutoff && event.timestamp_ms <= now_ms {
-                        events.push(event);
-                    }
-                }
-            }
-            if !events.is_empty() {
+        if let Ok(path_events) = read_recent_events_from_path(&path, cutoff, now_ms) {
+            events.extend(path_events);
+        }
+    }
+    events.sort_by(|a, b| {
+        a.timestamp_ms
+            .cmp(&b.timestamp_ms)
+            .then_with(|| a.scope_id.cmp(&b.scope_id))
+            .then_with(|| a.generation.cmp(&b.generation))
+    });
+    events.dedup();
+    events
+}
+
+fn read_recent_events_from_path(
+    path: &Path,
+    cutoff: u64,
+    now_ms: u64,
+) -> io::Result<Vec<TelemetryEvent>> {
+    let mut file = File::open(path)?;
+    let mut position = file.seek(SeekFrom::End(0))?;
+    let mut pending = Vec::new();
+    let mut events = Vec::new();
+    let mut reached_cutoff = false;
+
+    while position > 0 && !reached_cutoff {
+        let read_len = position.min(TELEMETRY_READ_CHUNK_BYTES as u64) as usize;
+        position -= read_len as u64;
+        file.seek(SeekFrom::Start(position))?;
+
+        let mut chunk = vec![0; read_len];
+        file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&pending);
+        pending = chunk;
+
+        while let Some(newline) = pending.iter().rposition(|byte| *byte == b'\n') {
+            let line_start = newline + 1;
+            reached_cutoff =
+                parse_recent_telemetry_line(&pending[line_start..], cutoff, now_ms, &mut events);
+            pending.truncate(newline);
+            if reached_cutoff {
                 break;
             }
         }
     }
-    events
+
+    if !reached_cutoff && !pending.is_empty() {
+        parse_recent_telemetry_line(&pending, cutoff, now_ms, &mut events);
+    }
+
+    Ok(events)
+}
+
+fn parse_recent_telemetry_line(
+    line: &[u8],
+    cutoff: u64,
+    now_ms: u64,
+    events: &mut Vec<TelemetryEvent>,
+) -> bool {
+    let Ok(event) = serde_json::from_slice::<TelemetryEvent>(line) else {
+        return false;
+    };
+    if event.timestamp_ms < cutoff {
+        return true;
+    }
+    if event.timestamp_ms <= now_ms {
+        events.push(event);
+    }
+    false
 }
 
 pub fn active_rate_limit_lockout(now_ms: u64) -> Option<(u64, Option<u64>)> {
@@ -175,12 +229,11 @@ fn telemetry_candidate_paths() -> Vec<PathBuf> {
     paths
 }
 
-#[cfg(test)]
-fn append_to_path(path: &Path, event: &TelemetryEvent) -> io::Result<()> {
+pub fn append_to_path(path: &Path, event: &TelemetryEvent) -> io::Result<()> {
     append_to_path_with_lock(path, event, AppendLock::acquire)
 }
 
-fn try_append_to_path(path: &Path, event: &TelemetryEvent) -> io::Result<()> {
+pub fn try_append_to_path(path: &Path, event: &TelemetryEvent) -> io::Result<()> {
     append_to_path_with_lock(path, event, AppendLock::try_acquire)
 }
 
@@ -221,47 +274,47 @@ fn prepare_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-struct AppendLock {
-    path: PathBuf,
+pub struct AppendLock {
+    file: File,
 }
 
 impl AppendLock {
-    fn try_acquire(telemetry_path: &Path) -> io::Result<Self> {
+    pub fn try_acquire(telemetry_path: &Path) -> io::Result<Self> {
         let lock_path = append_lock_path(telemetry_path)?;
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
         options.mode(0o600);
         let file = options.open(&lock_path)?;
         #[cfg(unix)]
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        Ok(Self { path: lock_path })
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(TryLockError::WouldBlock) => Err(io::Error::new(
+                ErrorKind::WouldBlock,
+                "telemetry append lock would block",
+            )),
+            Err(TryLockError::Error(error)) => Err(error),
+        }
     }
 
-    #[cfg(test)]
-    fn acquire(telemetry_path: &Path) -> io::Result<Self> {
-        let started = Instant::now();
-        loop {
-            match Self::try_acquire(telemetry_path) {
-                Ok(lock) => return Ok(lock),
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    if started.elapsed() >= APPEND_LOCK_TIMEOUT {
-                        return Err(io::Error::new(
-                            ErrorKind::TimedOut,
-                            "telemetry append lock timed out",
-                        ));
-                    }
-                    thread::sleep(APPEND_LOCK_RETRY);
-                }
-                Err(error) => return Err(error),
-            }
-        }
+    pub fn acquire(telemetry_path: &Path) -> io::Result<Self> {
+        let lock_path = append_lock_path(telemetry_path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&lock_path)?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.lock()?;
+        Ok(Self { file })
     }
 }
 
 impl Drop for AppendLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self.file.unlock();
     }
 }
 
@@ -295,7 +348,11 @@ mod tests {
     const SCOPE: &str = "33333333-3333-4333-8333-333333333333";
 
     fn event() -> TelemetryEvent {
-        TelemetryEvent::new(
+        event_at(now_ms())
+    }
+
+    fn event_at(timestamp_ms: u64) -> TelemetryEvent {
+        let mut event = TelemetryEvent::new(
             SCOPE,
             1,
             BrowserDriverKind::Orca,
@@ -304,7 +361,9 @@ mod tests {
             Some(90),
             TelemetryErrorCode::RateLimited,
         )
-        .unwrap()
+        .unwrap();
+        event.timestamp_ms = timestamp_ms;
+        event
     }
 
     #[test]
@@ -354,6 +413,25 @@ mod tests {
     }
 
     #[test]
+    fn reverse_read_returns_recent_events_without_deserializing_older_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("telemetry").join("events.jsonl");
+        prepare_directory(path.parent().unwrap()).unwrap();
+        let now = 10_000;
+        let content = format!(
+            "{}\nnot-json\n{}\n{}\n",
+            serde_json::to_string(&event_at(1_000)).unwrap(),
+            serde_json::to_string(&event_at(9_000)).unwrap(),
+            serde_json::to_string(&event_at(11_000)).unwrap(),
+        );
+        fs::write(&path, content).unwrap();
+
+        let events = read_recent_events_from_path(&path, 8_000, now).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].timestamp_ms, 9_000);
+    }
+
+    #[test]
     fn concurrent_jsonl_writes_are_complete_and_non_interleaved() {
         let dir = tempdir().unwrap();
         let path = Arc::new(dir.path().join("telemetry").join("events.jsonl"));
@@ -386,13 +464,15 @@ mod tests {
 
     #[test]
     fn best_effort_path_does_not_wait_for_busy_append_lock() {
+        use std::time::Instant;
+
         let dir = tempdir().unwrap();
         let path = dir.path().join("telemetry").join("events.jsonl");
         prepare_directory(path.parent().unwrap()).unwrap();
         let held = AppendLock::try_acquire(&path).unwrap();
         let started = Instant::now();
         let error = try_append_to_path(&path, &event()).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
         assert!(started.elapsed() < Duration::from_millis(100));
         drop(held);
     }
@@ -411,5 +491,19 @@ mod tests {
         let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[test]
+    fn append_lock_releases_on_drop_allowing_subsequent_acquire() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("telemetry").join("events.jsonl");
+        prepare_directory(path.parent().unwrap()).unwrap();
+        let lock = AppendLock::try_acquire(&path).unwrap();
+        // Trying to acquire while held should fail with WouldBlock
+        assert!(AppendLock::try_acquire(&path).is_err());
+        drop(lock);
+        // After drop, lock is available again
+        let lock2 = AppendLock::try_acquire(&path);
+        assert!(lock2.is_ok());
     }
 }
