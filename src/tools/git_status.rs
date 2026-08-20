@@ -22,7 +22,9 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
         }));
     }
 
-    let p = target_path.map(str::trim).filter(|s| !s.is_empty() && *s != ".");
+    let p = target_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != ".");
 
     let status_out = if let Some(path) = p {
         run_git(ws, &["status", "--porcelain", "--", path]).unwrap_or_default()
@@ -32,20 +34,39 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
 
     let (diff_stat, combined) = if let Some(path) = p {
         let unstaged_stat = run_git(ws, &["diff", "--stat", "--", path]).unwrap_or_default();
-        let staged_stat = run_git(ws, &["diff", "--cached", "--stat", "--", path]).unwrap_or_default();
+        let staged_stat =
+            run_git(ws, &["diff", "--cached", "--stat", "--", path]).unwrap_or_default();
         let stat = match (unstaged_stat.is_empty(), staged_stat.is_empty()) {
             (true, true) => String::new(),
             (false, true) => unstaged_stat,
             (true, false) => format!("# Staged changes\n{}", staged_stat),
-            (false, false) => format!("# Unstaged changes\n{}\n# Staged changes\n{}", unstaged_stat, staged_stat),
+            (false, false) => format!(
+                "# Unstaged changes\n{}\n# Staged changes\n{}",
+                unstaged_stat, staged_stat
+            ),
         };
-        let unstaged = run_git(ws, &["diff", "--no-ext-diff", "--unified=3", "--", path]).unwrap_or_default();
-        let staged = run_git(ws, &["diff", "--cached", "--no-ext-diff", "--unified=3", "--", path]).unwrap_or_default();
+        let unstaged =
+            run_git(ws, &["diff", "--no-ext-diff", "--unified=3", "--", path]).unwrap_or_default();
+        let staged = run_git(
+            ws,
+            &[
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--unified=3",
+                "--",
+                path,
+            ],
+        )
+        .unwrap_or_default();
         let diff_comb = match (unstaged.is_empty(), staged.is_empty()) {
             (true, true) => String::new(),
             (false, true) => unstaged,
             (true, false) => format!("# Staged changes\n{}", staged),
-            (false, false) => format!("# Unstaged changes\n{}\n# Staged changes\n{}", unstaged, staged),
+            (false, false) => format!(
+                "# Unstaged changes\n{}\n# Staged changes\n{}",
+                unstaged, staged
+            ),
         };
         (stat, diff_comb)
     } else {
@@ -55,7 +76,10 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
             (true, true) => String::new(),
             (false, true) => unstaged_stat,
             (true, false) => format!("# Staged changes\n{}", staged_stat),
-            (false, false) => format!("# Unstaged changes\n{}\n# Staged changes\n{}", unstaged_stat, staged_stat),
+            (false, false) => format!(
+                "# Unstaged changes\n{}\n# Staged changes\n{}",
+                unstaged_stat, staged_stat
+            ),
         };
         let msg = "# Notice: Entire repository diff scan is disabled for performance. Pass `path` parameter (e.g. `path: \"src/my_file.rs\"`) to inspect exact file diffs.";
         (stat, msg.to_string())
@@ -124,7 +148,11 @@ pub(crate) fn run_git_bounded(
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(format!("Failed while waiting for git {}: {}", args.join(" "), e));
+                return Err(format!(
+                    "Failed while waiting for git {}: {}",
+                    args.join(" "),
+                    e
+                ));
             }
         }
     };
@@ -287,12 +315,16 @@ mod tests {
     fn test_truncate_chars_long_ascii_and_multibyte() {
         let (res, truncated) = truncate_chars("abcdefghij", 4);
         assert!(truncated);
-        assert!(res.starts_with("ab\n\n...[diff truncated by gpt2omo; 6 characters omitted]...\n\nij"));
+        assert!(
+            res.starts_with("ab\n\n...[diff truncated by gpt2omo; 6 characters omitted]...\n\nij")
+        );
 
         let unicode = "🦀🌟🎉🔥🚀✨";
         let (res, truncated) = truncate_chars(unicode, 4);
         assert!(truncated);
-        assert!(res.starts_with("🦀🌟\n\n...[diff truncated by gpt2omo; 2 characters omitted]...\n\n🚀✨"));
+        assert!(res.starts_with(
+            "🦀🌟\n\n...[diff truncated by gpt2omo; 2 characters omitted]...\n\n🚀✨"
+        ));
     }
 
     #[test]

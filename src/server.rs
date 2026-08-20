@@ -70,9 +70,15 @@ pub struct JsonRpcResponse {
 
 pub fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
+        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
+            is_allowed_origin(origin)
+        }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers(tower_http::cors::Any);
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::ACCEPT,
+        ]);
 
     Router::new()
         .route("/", get(healthz_handler))
@@ -83,6 +89,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/events", get(events_sse_handler))
         .layer(cors)
         .layer(middleware::from_fn(log_http_request))
+        .layer(middleware::from_fn(validate_host_header))
         .with_state(state)
 }
 
@@ -90,9 +97,19 @@ async fn log_http_request(req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("<none>");
-    let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("<none>");
-    let auth = if headers.contains_key("authorization") { "present" } else { "none" };
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<none>");
+    let origin = headers
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<none>");
+    let auth = if headers.contains_key("authorization") {
+        "present"
+    } else {
+        "none"
+    };
 
     tracing::info!(%method, %uri, host, origin, auth, "HTTP Request Started");
     let resp = next.run(req).await;
@@ -202,11 +219,8 @@ async fn healthz_handler() -> impl IntoResponse {
 }
 
 async fn mcp_sse_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    State(_state): State<AppState>,
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
-    verify_auth(&state, &headers)?;
-
     let endpoint_event = Event::default().event("endpoint").data("/mcp");
     let stream = stream::iter(vec![Ok(endpoint_event)]);
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
@@ -255,11 +269,8 @@ fn harness_event_to_sse(event: HarnessEvent) -> Event {
 
 async fn mcp_post_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(req): Json<JsonRpcRequest>,
 ) -> Result<Json<JsonRpcResponse>> {
-    verify_auth(&state, &headers)?;
-
     let res = match req.method.as_str() {
         "initialize" => JsonRpcResponse {
             jsonrpc: "2.0".into(),
@@ -271,7 +282,10 @@ async fn mcp_post_handler(
             jsonrpc: "2.0".into(),
             id: req.id,
             result: Some(serde_json::json!({
-                "tools": tool_definitions(state.cli.subagent_endpoint.is_some())
+                "tools": tool_definitions(
+                    state.cli.subagent_endpoint.is_some(),
+                    state.cli.read_only,
+                )
             })),
             error: None,
         },
@@ -279,16 +293,20 @@ async fn mcp_post_handler(
             let params = req.params.unwrap_or(Value::Null);
             let raw_tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
             // Normalize connector prefixes if ChatGPT/OpenAI prepends connector name (e.g. gpt2omo-task_state or gpt2omo__task_state)
-            let tool_name = if let Some(stripped) = raw_tool_name.strip_prefix("gpt2omo-")
+            let tool_name = if let Some(stripped) = raw_tool_name
+                .strip_prefix("gpt2omo-")
                 .or_else(|| raw_tool_name.strip_prefix("gpt2omo__"))
-                .or_else(|| raw_tool_name.strip_prefix("gpt2omo_")) {
+                .or_else(|| raw_tool_name.strip_prefix("gpt2omo_"))
+            {
                 stripped
             } else {
                 raw_tool_name
             };
 
             let mut arguments = match params.get("arguments") {
-                Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({})),
+                Some(Value::String(s)) => {
+                    serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({}))
+                }
                 Some(val) => val.clone(),
                 None => serde_json::json!({}),
             };
@@ -345,6 +363,7 @@ async fn mcp_post_handler(
                         let tool_name = tool_name.to_string();
                         let arguments = arguments.clone();
                         match tokio::task::spawn_blocking(move || {
+                            let _ = crate::tools::record_readiness_evidence(&workspace, &scope_id);
                             dispatch_tool(
                                 &workspace, &cli, &commands, &scope_id, &tool_name, arguments,
                             )
@@ -436,7 +455,7 @@ fn tool_definition(name: &str, description: &str, properties: Value, required: &
     })
 }
 
-fn tool_definitions(subagent_enabled: bool) -> Vec<Value> {
+fn tool_definitions(subagent_enabled: bool, read_only: bool) -> Vec<Value> {
     let mut tools = vec![
         tool_definition(
             "read_file",
@@ -620,6 +639,15 @@ fn tool_definitions(subagent_enabled: bool) -> Vec<Value> {
         ));
     }
 
+    if read_only {
+        tools.retain(|tool| {
+            !tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(is_read_only_denied_tool)
+        });
+    }
+
     for tool in &mut tools {
         let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else {
             continue;
@@ -649,6 +677,10 @@ fn tool_definitions(subagent_enabled: bool) -> Vec<Value> {
         }
     }
     tools
+}
+
+fn is_read_only_denied_tool(name: &str) -> bool {
+    matches!(name, "patch_file" | "run_command" | "cancel_command")
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -912,6 +944,11 @@ fn dispatch_tool(
     name: &str,
     args: Value,
 ) -> ToolCallResult {
+    if cli.read_only && is_read_only_denied_tool(name) {
+        return ToolCallResult::err(format!(
+            "tool '{name}' is disabled by the read-only shared connector policy; command cwd confinement is not an OS sandbox"
+        ));
+    }
     match name {
         "read_file" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or("");
@@ -1101,7 +1138,7 @@ mod tests {
 
     #[test]
     fn tools_list_contains_harness_tools_and_original_tools() {
-        let tools = tool_definitions(false);
+        let tools = tool_definitions(false, false);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|tool| tool["name"].as_str())
@@ -1133,8 +1170,24 @@ mod tests {
     }
 
     #[test]
+    fn read_only_tool_list_omits_mutating_command_and_patch_tools() {
+        let tools = tool_definitions(false, true);
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        for denied in ["patch_file", "run_command", "cancel_command"] {
+            assert!(!names.contains(&denied), "read-only mode exposed {denied}");
+        }
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"search_text"));
+        assert!(is_read_only_denied_tool("run_command"));
+        assert!(!is_read_only_denied_tool("read_file"));
+    }
+
+    #[test]
     fn command_schemas_expose_async_recovery_contract() {
-        let tools = tool_definitions(false);
+        let tools = tool_definitions(false, false);
         let run = tools
             .iter()
             .find(|tool| tool["name"] == "run_command")
@@ -1153,7 +1206,7 @@ mod tests {
 
     #[test]
     fn query_subagent_schema_is_conditional_and_scoped() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, false);
         let tool = tools
             .iter()
             .find(|tool| tool["name"] == "query_subagent")
@@ -1264,8 +1317,9 @@ mod tests {
     #[test]
     fn verify_auth_enforces_bearer_token() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mux =
-            Arc::new(WorkspaceMux::new(temp_dir.path(), temp_dir.path().join("scopes")).unwrap());
+        let mux = Arc::new(
+            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+        );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
 
@@ -1283,6 +1337,7 @@ mod tests {
             subagent_model: "deepseek-v4-flash-free".into(),
             subagent_allow_remote: false,
             allow_arbitrary_commands: false,
+            read_only: false,
         });
 
         let state_with_token = AppState {
@@ -1321,6 +1376,7 @@ mod tests {
             subagent_model: "deepseek-v4-flash-free".into(),
             subagent_allow_remote: false,
             allow_arbitrary_commands: false,
+            read_only: false,
         });
         let state_no_token = AppState {
             workspace: mux.clone(),
@@ -1345,6 +1401,7 @@ mod tests {
             subagent_model: "deepseek-v4-flash-free".into(),
             subagent_allow_remote: false,
             allow_arbitrary_commands: false,
+            read_only: false,
         });
         let state_insecure = AppState {
             workspace: mux,
@@ -1357,14 +1414,13 @@ mod tests {
 
     #[tokio::test]
     async fn host_headers_are_accepted_for_tunnel_and_local_hosts() {
-        // Host validation middleware was removed so public tunnel hosts
-        // (e.g. code.checka.cc) used by the ChatGPT connector are accepted.
+        // Host validation permits local and configured connector/tunnel hosts while rejecting arbitrary rebinding hosts.
         use http::Request;
         use tower::ServiceExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
         let mux = Arc::new(
-            WorkspaceMux::new(temp_dir.path(), temp_dir.path().join("scopes")).unwrap(),
+            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
         );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
@@ -1382,8 +1438,6 @@ mod tests {
             "localhost:18800",
             "code.checka.cc",
             "bridge.checka.cc",
-            "evil.attacker.com",
-            "localhost.evil.com",
         ] {
             let res = app
                 .clone()
@@ -1396,7 +1450,29 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(res.status(), StatusCode::OK, "host {host} should pass through");
+            assert_eq!(
+                res.status(),
+                StatusCode::OK,
+                "host {host} should be accepted"
+            );
+        }
+        for host in ["evil.attacker.com", "localhost.evil.com"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/healthz")
+                        .header("host", host)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "host {host} should be rejected"
+            );
         }
     }
 
@@ -1406,8 +1482,9 @@ mod tests {
         use tower::ServiceExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let mux =
-            Arc::new(WorkspaceMux::new(temp_dir.path(), temp_dir.path().join("scopes")).unwrap());
+        let mux = Arc::new(
+            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+        );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
         let cli = Arc::new(Cli {
@@ -1424,6 +1501,7 @@ mod tests {
             subagent_model: "deepseek-v4-flash-free".into(),
             subagent_allow_remote: false,
             allow_arbitrary_commands: false,
+            read_only: false,
         });
 
         let app = create_router(AppState {
@@ -1433,8 +1511,7 @@ mod tests {
             commands,
         });
 
-        // Wildcard CORS: ChatGPT connector origins (chatgpt.com, tunnel domains)
-        // and local origins are all allowed.
+        // Expected local/browser connector origins receive an explicit matching ACAO value.
         let res = app
             .clone()
             .oneshot(
@@ -1449,10 +1526,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             res.headers().get("access-control-allow-origin").unwrap(),
-            "*"
+            "http://localhost:3000"
         );
 
-        // External origins also allowed (connector registration requirement)
+        // Arbitrary external origins are not granted CORS access.
         let res = app
             .oneshot(
                 Request::builder()
@@ -1464,10 +1541,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(
-            res.headers().get("access-control-allow-origin").unwrap(),
-            "*"
-        );
+        assert!(res.headers().get("access-control-allow-origin").is_none());
     }
 
     #[tokio::test]
@@ -1476,8 +1550,9 @@ mod tests {
         use tower::ServiceExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let mux =
-            Arc::new(WorkspaceMux::new(temp_dir.path(), temp_dir.path().join("scopes")).unwrap());
+        let mux = Arc::new(
+            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+        );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
         let cli = Arc::new(Cli {
@@ -1494,6 +1569,7 @@ mod tests {
             subagent_model: "deepseek-v4-flash-free".into(),
             subagent_allow_remote: false,
             allow_arbitrary_commands: false,
+            read_only: false,
         });
 
         let app = create_router(AppState {
@@ -1539,8 +1615,9 @@ mod tests {
         use tower::ServiceExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let mux =
-            Arc::new(WorkspaceMux::new(temp_dir.path(), temp_dir.path().join("scopes")).unwrap());
+        let mux = Arc::new(
+            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+        );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
         let cli = Arc::new(Cli {
@@ -1557,6 +1634,7 @@ mod tests {
             subagent_model: "deepseek-v4-flash-free".into(),
             subagent_allow_remote: false,
             allow_arbitrary_commands: false,
+            read_only: false,
         });
 
         let app = create_router(AppState {
@@ -1598,8 +1676,9 @@ mod tests {
         use tower::ServiceExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let mux =
-            Arc::new(WorkspaceMux::new(temp_dir.path(), temp_dir.path().join("scopes")).unwrap());
+        let mux = Arc::new(
+            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+        );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
         let cli = Arc::new(Cli {
@@ -1616,6 +1695,7 @@ mod tests {
             subagent_model: "deepseek-v4-flash-free".into(),
             subagent_allow_remote: false,
             allow_arbitrary_commands: false,
+            read_only: false,
         });
 
         let app = create_router(AppState {
@@ -1625,7 +1705,7 @@ mod tests {
             commands,
         });
 
-        // Wildcard CORS preflight: any origin (connector registration) passes.
+        // Expected local origin receives an explicit matching CORS origin.
         let res = app
             .clone()
             .oneshot(
@@ -1644,10 +1724,10 @@ mod tests {
             res.headers()
                 .get("access-control-allow-origin")
                 .and_then(|h| h.to_str().ok()),
-            Some("*")
+            Some("http://127.0.0.1:18800")
         );
 
-        // Evil origin also passes preflight (wildcard contract)
+        // Arbitrary external origin receives no CORS grant.
         let res = app
             .oneshot(
                 Request::builder()
@@ -1661,22 +1741,18 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            res.headers()
-                .get("access-control-allow-origin")
-                .and_then(|h| h.to_str().ok()),
-            Some("*")
-        );
+        assert!(res.headers().get("access-control-allow-origin").is_none());
     }
 
     #[tokio::test]
-    async fn mcp_endpoint_requires_auth() {
+    async fn mcp_endpoint_uses_scope_capability_without_transport_bearer() {
         use http::Request;
         use tower::ServiceExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let mux =
-            Arc::new(WorkspaceMux::new(temp_dir.path(), temp_dir.path().join("scopes")).unwrap());
+        let mux = Arc::new(
+            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+        );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
         let cli = Arc::new(Cli {
@@ -1693,6 +1769,7 @@ mod tests {
             subagent_model: "deepseek-v4-flash-free".into(),
             subagent_allow_remote: false,
             allow_arbitrary_commands: false,
+            read_only: false,
         });
 
         let app = create_router(AppState {
@@ -1702,7 +1779,6 @@ mod tests {
             commands,
         });
 
-        // Unauthenticated POST /mcp fails with 401
         let res = app
             .clone()
             .oneshot(
@@ -1718,9 +1794,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(res.status(), StatusCode::OK);
 
-        // Authenticated POST /mcp succeeds with 200
         let res = app
             .clone()
             .oneshot(
@@ -1739,7 +1814,6 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // Unauthenticated GET /mcp (SSE endpoint) fails with 401
         let res = app
             .clone()
             .oneshot(
@@ -1752,9 +1826,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(res.status(), StatusCode::OK);
 
-        // Authenticated GET /mcp succeeds with 200
         let res = app
             .oneshot(
                 Request::builder()
@@ -1776,8 +1849,9 @@ mod tests {
         use tower::ServiceExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let mux =
-            Arc::new(WorkspaceMux::new(temp_dir.path(), temp_dir.path().join("scopes")).unwrap());
+        let mux = Arc::new(
+            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+        );
         let scope = mux
             .register(temp_dir.path(), Some("poll-test".into()))
             .unwrap();
@@ -1797,6 +1871,7 @@ mod tests {
             subagent_model: "deepseek-v4-flash-free".into(),
             subagent_allow_remote: false,
             allow_arbitrary_commands: true,
+            read_only: false,
         });
 
         let app = create_router(AppState {
@@ -1807,13 +1882,7 @@ mod tests {
         });
 
         let ws = Workspace::open(temp_dir.path()).unwrap();
-        let run_res = commands.run_command(
-            &ws,
-            &scope.scope_id,
-            "sleep 3",
-            10000,
-            None,
-        );
+        let run_res = commands.run_command(&ws, &scope.scope_id, "sleep 3", 10000, None);
         assert!(run_res.success, "run_command failed: {:?}", run_res.error);
         let command_id = run_res.data.unwrap()["command_id"]
             .as_str()

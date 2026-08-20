@@ -37,9 +37,7 @@ pub fn handle_list_files(
         builder.hidden(false);
         builder.filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
-            if entry
-                .file_type()
-                .is_some_and(|ft| ft.is_dir())
+            if entry.file_type().is_some_and(|ft| ft.is_dir())
                 && SKIPPED_DIR_NAMES.contains(&name.as_ref())
             {
                 return false;

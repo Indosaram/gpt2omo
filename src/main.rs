@@ -2,7 +2,7 @@ use clap::Parser;
 use gpt2omo::{create_router, default_scope_dir, AppState, Cli, EventBus, WorkspaceMux};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -15,8 +15,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut cli = Cli::parse();
-    cli.load_token_file()?;
+    cli.ensure_auth()?;
     let addr: SocketAddr = cli.bind.parse()?;
+    cli.validate_bind_security(&addr)
+        .map_err(anyhow::Error::msg)?;
     let scope_dir = cli
         .scope_dir
         .clone()
@@ -29,6 +31,15 @@ async fn main() -> anyhow::Result<()> {
     );
     info!("Workspace scope directory: {}", scope_dir.display());
     info!("Workspace mode: multiplexed_scopes");
+    if cli.read_only {
+        info!(
+            "Read-only shared connector policy enabled: patch_file, run_command, and cancel_command are not exposed"
+        );
+    } else {
+        warn!(
+            "Command execution is daemon-owned but not OS-sandboxed. Treat every holder of a live scope_id in a shared ChatGPT account as one trust principal; use --read-only for untrusted shared access."
+        );
+    }
 
     let events = Arc::new(EventBus::new(
         workspaces.mount_root().to_string_lossy().to_string(),

@@ -244,8 +244,8 @@ fn wrapper_policy_is_pinned_to_delegate_runtime_guards() {
     assert!(delegate.contains("const MAX_NEW_DISPATCH_WORKERS: usize = 2;"));
     assert!(delegate.contains("const MAX_CONCURRENT_IN_FLIGHT_WORKERS: usize = 3;"));
     assert!(delegate.contains("const SPAWN_STAGGER_DELAY: Duration = Duration::from_secs(10);"));
-    assert!(delegate.contains("check_rate_limit_and_window_guards(tasks.len())?;"));
-    assert!(delegate.contains("count_active_in_flight_workers(mux)?"));
+    assert!(delegate.contains(".reserve_batch_for_mux(mux, tasks.len(), epoch_ms())"));
+    assert!(delegate.contains("router.commit(reservation, epoch_ms())"));
     assert!(delegate.contains("sleep(SPAWN_STAGGER_DELAY).await;"));
     assert!(delegate.contains("--resume-scope cannot be combined with --batch-stdin"));
 }

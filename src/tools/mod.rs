@@ -73,5 +73,6 @@ pub use run_command::handle_run_command;
 pub use search_text::handle_search_text;
 pub use subagent::handle_query_subagent;
 pub use task_state::{
-    handle_task_plan, handle_task_state, handle_task_update, record_mutation, record_verification,
+    handle_task_plan, handle_task_state, handle_task_update, record_mutation,
+    record_readiness_evidence, record_verification,
 };

@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String) {
-    let scope_dir = dir.path().join("scopes");
+    let scope_dir = dir.path().with_extension("scopes");
     let mux = WorkspaceMux::new(dir.path(), &scope_dir).unwrap();
     let scope = mux.register(dir.path(), Some("term-test".into())).unwrap();
     let cli = Cli {
@@ -27,6 +27,7 @@ fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String
         subagent_model: "deepseek-v4-flash-free".into(),
         subagent_allow_remote: false,
         allow_arbitrary_commands: false,
+        read_only: false,
     };
     let events = Arc::new(EventBus::new(dir.path().to_string_lossy().to_string()));
     let app = create_router(AppState {
@@ -53,6 +54,7 @@ fn app_for_mux(mount: &TempDir, scope_dir: std::path::PathBuf, mux: &WorkspaceMu
         subagent_model: "deepseek-v4-flash-free".into(),
         subagent_allow_remote: false,
         allow_arbitrary_commands: false,
+        read_only: false,
     };
     let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
     create_router(AppState {
@@ -79,6 +81,80 @@ async fn rpc(app: axum::Router, payload: Value) -> Value {
 fn nested_tool_result(response: &Value) -> Value {
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     serde_json::from_str(text).unwrap()
+}
+
+#[tokio::test]
+async fn scope_capability_authenticates_mcp_without_transport_bearer() {
+    let mount = tempfile::tempdir().unwrap();
+    let project = mount.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let scope_dir = mount.path().with_extension("scopes");
+    let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
+    let scope = mux.register_browser(&project, "page-one".into()).unwrap();
+    let workspace = mux.resolve(&scope.scope_id).unwrap();
+    clear_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
+    let cli = Cli {
+        mount_root: mount.path().to_path_buf(),
+        scope_dir: Some(scope_dir),
+        bind: "127.0.0.1:0".into(),
+        token: Some("relay-control-token".into()),
+        token_file: None,
+        insecure_no_auth: false,
+        max_file_bytes: 10 * 1024 * 1024,
+        command_timeout_ms: 5_000,
+        subagent_endpoint: None,
+        subagent_api_key: None,
+        subagent_model: "deepseek-v4-flash-free".into(),
+        subagent_allow_remote: false,
+        allow_arbitrary_commands: false,
+        read_only: false,
+    };
+    let app = create_router(AppState {
+        workspace: Arc::new(mux),
+        cli: Arc::new(cli),
+        events: Arc::new(EventBus::new(mount.path().to_string_lossy().to_string())),
+        commands: Arc::new(gpt2omo::tools::CommandManager::new()),
+    });
+
+    let valid = rpc(
+        app.clone(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 700,
+            "method": "tools/call",
+            "params": {
+                "name": "task_state",
+                "arguments": {"scope_id": scope.scope_id}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(valid["result"]["isError"], false);
+
+    let lifecycle = load_delegation_lifecycle(&workspace, &scope.scope_id)
+        .unwrap()
+        .expect("a valid scope capability must record readiness without a transport bearer");
+    assert!(lifecycle.ready_ms.is_some());
+
+    let invalid = rpc(
+        app,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 701,
+            "method": "tools/call",
+            "params": {
+                "name": "task_state",
+                "arguments": {"scope_id": "77777777-7777-4777-8777-777777777777"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(invalid["result"]["isError"], true);
+    let failure = nested_tool_result(&invalid);
+    assert!(failure["error"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown or expired workspace scope"));
 }
 
 #[tokio::test]
@@ -154,7 +230,7 @@ async fn actual_mcp_one_worker_readiness_smoke() {
     let mount = tempfile::tempdir().unwrap();
     let project = mount.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let scope_dir = mount.path().join("scopes");
+    let scope_dir = mount.path().with_extension("scopes");
     let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
     let scope = mux.register_browser(&project, "page-one".into()).unwrap();
     let workspace = mux.resolve(&scope.scope_id).unwrap();
@@ -189,7 +265,7 @@ async fn actual_mcp_three_worker_readiness_smoke() {
     let mount = tempfile::tempdir().unwrap();
     let project = mount.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let scope_dir = mount.path().join("scopes");
+    let scope_dir = mount.path().with_extension("scopes");
     let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
     let scopes = (1..=3)
         .map(|index| {
@@ -452,7 +528,7 @@ async fn two_scopes_access_separate_workspaces_without_global_switch() {
     std::fs::write(first.join("only-first.txt"), "first").unwrap();
     std::fs::write(second.join("only-second.txt"), "second").unwrap();
 
-    let scope_dir = mount.path().join("scopes");
+    let scope_dir = mount.path().with_extension("scopes");
     let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
     let scope_a = mux.register(&first, Some("term-a".into())).unwrap();
     let scope_b = mux.register(&second, Some("term-b".into())).unwrap();
@@ -470,6 +546,7 @@ async fn two_scopes_access_separate_workspaces_without_global_switch() {
         subagent_model: "deepseek-v4-flash-free".into(),
         subagent_allow_remote: false,
         allow_arbitrary_commands: false,
+        read_only: false,
     };
     let events = Arc::new(EventBus::new(mount.path().to_string_lossy().to_string()));
     let app = create_router(AppState {

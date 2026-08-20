@@ -2,12 +2,12 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::future::join_all;
 use gpt2omo::orca::{
-    close_browser_page, create_chatgpt_tab, probe_chatgpt_ui_condition, send_chatgpt_prompt,
-    verify_chatgpt_page, BrowserDriverKind, ChatgptRateLimitReason, ChatgptUiCondition, OrcaConfig,
+    close_browser_page, probe_chatgpt_ui_condition, send_chatgpt_prompt, verify_chatgpt_page,
+    BrowserDriverKind, ChatgptRateLimitReason, ChatgptUiCondition, OrcaConfig,
 };
 use gpt2omo::telemetry::{
-    active_rate_limit_lockout, append_best_effort, recent_dispatches_in_window, TelemetryErrorCode,
-    TelemetryEvent, TelemetryEventType, TelemetryModelHint,
+    append_best_effort, TelemetryErrorCode, TelemetryEvent, TelemetryEventInput,
+    TelemetryEventType, TelemetryModelHint,
 };
 use gpt2omo::tools::task_state::{
     clear_delegation_lifecycle, load_delegation_lifecycle, record_terminal_evidence,
@@ -17,13 +17,15 @@ use gpt2omo::tools::task_state::{
 };
 use gpt2omo::web_session::cleanup_expired_retained_sessions;
 use gpt2omo::{
-    default_bridge_base_dir, default_scope_dir, Workspace, WorkspaceMux, WorkspaceScope,
-    WorkspaceScopeLock,
+    default_bridge_base_dir, default_scope_dir, recover_stale_account_health, AccountLimits,
+    AccountRouter, BrowserBinding, BrowserInstanceConfig, BrowserPool, LegacyAccountConfig,
+    RouteReservation, Workspace, WorkspaceMux, WorkspaceScope, WorkspaceScopeLock,
 };
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use serde_json::Value;
-use std::fs::{self, File, OpenOptions};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,9 +33,6 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Instant};
 use url::Url;
-
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const MAX_NEW_DISPATCH_WORKERS: usize = 2;
 const MAX_CONCURRENT_IN_FLIGHT_WORKERS: usize = 3;
@@ -121,17 +120,21 @@ struct Cli {
     #[arg(long, env = "OMO_SCOPE_DIR")]
     scope_dir: Option<PathBuf>,
 
-    /// Orca worktree selector used for browser tabs.
-    #[arg(long, default_value = "active")]
+    /// Browser workspace selector used for browser tabs.
+    #[arg(long, default_value = "active", env = "OMO_BROWSER_WORKSPACE")]
     worktree: String,
 
     /// Legacy terminal selector retained for compatibility. Browser-scoped delegations do not use it.
     #[arg(long, env = "OMO_RELAY_TERMINAL")]
     terminal: Option<String>,
 
-    /// Orca CLI executable.
-    #[arg(long, default_value = "orca")]
+    /// Browser CLI executable for the configured legacy driver.
+    #[arg(long, default_value = "orca", env = "OMO_BROWSER_BIN")]
     orca_bin: String,
+
+    /// Browser driver for the legacy account when accounts.json is absent.
+    #[arg(long, env = "OMO_BROWSER_DRIVER")]
+    browser_driver: Option<BrowserDriverKind>,
 
     /// Optional bearer token used by gpt2omo.
     #[arg(long, env = "OMO_BRIDGE_TOKEN")]
@@ -167,12 +170,18 @@ struct PreparedTask {
     label: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct StagedDelegation {
     scope_id: String,
     workspace: String,
     label: Option<String>,
     browser_page_id: Option<String>,
+    browser_binding: Option<BrowserBinding>,
+    browser_pool: Option<BrowserPool>,
+    account_id: String,
+    browser_instance: Option<String>,
+    account_router: Option<AccountRouter>,
+    route_reservation: Option<RouteReservation>,
     generation: u64,
     generation_started_ms: u64,
     resumed: bool,
@@ -265,19 +274,40 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_scope_dir(port));
     let mux = WorkspaceMux::new(&cli.mount_root, &scope_dir)?;
-    let orca = OrcaConfig::new(
+    let orca = OrcaConfig::with_driver(
+        cli.browser_driver,
+        Some(cli.orca_bin.clone().into()),
         cli.worktree.clone(),
         cli.terminal.clone(),
-        cli.orca_bin.clone(),
     );
+    let legacy_account = legacy_account_config(&cli);
+    let account_router = AccountRouter::new(
+        default_bridge_base_dir(),
+        &cli.mount_root,
+        legacy_account.clone(),
+    );
+    account_router
+        .load_config()
+        .map_err(|error| anyhow!(error.to_string()))?;
+    let browser_pool = BrowserPool::new(
+        default_bridge_base_dir(),
+        cli.mount_root.clone(),
+        legacy_account,
+        orca.clone(),
+    );
+    browser_pool.provision_profiles()?;
+    if !cli.dry_run {
+        recover_stale_account_health(&account_router, &browser_pool, epoch_ms()).await?;
+    }
 
     if !cli.dry_run {
         let excluded = cli.resume_scope.as_deref().or(cli.close_scope.as_deref());
-        cleanup_expired_retained_sessions(&mux, &orca, epoch_ms(), ttl_ms, excluded).await?;
+        cleanup_expired_retained_sessions(&mux, &browser_pool, epoch_ms(), ttl_ms, excluded)
+            .await?;
     }
 
     if let Some(scope_id) = cli.close_scope.as_deref() {
-        let value = close_retained_scope(&mux, &orca, scope_id).await?;
+        let value = close_retained_scope(&mux, &browser_pool, &orca, scope_id).await?;
         if cli.json {
             println!("{}", serde_json::to_string(&value)?);
         } else {
@@ -297,7 +327,9 @@ async fn main() -> Result<()> {
             ));
         }
         let task = prepare_resume_task(&cli)?;
-        match stage_resume_delegation(&mux, &orca, scope_id, &task).await? {
+        match stage_resume_delegation(&mux, &browser_pool, &orca, &account_router, scope_id, &task)
+            .await?
+        {
             ResumeStage::Ready(item, lock) => (vec![item], vec![lock]),
             ResumeStage::Lost {
                 staged,
@@ -325,7 +357,7 @@ async fn main() -> Result<()> {
         if cli.dry_run {
             stage_dry_run(&mux, &tasks)?
         } else {
-            stage_browser_delegations(&mux, &orca, &tasks).await?
+            stage_browser_delegations(&mux, &browser_pool, &orca, &account_router, &tasks).await?
         }
     };
 
@@ -340,23 +372,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let driver = orca.detect().await?.0;
-
-    if let Err(error) = dispatch_bootstrap(&mux, &orca, driver, &staged).await {
+    if let Err(error) = dispatch_bootstrap(&mux, &orca, &staged).await {
         cleanup_failed_readiness_staged(&mux, &orca, &staged).await;
         return Err(error.context(
             "readiness bootstrap failed; actual task dispatch count is 0 and staged tabs/scopes were cleaned up after terminal evidence was preserved",
         ));
     }
 
-    if let Err(error) = wait_for_all_ready(&mux, &orca, driver, &staged, READINESS_TIMEOUT).await {
+    if let Err(error) = wait_for_all_ready(&mux, &orca, &staged, READINESS_TIMEOUT).await {
         cleanup_failed_readiness_staged(&mux, &orca, &staged).await;
         return Err(error.context(
             "authoritative readiness handshake failed closed; actual task dispatch count is 0 and terminal evidence was preserved",
         ));
     }
 
-    let actual_sent = match dispatch_actual_tasks(&mux, &orca, driver, &staged).await {
+    let actual_sent = match dispatch_actual_tasks(&mux, &orca, &staged).await {
         Ok(sent) => sent,
         Err(error) => {
             cleanup_failed_readiness_staged(&mux, &orca, &staged).await;
@@ -366,7 +396,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let terminal = wait_for_terminal_states(&mux, &orca, driver, &staged, TERMINAL_TIMEOUT).await;
+    let terminal = wait_for_terminal_states(&mux, &orca, &staged, TERMINAL_TIMEOUT).await;
     drop(scope_locks);
     let sessions = finalize_terminal_sessions(
         &mux,
@@ -378,7 +408,7 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    cleanup_expired_retained_sessions(&mux, &orca, epoch_ms(), ttl_ms, None).await?;
+    cleanup_expired_retained_sessions(&mux, &browser_pool, epoch_ms(), ttl_ms, None).await?;
 
     emit_result(
         &cli,
@@ -463,6 +493,8 @@ fn emit_result(
                 "scope_id": item.scope_id,
                 "workspace": item.workspace,
                 "browser_page_id": item.browser_page_id,
+                "account_id": item.account_id,
+                "browser_instance": item.browser_instance,
                 "generation": item.generation,
                 "resumed": item.resumed,
                 "ready": outcome.readiness_complete,
@@ -540,9 +572,11 @@ fn emit_result(
                 "UNAVAILABLE"
             };
             println!(
-                "{}. scope={} generation={} page={} terminal={} session={}",
+                "{}. scope={} account={} instance={} generation={} page={} terminal={} session={}",
                 index + 1,
                 item.scope_id,
+                item.account_id,
+                item.browser_instance.as_deref().unwrap_or("<legacy>"),
                 item.generation,
                 item.browser_page_id.as_deref().unwrap_or("<missing>"),
                 state,
@@ -694,53 +728,33 @@ fn max_concurrent_in_flight_workers() -> usize {
     load_bridge_runtime_policy().1
 }
 
-fn window_rate_limit_params() -> (u64, usize) {
-    let (_, _, window_ms, max_dispatches) = load_bridge_runtime_policy();
-    (window_ms, max_dispatches)
+fn legacy_account_config(cli: &Cli) -> LegacyAccountConfig {
+    let (_, max_concurrent, window_ms, max_dispatches) = load_bridge_runtime_policy();
+    LegacyAccountConfig {
+        limits: AccountLimits {
+            window_seconds: (window_ms / 1000).max(1),
+            max_dispatches,
+            max_active_workers: max_concurrent,
+        },
+        browser: BrowserInstanceConfig::legacy(cli.worktree.clone()),
+        ..LegacyAccountConfig::default()
+    }
 }
 
-fn check_rate_limit_and_window_guards(additional_tasks: usize) -> Result<()> {
-    let now = epoch_ms();
-    if let Some((_, remaining_secs)) = active_rate_limit_lockout(now) {
-        let wait_msg = match remaining_secs {
-            Some(secs) if secs > 60 => format!("{} minute(s)", secs.div_ceil(60)),
-            Some(secs) => format!("{secs} second(s)"),
-            None => "a few minutes".to_string(),
-        };
-        return Err(anyhow!(
-            "ChatGPT Web is currently rate-limited (Too Many Requests). New delegations are blocked by bridge telemetry until reset in {wait_msg}."
-        ));
-    }
-
-    let (window_ms, max_dispatches) = window_rate_limit_params();
-    let recent = recent_dispatches_in_window(window_ms, now);
-    if recent + additional_tasks > max_dispatches {
-        let window_mins = window_ms / (60 * 1000);
-        return Err(anyhow!(
-            "ChatGPT Web sliding window dispatch limit reached: {} dispatch(es) recorded in the last {} minutes (limit: {}). Wait for previous window slots to expire before creating new delegations.",
-            recent,
-            window_mins,
-            max_dispatches
-        ));
-    }
-
-    Ok(())
-}
-
-fn count_active_in_flight_workers(mux: &WorkspaceMux) -> Result<usize> {
+#[cfg(test)]
+fn count_active_in_flight_workers_by_account(mux: &WorkspaceMux) -> Result<HashMap<String, usize>> {
     let scopes = mux.list_scopes()?;
-    let mut count = 0;
+    let mut counts = HashMap::new();
     for scope in scopes {
         if let Ok(workspace) = mux.resolve(&scope.scope_id) {
             if let Ok(Some(lifecycle)) = load_delegation_lifecycle(&workspace, &scope.scope_id) {
                 if lifecycle.terminal_state.is_none() {
+                    let account_id = scope.account_id().to_string();
                     match mux.try_lock_scope(&scope.scope_id) {
                         Ok(None) => {
-                            // File lock is actively held by a live running worker process
-                            count += 1;
+                            *counts.entry(account_id).or_insert(0) += 1;
                         }
                         Ok(Some(_lock)) => {
-                            // File lock is not held by any process -> ghost scope without a live process
                             tracing::debug!(
                                 scope_id = %scope.scope_id,
                                 "Ghost scope without active process lock excluded from in-flight worker count"
@@ -752,14 +766,22 @@ fn count_active_in_flight_workers(mux: &WorkspaceMux) -> Result<usize> {
                                 error = %error,
                                 "Failed to probe scope lock; counting defensively"
                             );
-                            count += 1;
+                            *counts.entry(account_id).or_insert(0) += 1;
                         }
                     }
                 }
             }
         }
     }
-    Ok(count)
+    Ok(counts)
+}
+
+#[cfg(test)]
+fn count_active_in_flight_workers(mux: &WorkspaceMux) -> Result<usize> {
+    Ok(count_active_in_flight_workers_by_account(mux)?
+        .values()
+        .copied()
+        .sum())
 }
 
 fn validate_parallel_count(count: usize) -> Result<()> {
@@ -798,10 +820,16 @@ fn stage_dry_run(
         .map(|task| {
             let scope = mux.register(&task.workspace, None)?;
             Ok(StagedDelegation {
-                scope_id: scope.scope_id,
-                workspace: scope.workspace,
+                scope_id: scope.scope_id.clone(),
+                workspace: scope.workspace.clone(),
                 label: task.label.clone(),
                 browser_page_id: None,
+                browser_binding: None,
+                browser_pool: None,
+                account_id: scope.account_id().to_string(),
+                browser_instance: scope.browser_instance().map(str::to_string),
+                account_router: None,
+                route_reservation: None,
                 generation: 0,
                 generation_started_ms: scope.created_ms,
                 resumed: false,
@@ -813,81 +841,42 @@ fn stage_dry_run(
     Ok((staged, Vec::new()))
 }
 
-struct DispatchLock {
-    file: File,
-}
-
-impl DispatchLock {
-    fn acquire() -> Result<Self> {
-        let lock_dir = default_bridge_base_dir();
-        fs::create_dir_all(&lock_dir).with_context(|| {
-            format!(
-                "failed to create dispatch lock directory at {}",
-                lock_dir.display()
-            )
-        })?;
-        #[cfg(unix)]
-        let _ = fs::set_permissions(&lock_dir, fs::Permissions::from_mode(0o700));
-        let lock_path = lock_dir.join(".dispatch.lock");
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options
-            .open(&lock_path)
-            .with_context(|| format!("failed to open dispatch lock at {}", lock_path.display()))?;
-        #[cfg(unix)]
-        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
-        file.lock().with_context(|| {
-            format!("failed to acquire dispatch lock at {}", lock_path.display())
-        })?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for DispatchLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
 async fn stage_browser_delegations(
     mux: &WorkspaceMux,
+    browsers: &BrowserPool,
     orca: &OrcaConfig,
+    router: &AccountRouter,
     tasks: &[PreparedTask],
 ) -> Result<(Vec<StagedDelegation>, Vec<WorkspaceScopeLock>)> {
-    let _dispatch_lock = DispatchLock::acquire()?;
-    check_rate_limit_and_window_guards(tasks.len())?;
-
-    let max_concurrent = max_concurrent_in_flight_workers();
-    let active = count_active_in_flight_workers(mux)?;
-    if active + tasks.len() > max_concurrent {
-        return Err(anyhow!(
-            "active concurrent Web delegations limit reached (currently {} active in-flight worker(s), requested {}, max concurrent limit is {})",
-            active,
-            tasks.len(),
-            max_concurrent
-        ));
-    }
+    let reservations = router
+        .reserve_batch_for_mux(mux, tasks.len(), epoch_ms())
+        .map_err(|error| anyhow!(error.to_string()))?;
 
     let mut staged = Vec::with_capacity(tasks.len());
     let mut scope_locks = Vec::with_capacity(tasks.len());
-    for (index, task) in tasks.iter().enumerate() {
+    for (index, (task, reservation)) in tasks.iter().zip(reservations.iter()).enumerate() {
         if index > 0 {
-            // Anti-burst stagger delay to avoid triggering Cloudflare/WAF and ChatGPT concurrent tab rate limits
             sleep(SPAWN_STAGGER_DELAY).await;
         }
-        let page = match create_chatgpt_tab(orca).await {
+        let handle = match browsers.create_chatgpt_page(&reservation.account.id).await {
             Ok(page) => page,
             Err(error) => {
+                for reserved in &reservations {
+                    let _ = router.release(reserved, epoch_ms());
+                }
                 cleanup_unstarted_staged(mux, orca, &staged).await;
                 return Err(error.context("failed to create a fresh ChatGPT Web worker tab"));
             }
         };
-        let scope = match mux.register_browser(&task.workspace, page.clone()) {
+        let page = handle.page_id.clone();
+        let binding = handle.binding();
+        let scope = match mux.register_browser_binding(&task.workspace, binding.clone()) {
             Ok(scope) => scope,
             Err(error) => {
-                let _ = close_browser_page(orca, &page).await;
+                let _ = browsers.close(&binding).await;
+                for reserved in &reservations {
+                    let _ = router.release(reserved, epoch_ms());
+                }
                 cleanup_unstarted_staged(mux, orca, &staged).await;
                 return Err(error.into());
             }
@@ -895,8 +884,11 @@ async fn stage_browser_delegations(
         let scope_lock = match mux.lock_scope(&scope.scope_id) {
             Ok(lock) => lock,
             Err(error) => {
-                let _ = close_browser_page(orca, &page).await;
+                let _ = browsers.close(&binding).await;
                 let _ = mux.remove(&scope.scope_id);
+                for reserved in &reservations {
+                    let _ = router.release(reserved, epoch_ms());
+                }
                 cleanup_unstarted_staged(mux, orca, &staged).await;
                 return Err(error.into());
             }
@@ -904,8 +896,11 @@ async fn stage_browser_delegations(
         let workspace = match mux.resolve(&scope.scope_id) {
             Ok(workspace) => workspace,
             Err(error) => {
-                let _ = close_browser_page(orca, &page).await;
+                let _ = browsers.close(&binding).await;
                 let _ = mux.remove(&scope.scope_id);
+                for reserved in &reservations {
+                    let _ = router.release(reserved, epoch_ms());
+                }
                 cleanup_unstarted_staged(mux, orca, &staged).await;
                 return Err(error.into());
             }
@@ -913,32 +908,38 @@ async fn stage_browser_delegations(
         let lifecycle = match start_fresh_delegation_lifecycle(&workspace, &scope.scope_id) {
             Ok(lifecycle) => lifecycle,
             Err(error) => {
-                let _ = close_browser_page(orca, &page).await;
+                let _ = browsers.close(&binding).await;
                 let _ = mux.remove(&scope.scope_id);
+                for reserved in &reservations {
+                    let _ = router.release(reserved, epoch_ms());
+                }
                 cleanup_unstarted_staged(mux, orca, &staged).await;
                 return Err(anyhow!(error));
             }
         };
-        let staged_item = build_staged_delegation(
+        if let Err(error) = router.bind_scope(reservation, &scope.scope_id, epoch_ms()) {
+            let _ = clear_delegation_lifecycle(&workspace, &scope.scope_id);
+            let _ = browsers.close(&binding).await;
+            let _ = mux.remove(&scope.scope_id);
+            for reserved in &reservations {
+                let _ = router.release(reserved, epoch_ms());
+            }
+            cleanup_unstarted_staged(mux, orca, &staged).await;
+            return Err(anyhow!(error.to_string())
+                .context("failed to bind account reservation to active scope"));
+        }
+        let mut staged_item = build_staged_delegation(
             &scope,
             Some(page),
             task.label.clone(),
             &task.task,
             &lifecycle,
             false,
+            Some(router.clone()),
         );
-        let driver = orca
-            .detect()
-            .await
-            .map(|(k, _)| k)
-            .unwrap_or(BrowserDriverKind::Maho);
-        emit_telemetry(
-            &staged_item,
-            driver,
-            TelemetryEventType::Dispatched,
-            None,
-            TelemetryErrorCode::Dispatched,
-        );
+        staged_item.browser_binding = Some(binding);
+        staged_item.browser_pool = Some(browsers.clone());
+        staged_item.route_reservation = Some(reservation.clone());
         staged.push(staged_item);
         scope_locks.push(scope_lock);
     }
@@ -947,36 +948,59 @@ async fn stage_browser_delegations(
 
 async fn stage_resume_delegation(
     mux: &WorkspaceMux,
+    browsers: &BrowserPool,
     orca: &OrcaConfig,
+    router: &AccountRouter,
     scope_id: &str,
     task: &str,
 ) -> Result<ResumeStage> {
-    let _dispatch_lock = DispatchLock::acquire()?;
-    check_rate_limit_and_window_guards(1)?;
-
-    let max_concurrent = max_concurrent_in_flight_workers();
-    let active = count_active_in_flight_workers(mux)?;
-    if active >= max_concurrent {
-        return Err(anyhow!(
-            "active concurrent Web delegations limit reached (currently {} active in-flight worker(s), max concurrent limit is {})",
-            active,
-            max_concurrent
-        ));
-    }
-
     let scope_lock = mux.lock_scope(scope_id)?;
     let (scope, workspace, previous) = load_resumable_scope(mux, scope_id)?;
     let page = scope
-        .browser_page_id
-        .clone()
-        .ok_or_else(|| anyhow!("retained scope has no browser_page_id"))?;
+        .page_id()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("retained scope has no browser page id"))?;
+
+    if let Some(binding) = scope.browser.as_ref() {
+        browsers
+            .target_for_binding(binding)
+            .await
+            .map_err(|error| {
+                anyhow!(serde_json::json!({
+                    "code": "BROWSER_ACCOUNT_UNAVAILABLE",
+                    "account_id": binding.account_id,
+                    "instance": binding.instance,
+                    "detail": error.to_string()
+                })
+                .to_string())
+            })?;
+    }
+    let reservation = router
+        .reserve_for_account_for_mux(mux, scope.account_id(), epoch_ms())
+        .map_err(|error| anyhow!(error.to_string()))?;
+    if let Some(binding) = scope.browser.as_ref() {
+        if binding.instance != reservation.account.browser.instance {
+            let _ = router.release(&reservation, epoch_ms());
+            return Err(anyhow!(
+                "retained scope browser instance {} no longer matches configured instance {} for account {}",
+                binding.instance,
+                reservation.account.browser.instance,
+                reservation.account.id
+            ));
+        }
+    }
 
     if retained_session_expired(&previous, epoch_ms()) {
+        let _ = router.release(&reservation, epoch_ms());
         let detail = format!("retained Web session lease expired before resume: {scope_id}");
         release_session_retention(&workspace, scope_id).map_err(anyhow::Error::msg)?;
         mux.remove(scope_id)?;
         drop(scope_lock);
-        let close_error = close_browser_page(orca, &page).await.err();
+        let close_error = if let Some(binding) = scope.browser.as_ref() {
+            browsers.close(binding).await.err()
+        } else {
+            close_browser_page(orca, &page).await.err()
+        };
         return Ok(ResumeStage::Lost {
             staged: staged_from_existing_terminal(&scope, task, &previous),
             terminal: TerminalObservation {
@@ -994,11 +1018,17 @@ async fn stage_resume_delegation(
         });
     }
 
-    if let Err(error) = verify_chatgpt_page(orca, &page).await {
+    let verify_result = if let Some(binding) = scope.browser.as_ref() {
+        browsers.verify(binding).await
+    } else {
+        verify_chatgpt_page(orca, &page).await
+    };
+    if let Err(error) = verify_result {
+        let _ = router.release(&reservation, epoch_ms());
         let lifecycle = start_next_delegation_generation(&workspace, scope_id, false)
             .map_err(anyhow::Error::msg)?;
         let detail = format!(
-            "retained browser_page_id {} is no longer a live chatgpt.com conversation: {}",
+            "retained browser page {} is no longer a live chatgpt.com conversation: {}",
             page, error
         );
         let terminal_lifecycle = record_terminal_evidence(
@@ -1011,8 +1041,20 @@ async fn stage_resume_delegation(
         let _ = release_session_retention(&workspace, scope_id);
         let _ = mux.remove(scope_id);
         drop(scope_lock);
-        let close_error = close_browser_page(orca, &page).await.err();
-        let staged = build_staged_delegation(&scope, Some(page), None, task, &lifecycle, true);
+        let close_error = if let Some(binding) = scope.browser.as_ref() {
+            browsers.close(binding).await.err()
+        } else {
+            close_browser_page(orca, &page).await.err()
+        };
+        let staged = build_staged_delegation(
+            &scope,
+            Some(page),
+            None,
+            task,
+            &lifecycle,
+            true,
+            Some(router.clone()),
+        );
         return Ok(ResumeStage::Lost {
             staged,
             terminal: TerminalObservation {
@@ -1035,21 +1077,35 @@ async fn stage_resume_delegation(
     }
 
     let reopen_blocked = previous.terminal_state == Some(DelegationTerminalState::Blocked);
-    let lifecycle = start_next_delegation_generation(&workspace, scope_id, reopen_blocked)
-        .map_err(anyhow::Error::msg)?;
-    let staged = build_staged_delegation(&scope, Some(page), None, task, &lifecycle, true);
-    let driver = orca
-        .detect()
-        .await
-        .map(|(k, _)| k)
-        .unwrap_or(BrowserDriverKind::Maho);
-    emit_telemetry(
-        &staged,
-        driver,
-        TelemetryEventType::Dispatched,
+    let lifecycle = match start_next_delegation_generation(&workspace, scope_id, reopen_blocked) {
+        Ok(lifecycle) => lifecycle,
+        Err(error) => {
+            let _ = router.release(&reservation, epoch_ms());
+            return Err(anyhow!(error));
+        }
+    };
+    if let Err(error) = router.bind_scope(&reservation, scope_id, epoch_ms()) {
+        let _ = router.release(&reservation, epoch_ms());
+        let detail = format!("failed to bind retained account reservation to scope: {error}");
+        let _ = record_terminal_evidence(
+            &workspace,
+            scope_id,
+            DelegationTerminalState::Failed,
+            Some(&detail),
+        );
+        return Err(anyhow!(detail));
+    }
+    let mut staged = build_staged_delegation(
+        &scope,
+        Some(page),
         None,
-        TelemetryErrorCode::Dispatched,
+        task,
+        &lifecycle,
+        true,
+        Some(router.clone()),
     );
+    staged.browser_pool = Some(browsers.clone());
+    staged.route_reservation = Some(reservation);
     Ok(ResumeStage::Ready(staged, scope_lock))
 }
 
@@ -1087,6 +1143,12 @@ fn staged_from_existing_terminal(
         workspace: scope.workspace.clone(),
         label: None,
         browser_page_id: scope.browser_page_id.clone(),
+        browser_binding: scope.browser.clone(),
+        browser_pool: None,
+        account_id: scope.account_id().to_string(),
+        browser_instance: scope.browser_instance().map(str::to_string),
+        account_router: None,
+        route_reservation: None,
         generation: lifecycle.generation,
         generation_started_ms: lifecycle.generation_started_ms,
         resumed: true,
@@ -1102,6 +1164,7 @@ fn build_staged_delegation(
     task: &str,
     lifecycle: &DelegationLifecycle,
     resumed: bool,
+    account_router: Option<AccountRouter>,
 ) -> StagedDelegation {
     let workspace_path = Path::new(&scope.workspace);
     StagedDelegation {
@@ -1109,6 +1172,12 @@ fn build_staged_delegation(
         workspace: scope.workspace.clone(),
         label: label.clone(),
         browser_page_id: page,
+        browser_binding: scope.browser.clone(),
+        browser_pool: None,
+        account_id: scope.account_id().to_string(),
+        browser_instance: scope.browser_instance().map(str::to_string),
+        account_router,
+        route_reservation: None,
         generation: lifecycle.generation,
         generation_started_ms: lifecycle.generation_started_ms,
         resumed,
@@ -1133,13 +1202,12 @@ fn build_staged_delegation(
 async fn dispatch_bootstrap(
     mux: &WorkspaceMux,
     orca: &OrcaConfig,
-    driver: BrowserDriverKind,
     staged: &[StagedDelegation],
 ) -> Result<()> {
     let futures = staged.iter().map(|item| {
-        send_chatgpt_prompt(
+        send_item_prompt(
             orca,
-            item.browser_page_id.as_deref().unwrap_or_default(),
+            item,
             item.bootstrap_prompt.as_deref().unwrap_or_default(),
         )
     });
@@ -1147,25 +1215,58 @@ async fn dispatch_bootstrap(
     let mut failures = Vec::new();
 
     for (index, result) in results.into_iter().enumerate() {
-        if let Err(error) = result {
-            let item = &staged[index];
-            let condition = probe_chatgpt_ui_condition(
-                orca,
-                item.browser_page_id.as_deref().unwrap_or_default(),
-            )
-            .await;
-            let _ = apply_ui_condition(mux, item, driver, condition);
-            let detail =
-                structured_terminal_detail(StructuredTerminalCode::ReadinessBootstrapFailed);
-            let _ = record_helper_terminal(mux, item, DelegationTerminalState::Failed, &detail);
-            emit_telemetry(
-                item,
-                driver,
-                TelemetryEventType::ReadinessBootstrapFailed,
-                None,
-                TelemetryErrorCode::BootstrapFailed,
-            );
-            failures.push(format!("worker {}: {}", index + 1, error));
+        let item = &staged[index];
+        match result {
+            Ok(()) => {
+                if let (Some(router), Some(reservation)) = (
+                    item.account_router.as_ref(),
+                    item.route_reservation.as_ref(),
+                ) {
+                    if let Err(error) = router.commit(reservation, epoch_ms()) {
+                        let detail = structured_terminal_detail(
+                            StructuredTerminalCode::ReadinessBootstrapFailed,
+                        );
+                        let _ = record_helper_terminal(
+                            mux,
+                            item,
+                            DelegationTerminalState::Failed,
+                            &detail,
+                        );
+                        failures.push(format!(
+                            "worker {} account reservation commit failed after Web dispatch: {}",
+                            index + 1,
+                            error
+                        ));
+                        continue;
+                    }
+                }
+                emit_telemetry(
+                    item,
+                    TelemetryEventType::Dispatched,
+                    None,
+                    TelemetryErrorCode::Dispatched,
+                );
+            }
+            Err(error) => {
+                if let (Some(router), Some(reservation)) = (
+                    item.account_router.as_ref(),
+                    item.route_reservation.as_ref(),
+                ) {
+                    let _ = router.release(reservation, epoch_ms());
+                }
+                let condition = probe_item_condition(orca, item).await;
+                let _ = apply_ui_condition(mux, item, condition);
+                let detail =
+                    structured_terminal_detail(StructuredTerminalCode::ReadinessBootstrapFailed);
+                let _ = record_helper_terminal(mux, item, DelegationTerminalState::Failed, &detail);
+                emit_telemetry(
+                    item,
+                    TelemetryEventType::ReadinessBootstrapFailed,
+                    None,
+                    TelemetryErrorCode::BootstrapFailed,
+                );
+                failures.push(format!("worker {}: {}", index + 1, error));
+            }
         }
     }
 
@@ -1182,7 +1283,6 @@ async fn dispatch_bootstrap(
 async fn wait_for_all_ready(
     mux: &WorkspaceMux,
     orca: &OrcaConfig,
-    driver: BrowserDriverKind,
     staged: &[StagedDelegation],
     timeout: Duration,
 ) -> Result<()> {
@@ -1226,12 +1326,8 @@ async fn wait_for_all_ready(
                 continue;
             }
             next_ui_probe[index] = Instant::now() + UI_PROBE_INTERVAL;
-            let condition = probe_chatgpt_ui_condition(
-                orca,
-                item.browser_page_id.as_deref().unwrap_or_default(),
-            )
-            .await;
-            match apply_ui_condition(mux, item, driver, condition)? {
+            let condition = probe_item_condition(orca, item).await;
+            match apply_ui_condition(mux, item, condition)? {
                 UiProbeAction::Continue => {}
                 UiProbeAction::Disable => probe_disabled[index] = true,
                 UiProbeAction::Terminal(observation) => {
@@ -1254,7 +1350,6 @@ async fn wait_for_all_ready(
                 let _ = record_helper_terminal(mux, item, DelegationTerminalState::Failed, &detail);
                 emit_telemetry(
                     item,
-                    driver,
                     TelemetryEventType::ReadinessHandshakeFailed,
                     None,
                     TelemetryErrorCode::ReadinessTimeout,
@@ -1273,9 +1368,9 @@ async fn wait_for_all_ready(
         if !retried && Instant::now().duration_since(started) >= READINESS_RETRY_AFTER {
             let futures = pending.iter().map(|index| {
                 let item = &staged[*index];
-                send_chatgpt_prompt(
+                send_item_prompt(
                     orca,
-                    item.browser_page_id.as_deref().unwrap_or_default(),
+                    item,
                     item.bootstrap_prompt.as_deref().unwrap_or_default(),
                 )
             });
@@ -1284,12 +1379,8 @@ async fn wait_for_all_ready(
             for (index, result) in pending.iter().zip(results.into_iter()) {
                 if let Err(error) = result {
                     let item = &staged[*index];
-                    let condition = probe_chatgpt_ui_condition(
-                        orca,
-                        item.browser_page_id.as_deref().unwrap_or_default(),
-                    )
-                    .await;
-                    let _ = apply_ui_condition(mux, item, driver, condition);
+                    let condition = probe_item_condition(orca, item).await;
+                    let _ = apply_ui_condition(mux, item, condition);
                     let detail = structured_terminal_detail(
                         StructuredTerminalCode::ReadinessBootstrapFailed,
                     );
@@ -1297,7 +1388,6 @@ async fn wait_for_all_ready(
                         record_helper_terminal(mux, item, DelegationTerminalState::Failed, &detail);
                     emit_telemetry(
                         item,
-                        driver,
                         TelemetryEventType::ReadinessBootstrapFailed,
                         None,
                         TelemetryErrorCode::BootstrapFailed,
@@ -1349,7 +1439,6 @@ fn actual_dispatch_plan(
 async fn dispatch_actual_tasks(
     mux: &WorkspaceMux,
     orca: &OrcaConfig,
-    driver: BrowserDriverKind,
     staged: &[StagedDelegation],
 ) -> Result<Vec<bool>> {
     let plan = actual_dispatch_plan(mux, staged, epoch_ms())?;
@@ -1359,7 +1448,6 @@ async fn dispatch_actual_tasks(
             let _ = record_helper_terminal(mux, item, DelegationTerminalState::Failed, &detail);
             emit_telemetry(
                 item,
-                driver,
                 TelemetryEventType::ReadinessInvalid,
                 None,
                 TelemetryErrorCode::ReadinessFailed,
@@ -1370,9 +1458,10 @@ async fn dispatch_actual_tasks(
         ));
     }
 
-    let futures = plan
+    let futures = staged
         .iter()
-        .map(|(page, prompt)| send_chatgpt_prompt(orca, page, prompt));
+        .zip(plan.iter())
+        .map(|(item, (_page, prompt))| send_item_prompt(orca, item, prompt));
     let results = join_all(futures).await;
     let mut sent = vec![false; staged.len()];
     for (index, result) in results.into_iter().enumerate() {
@@ -1380,18 +1469,13 @@ async fn dispatch_actual_tasks(
             Ok(()) => sent[index] = true,
             Err(_) => {
                 let item = &staged[index];
-                let condition = probe_chatgpt_ui_condition(
-                    orca,
-                    item.browser_page_id.as_deref().unwrap_or_default(),
-                )
-                .await;
-                let _ = apply_ui_condition(mux, item, driver, condition);
+                let condition = probe_item_condition(orca, item).await;
+                let _ = apply_ui_condition(mux, item, condition);
                 let detail =
                     structured_terminal_detail(StructuredTerminalCode::ActualDispatchFailed);
                 let _ = record_helper_terminal(mux, item, DelegationTerminalState::Failed, &detail);
                 emit_telemetry(
                     item,
-                    driver,
                     TelemetryEventType::DispatchFailed,
                     None,
                     TelemetryErrorCode::DispatchFailed,
@@ -1405,7 +1489,6 @@ async fn dispatch_actual_tasks(
 async fn wait_for_terminal_states(
     mux: &WorkspaceMux,
     orca: &OrcaConfig,
-    driver: BrowserDriverKind,
     staged: &[StagedDelegation],
     timeout: Duration,
 ) -> Vec<TerminalObservation> {
@@ -1456,19 +1539,14 @@ async fn wait_for_terminal_states(
                 continue;
             }
             next_ui_probe[index] = Instant::now() + UI_PROBE_INTERVAL;
-            let condition = probe_chatgpt_ui_condition(
-                orca,
-                item.browser_page_id.as_deref().unwrap_or_default(),
-            )
-            .await;
-            match apply_ui_condition(mux, item, driver, condition) {
+            let condition = probe_item_condition(orca, item).await;
+            match apply_ui_condition(mux, item, condition) {
                 Ok(UiProbeAction::Continue) => {}
                 Ok(UiProbeAction::Disable) => probe_disabled[index] = true,
                 Ok(UiProbeAction::Terminal(observation)) => observed[index] = Some(observation),
                 Err(_) => {
                     emit_telemetry(
                         item,
-                        driver,
                         TelemetryEventType::TerminalClaimFailed,
                         None,
                         TelemetryErrorCode::TerminalClaimFailed,
@@ -1511,7 +1589,6 @@ async fn wait_for_terminal_states(
 fn apply_ui_condition(
     mux: &WorkspaceMux,
     item: &StagedDelegation,
-    driver: BrowserDriverKind,
     condition: ChatgptUiCondition,
 ) -> Result<UiProbeAction> {
     match condition {
@@ -1521,7 +1598,6 @@ fn apply_ui_condition(
         ChatgptUiCondition::Unsupported => {
             emit_telemetry(
                 item,
-                driver,
                 TelemetryEventType::ProbeUnsupported,
                 None,
                 TelemetryErrorCode::ProbeUnsupported,
@@ -1532,6 +1608,16 @@ fn apply_ui_condition(
             reason,
             reset_after_seconds,
         } => {
+            if let Some(router) = item.account_router.as_ref() {
+                router
+                    .apply_rate_limit(
+                        &item.account_id,
+                        &reason.to_string(),
+                        reset_after_seconds,
+                        epoch_ms(),
+                    )
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            }
             let detail = rate_limit_terminal_detail(reason, reset_after_seconds);
             let lifecycle = match record_helper_terminal(
                 mux,
@@ -1543,7 +1629,6 @@ fn apply_ui_condition(
                 Err(error) => {
                     emit_telemetry(
                         item,
-                        driver,
                         TelemetryEventType::TerminalClaimFailed,
                         reset_after_seconds,
                         TelemetryErrorCode::TerminalClaimFailed,
@@ -1553,7 +1638,6 @@ fn apply_ui_condition(
             };
             emit_telemetry(
                 item,
-                driver,
                 TelemetryEventType::RateLimited,
                 reset_after_seconds,
                 TelemetryErrorCode::RateLimited,
@@ -1563,12 +1647,16 @@ fn apply_ui_condition(
             )))
         }
         ChatgptUiCondition::AuthenticationRequired => {
+            if let Some(router) = item.account_router.as_ref() {
+                router
+                    .mark_auth_required(&item.account_id, epoch_ms())
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            }
             let detail = structured_terminal_detail(StructuredTerminalCode::AuthenticationRequired);
             let lifecycle =
                 record_helper_terminal(mux, item, DelegationTerminalState::Failed, &detail)?;
             emit_telemetry(
                 item,
-                driver,
                 TelemetryEventType::AuthenticationRequired,
                 None,
                 TelemetryErrorCode::AuthenticationRequired,
@@ -1579,12 +1667,16 @@ fn apply_ui_condition(
         }
         ChatgptUiCondition::DeliveryError { recoverable: true } => Ok(UiProbeAction::Continue),
         ChatgptUiCondition::DeliveryError { recoverable: false } => {
+            if let Some(router) = item.account_router.as_ref() {
+                router
+                    .apply_delivery_failure(&item.account_id, epoch_ms())
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            }
             let detail = structured_terminal_detail(StructuredTerminalCode::DeliveryError);
             let lifecycle =
                 record_helper_terminal(mux, item, DelegationTerminalState::Failed, &detail)?;
             emit_telemetry(
                 item,
-                driver,
                 TelemetryEventType::DeliveryError,
                 None,
                 TelemetryErrorCode::DeliveryError,
@@ -1624,26 +1716,64 @@ fn rate_limit_terminal_detail(
 
 fn emit_telemetry(
     item: &StagedDelegation,
-    driver: BrowserDriverKind,
     event_type: TelemetryEventType,
     reset_after_seconds: Option<u64>,
     error_code: TelemetryErrorCode,
 ) {
-    if let Some(event) = TelemetryEvent::new(
-        &item.scope_id,
-        item.generation,
-        driver,
-        TelemetryModelHint::Unknown,
+    if let Some(event) = TelemetryEvent::from_input(TelemetryEventInput {
+        scope_id: &item.scope_id,
+        generation: item.generation,
+        account_id: Some(&item.account_id),
+        driver: item
+            .browser_binding
+            .as_ref()
+            .map(|binding| binding.driver)
+            .unwrap_or(BrowserDriverKind::Orca),
+        model_hint: TelemetryModelHint::Unknown,
         event_type,
         reset_after_seconds,
         error_code,
-    ) {
+    }) {
         let _ = append_best_effort(&event);
     }
 }
 
 fn should_retain_terminal(state: DelegationTerminalState, close_on_terminal: bool) -> bool {
     !close_on_terminal && state != DelegationTerminalState::Lost
+}
+
+async fn send_item_prompt(orca: &OrcaConfig, item: &StagedDelegation, prompt: &str) -> Result<()> {
+    if let (Some(pool), Some(binding)) = (item.browser_pool.as_ref(), item.browser_binding.as_ref())
+    {
+        pool.send(binding, prompt).await
+    } else {
+        send_chatgpt_prompt(
+            orca,
+            item.browser_page_id.as_deref().unwrap_or_default(),
+            prompt,
+        )
+        .await
+    }
+}
+
+async fn probe_item_condition(orca: &OrcaConfig, item: &StagedDelegation) -> ChatgptUiCondition {
+    if let (Some(pool), Some(binding)) = (item.browser_pool.as_ref(), item.browser_binding.as_ref())
+    {
+        pool.probe(binding).await
+    } else {
+        probe_chatgpt_ui_condition(orca, item.browser_page_id.as_deref().unwrap_or_default()).await
+    }
+}
+
+async fn close_item_page(orca: &OrcaConfig, item: &StagedDelegation) -> Result<()> {
+    if let (Some(pool), Some(binding)) = (item.browser_pool.as_ref(), item.browser_binding.as_ref())
+    {
+        pool.close(binding).await
+    } else if let Some(page) = item.browser_page_id.as_deref() {
+        close_browser_page(orca, page).await
+    } else {
+        Err(anyhow!("delegation has no browser page binding to close"))
+    }
 }
 
 async fn finalize_terminal_sessions(
@@ -1675,12 +1805,12 @@ async fn retain_terminal_session(
     item: &StagedDelegation,
     ttl_ms: u64,
 ) -> SessionDisposition {
-    let Some(page) = item.browser_page_id.as_deref() else {
+    if item.browser_page_id.is_none() {
         return SessionDisposition {
             error: Some("cannot retain delegation without browser_page_id".into()),
             ..SessionDisposition::default()
         };
-    };
+    }
     let scope_lock = match mux.lock_scope(&item.scope_id) {
         Ok(lock) => lock,
         Err(error) => {
@@ -1699,11 +1829,18 @@ async fn retain_terminal_session(
             }
         }
     };
-    if let Err(error) = verify_chatgpt_page(orca, page).await {
+    let verify_result = if let (Some(pool), Some(binding)) =
+        (item.browser_pool.as_ref(), item.browser_binding.as_ref())
+    {
+        pool.verify(binding).await
+    } else {
+        verify_chatgpt_page(orca, item.browser_page_id.as_deref().unwrap_or_default()).await
+    };
+    if let Err(error) = verify_result {
         let _ = release_session_retention(&workspace, &item.scope_id);
         let _ = mux.remove(&item.scope_id);
         drop(scope_lock);
-        let close_error = close_browser_page(orca, page).await.err();
+        let close_error = close_item_page(orca, item).await.err();
         return SessionDisposition {
             retained: false,
             closed: close_error.is_none(),
@@ -1728,7 +1865,7 @@ async fn retain_terminal_session(
         Err(error) => {
             let _ = mux.remove(&item.scope_id);
             drop(scope_lock);
-            let close_error = close_browser_page(orca, page).await.err();
+            let close_error = close_item_page(orca, item).await.err();
             SessionDisposition {
                 retained: false,
                 closed: close_error.is_none(),
@@ -1758,10 +1895,7 @@ async fn close_terminal_session(
     }
     let remove_result = mux.remove(&item.scope_id);
     drop(scope_lock);
-    let close_result = match item.browser_page_id.as_deref() {
-        Some(page) => close_browser_page(orca, page).await,
-        None => Err(anyhow!("delegation has no browser_page_id to close")),
-    };
+    let close_result = close_item_page(orca, item).await;
     let error = match (close_result.as_ref().err(), remove_result.as_ref().err()) {
         (None, None) => None,
         (Some(close_error), None) => Some(format!("browser tab close failed: {}", close_error)),
@@ -1782,6 +1916,7 @@ async fn close_terminal_session(
 
 async fn close_retained_scope(
     mux: &WorkspaceMux,
+    browsers: &BrowserPool,
     orca: &OrcaConfig,
     scope_id: &str,
 ) -> Result<Value> {
@@ -1791,20 +1926,37 @@ async fn close_retained_scope(
         .browser_page_id
         .clone()
         .ok_or_else(|| anyhow!("retained scope has no browser_page_id"))?;
+    let close_error = if let Some(binding) = scope.browser.as_ref() {
+        browsers.close(binding).await.err()
+    } else {
+        close_browser_page(orca, &page).await.err()
+    };
+    if let Some(error) = close_error {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "closed_scope": scope_id,
+            "browser_page_id": page,
+            "generation": lifecycle.generation,
+            "scope_removed": false,
+            "session_state": "RETAINED_CLOSE_FAILED",
+            "session_retained": true,
+            "session_closed": false,
+            "session_error": error.to_string(),
+        }));
+    }
     release_session_retention(&workspace, scope_id).map_err(anyhow::Error::msg)?;
     mux.remove(scope_id)?;
     drop(scope_lock);
-    let close_error = close_browser_page(orca, &page).await.err();
     Ok(serde_json::json!({
-        "ok": close_error.is_none(),
+        "ok": true,
         "closed_scope": scope_id,
         "browser_page_id": page,
         "generation": lifecycle.generation,
         "scope_removed": true,
         "session_state": "CLOSED",
         "session_retained": false,
-        "session_closed": close_error.is_none(),
-        "session_error": close_error.map(|error| error.to_string()),
+        "session_closed": true,
+        "session_error": Value::Null,
     }))
 }
 
@@ -1860,9 +2012,7 @@ async fn cleanup_unstarted_staged(
         if let Ok(workspace) = mux.resolve(&item.scope_id) {
             let _ = clear_delegation_lifecycle(&workspace, &item.scope_id);
         }
-        if let Some(page) = &item.browser_page_id {
-            let _ = close_browser_page(orca, page).await;
-        }
+        let _ = close_item_page(orca, item).await;
         let _ = mux.remove(&item.scope_id);
     }
 }
@@ -1873,9 +2023,7 @@ async fn cleanup_failed_readiness_staged(
     staged: &[StagedDelegation],
 ) {
     for item in staged {
-        if let Some(page) = &item.browser_page_id {
-            let _ = close_browser_page(orca, page).await;
-        }
+        let _ = close_item_page(orca, item).await;
         let _ = mux.remove(&item.scope_id);
     }
 }
@@ -2029,8 +2177,8 @@ fn build_bootstrap_prompt(
 SCOPE_ID: {}\n\
 WORKSPACE: {}\n\
 GENERATION: {}\n\n\
-{} The actual coding task for this generation has NOT been sent yet. Your only allowed readiness action now is to call the gpt2omo MCP tool task_state with exactly scope_id={}. If the task_state tool schema is not loaded yet, you may perform only the minimal connector/tool discovery required to expose that exact task_state tool, then call it immediately. Do not inspect files, edit, run commands, delegate, or start coding.\n\n\
-A textual READY/OK/complete message is ignored and provides no readiness evidence. Readiness exists only if the scoped task_state MCP call succeeds and the bridge records it for this generation. After that successful tool call, stop and wait for the actual task prompt.",
+{} The actual coding task for this generation has NOT been sent yet. Your immediate action now is to execute the gpt2omo MCP tool task_state with scope_id=\"{}\" to acknowledge readiness. (If the task_state tool schema is not loaded yet, perform minimal connector/tool discovery to expose and call it. Calling any valid gpt2omo tool with this scope_id will establish readiness). Do not inspect files, edit, run commands, delegate, or start coding yet.\n\n\
+IMPORTANT: A plain text reply (such as \"Ready\", \"Understood\", \"I'm ready\") provides ZERO readiness evidence and will cause a timeout. You MUST call the task_state MCP tool. After calling the tool, wait for the actual task prompt.",
         title_line,
         scope_id,
         workspace.display(),
@@ -2107,6 +2255,7 @@ mod tests {
             worktree: "active".into(),
             terminal: None,
             orca_bin: "orca".into(),
+            browser_driver: None,
             token: None,
             dry_run: false,
             json: false,
@@ -2119,10 +2268,16 @@ mod tests {
         resumed: bool,
     ) -> StagedDelegation {
         StagedDelegation {
-            scope_id: scope.scope_id,
-            workspace: scope.workspace,
+            scope_id: scope.scope_id.clone(),
+            workspace: scope.workspace.clone(),
             label: None,
-            browser_page_id: scope.browser_page_id,
+            browser_page_id: scope.browser_page_id.clone(),
+            browser_binding: scope.browser.clone(),
+            browser_pool: None,
+            account_id: scope.account_id().to_string(),
+            browser_instance: scope.browser_instance().map(str::to_string),
+            account_router: None,
+            route_reservation: None,
             generation: lifecycle.generation,
             generation_started_ms: lifecycle.generation_started_ms,
             resumed,
@@ -2352,14 +2507,8 @@ mod tests {
         assert_eq!(result.data.unwrap()["ready"], true);
 
         let orca = unsupported_probe_config();
-        let terminal = wait_for_terminal_states(
-            &mux,
-            &orca,
-            BrowserDriverKind::Maho,
-            &staged,
-            Duration::from_millis(20),
-        )
-        .await;
+        let terminal =
+            wait_for_terminal_states(&mux, &orca, &staged, Duration::from_millis(20)).await;
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0].state, DelegationTerminalState::Completed);
     }
@@ -2398,14 +2547,8 @@ mod tests {
         );
 
         let orca = unsupported_probe_config();
-        let terminal = wait_for_terminal_states(
-            &mux,
-            &orca,
-            BrowserDriverKind::Maho,
-            &staged,
-            Duration::from_millis(20),
-        )
-        .await;
+        let terminal =
+            wait_for_terminal_states(&mux, &orca, &staged, Duration::from_millis(20)).await;
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0].state, DelegationTerminalState::Blocked);
     }
@@ -2493,10 +2636,57 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_lock_can_be_acquired_and_released() {
-        let lock = DispatchLock::acquire().unwrap();
-        drop(lock);
-        let lock2 = DispatchLock::acquire();
-        assert!(lock2.is_ok());
+    fn rate_limit_probe_cools_down_only_bound_account() {
+        let root = tempdir().unwrap();
+        let mount = root.path().join("mount");
+        let project = mount.join("project");
+        let bridge = root.path().join("bridge");
+        let scopes = root.path().join("scopes");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&bridge).unwrap();
+        std::fs::write(
+            bridge.join("accounts.json"),
+            r#"{
+              "version":1,
+              "routing":{"strategy":"round_robin","reservation_ttl_seconds":10,"selection_failure_backoff_seconds":5},
+              "defaults":{"limits":{"window_seconds":600,"max_dispatches":10,"max_active_workers":3}},
+              "accounts":[
+                {"id":"a","browser":{"instance":"instance-a"}},
+                {"id":"b","browser":{"instance":"instance-b"}}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let router = AccountRouter::new(&bridge, &mount, LegacyAccountConfig::default());
+        let mux = WorkspaceMux::new(&mount, &scopes).unwrap();
+        let scope = mux
+            .register_browser_binding(
+                &project,
+                BrowserBinding::new("a", BrowserDriverKind::Orca, "instance-a", "page-a"),
+            )
+            .unwrap();
+        let workspace = mux.resolve(&scope.scope_id).unwrap();
+        let lifecycle = start_fresh_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
+        let mut staged = staged_for_scope(scope, &lifecycle, false);
+        staged.account_router = Some(router.clone());
+
+        let action = apply_ui_condition(
+            &mux,
+            &staged,
+            ChatgptUiCondition::RateLimited {
+                reason: ChatgptRateLimitReason::TooManyRequests,
+                reset_after_seconds: Some(60),
+            },
+        )
+        .unwrap();
+        assert!(matches!(action, UiProbeAction::Terminal(_)));
+
+        let now = epoch_ms();
+        let a = router.state_for_account("a", now).unwrap();
+        let b = router.state_for_account("b", now).unwrap();
+        assert_eq!(a.cooldown_reason.as_deref(), Some("too_many_requests"));
+        assert!(a.cooldown_until_ms.is_some_and(|until| until > now));
+        assert_eq!(b.cooldown_until_ms, None);
+        assert_eq!(b.cooldown_reason, None);
     }
 }

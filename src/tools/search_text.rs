@@ -63,9 +63,7 @@ pub fn handle_search_text(
         builder.hidden(false);
         builder.filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
-            if entry
-                .file_type()
-                .is_some_and(|ft| ft.is_dir())
+            if entry.file_type().is_some_and(|ft| ft.is_dir())
                 && SKIPPED_DIR_NAMES.contains(&name.as_ref())
             {
                 return false;
@@ -84,7 +82,7 @@ pub fn handle_search_text(
 
         for entry in builder.build().flatten() {
             entries_walked += 1;
-            if entries_walked % 64 == 0 && started.elapsed() >= SEARCH_TIME_BUDGET {
+            if entries_walked.is_multiple_of(64) && started.elapsed() >= SEARCH_TIME_BUDGET {
                 deadline_hit = true;
                 break 'roots;
             }

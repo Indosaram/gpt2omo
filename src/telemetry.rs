@@ -60,12 +60,26 @@ pub enum TelemetryErrorCode {
 pub struct TelemetryEvent {
     timestamp_ms: u64,
     scope_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
     generation: u64,
     driver: BrowserDriverKind,
     model_hint: TelemetryModelHint,
     event_type: TelemetryEventType,
     reset_after_seconds: Option<u64>,
     error_code: TelemetryErrorCode,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TelemetryEventInput<'a> {
+    pub scope_id: &'a str,
+    pub generation: u64,
+    pub account_id: Option<&'a str>,
+    pub driver: BrowserDriverKind,
+    pub model_hint: TelemetryModelHint,
+    pub event_type: TelemetryEventType,
+    pub reset_after_seconds: Option<u64>,
+    pub error_code: TelemetryErrorCode,
 }
 
 impl TelemetryEvent {
@@ -78,18 +92,37 @@ impl TelemetryEvent {
         reset_after_seconds: Option<u64>,
         error_code: TelemetryErrorCode,
     ) -> Option<Self> {
-        if generation == 0 || uuid::Uuid::parse_str(scope_id).is_err() {
+        Self::from_input(TelemetryEventInput {
+            scope_id,
+            generation,
+            account_id: None,
+            driver,
+            model_hint,
+            event_type,
+            reset_after_seconds,
+            error_code,
+        })
+    }
+
+    pub fn from_input(input: TelemetryEventInput<'_>) -> Option<Self> {
+        if input.generation == 0 || uuid::Uuid::parse_str(input.scope_id).is_err() {
+            return None;
+        }
+        if input.account_id.is_some_and(str::is_empty) {
             return None;
         }
         Some(Self {
             timestamp_ms: now_ms(),
-            scope_id: scope_id.to_string(),
-            generation,
-            driver,
-            model_hint,
-            event_type,
-            reset_after_seconds: reset_after_seconds.and_then(validate_reset_after_seconds),
-            error_code,
+            scope_id: input.scope_id.to_string(),
+            account_id: input.account_id.map(str::to_string),
+            generation: input.generation,
+            driver: input.driver,
+            model_hint: input.model_hint,
+            event_type: input.event_type,
+            reset_after_seconds: input
+                .reset_after_seconds
+                .and_then(validate_reset_after_seconds),
+            error_code: input.error_code,
         })
     }
 }
@@ -410,6 +443,23 @@ mod tests {
             TelemetryErrorCode::ProbeUnknown,
         )
         .is_none());
+    }
+
+    #[test]
+    fn account_id_is_optional_but_serialized_when_present() {
+        let event = TelemetryEvent::from_input(TelemetryEventInput {
+            scope_id: SCOPE,
+            generation: 2,
+            account_id: Some("web-a"),
+            driver: BrowserDriverKind::Orca,
+            model_hint: TelemetryModelHint::Unknown,
+            event_type: TelemetryEventType::Dispatched,
+            reset_after_seconds: None,
+            error_code: TelemetryErrorCode::Dispatched,
+        })
+        .unwrap();
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["account_id"], "web-a");
     }
 
     #[test]

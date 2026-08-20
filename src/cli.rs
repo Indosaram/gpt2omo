@@ -5,10 +5,10 @@ use std::path::PathBuf;
 #[command(
     name = "gpt2omo",
     version,
-    about = "Sandboxed local MCP HTTP/SSE daemon for ChatGPT"
+    about = "Scoped local MCP HTTP/SSE daemon for ChatGPT"
 )]
 pub struct Cli {
-    /// Broad filesystem mount root. Individual MCP calls are sandboxed by per-delegation scope.
+    /// Broad filesystem mount root. File tools are constrained by per-delegation scope; command children are not an OS sandbox.
     #[arg(long, default_value_os_t = default_mount_root())]
     pub mount_root: PathBuf,
 
@@ -20,11 +20,11 @@ pub struct Cli {
     #[arg(long, default_value = "127.0.0.1:18800", env = "OMO_BRIDGE_BIND")]
     pub bind: String,
 
-    /// Optional bearer token for authentication
+    /// Optional bearer token for bridge-control endpoints such as `/events`; MCP tool calls use scope_id capabilities.
     #[arg(long, env = "OMO_BRIDGE_TOKEN")]
     pub token: Option<String>,
 
-    /// Optional path to a file containing the bearer token
+    /// Optional path to a bearer token for bridge-control endpoints such as `/events`.
     #[arg(long, env = "OMO_BRIDGE_TOKEN_FILE")]
     pub token_file: Option<PathBuf>,
 
@@ -61,7 +61,7 @@ pub struct Cli {
     #[arg(long, env = "OMO_SUBAGENT_ALLOW_REMOTE", default_value_t = false)]
     pub subagent_allow_remote: bool,
 
-    /// Insecurely disable authentication enforcement when no token is configured.
+    /// Allow bridge-control endpoints without a bearer token when no token is configured.
     #[arg(long, env = "OMO_BRIDGE_INSECURE_NO_AUTH", default_value_t = false)]
     pub insecure_no_auth: bool,
 
@@ -72,6 +72,10 @@ pub struct Cli {
         default_value_t = false
     )]
     pub allow_arbitrary_commands: bool,
+
+    /// Shared/untrusted connector profile: expose read-only workspace tools and disable patch/run/cancel.
+    #[arg(long, env = "OMO_BRIDGE_READ_ONLY", default_value_t = false)]
+    pub read_only: bool,
 }
 
 impl Default for Cli {
@@ -90,11 +94,23 @@ impl Default for Cli {
             subagent_allow_remote: false,
             insecure_no_auth: false,
             allow_arbitrary_commands: false,
+            read_only: false,
         }
     }
 }
 
 impl Cli {
+    /// Enforces the daemon exposure invariant after bridge-control authentication has been resolved.
+    pub fn validate_bind_security(&self, addr: &std::net::SocketAddr) -> Result<(), String> {
+        if !addr.ip().is_loopback() && self.token.is_none() {
+            return Err(
+                "non-loopback bind requires bearer authentication; --insecure-no-auth is loopback-only"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Loads token from `token_file` if `token` is None and `token_file` is specified.
     pub fn load_token_file(&mut self) -> std::io::Result<()> {
         if self.token.is_none() {
@@ -247,6 +263,28 @@ mod tests {
 
         cli.load_token_file().unwrap();
         assert_eq!(cli.token, Some("cli-token".to_string()));
+    }
+
+    #[test]
+    fn read_only_flag_parsed() {
+        let cli_default = Cli::try_parse_from(["gpt2omo"]).unwrap();
+        assert!(!cli_default.read_only);
+        let cli = Cli::try_parse_from(["gpt2omo", "--read-only"]).unwrap();
+        assert!(cli.read_only);
+    }
+
+    #[test]
+    fn remote_bind_requires_effective_bearer_authentication() {
+        let remote: std::net::SocketAddr = "0.0.0.0:18800".parse().unwrap();
+        let local: std::net::SocketAddr = "127.0.0.1:18800".parse().unwrap();
+        let mut cli = Cli {
+            insecure_no_auth: true,
+            ..Cli::default()
+        };
+        assert!(cli.validate_bind_security(&local).is_ok());
+        assert!(cli.validate_bind_security(&remote).is_err());
+        cli.token = Some("configured".into());
+        assert!(cli.validate_bind_security(&remote).is_ok());
     }
 
     #[test]

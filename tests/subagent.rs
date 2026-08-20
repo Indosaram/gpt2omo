@@ -100,11 +100,12 @@ fn cli_for(dir: &TempDir, scope_dir: std::path::PathBuf, endpoint: Option<String
         subagent_allow_remote: false,
         insecure_no_auth: true,
         allow_arbitrary_commands: false,
+        read_only: false,
     }
 }
 
 fn test_app(dir: &TempDir, endpoint: Option<String>) -> (axum::Router, WorkspaceMux, String) {
-    let scope_dir = dir.path().join("scopes");
+    let scope_dir = dir.path().with_extension("scopes");
     let mux = WorkspaceMux::new(dir.path(), &scope_dir).unwrap();
     let scope = mux
         .register(dir.path(), Some("subagent-test".into()))

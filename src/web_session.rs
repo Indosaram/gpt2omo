@@ -1,4 +1,5 @@
-use crate::orca::{close_browser_page, OrcaConfig};
+use crate::browser_pool::BrowserPool;
+use crate::security::BrowserBinding;
 use crate::tools::task_state::{
     load_delegation_lifecycle, release_session_retention, retain_session_with_lease,
     retained_session_expired,
@@ -10,20 +11,22 @@ use serde::Serialize;
 pub struct ExpiredSessionCleanup {
     pub scope_id: String,
     pub browser_page_id: Option<String>,
+    pub account_id: Option<String>,
+    pub browser_instance: Option<String>,
     pub scope_removed: bool,
     pub page_closed: bool,
     pub close_error: Option<String>,
 }
 
-#[derive(Clone, Debug)]
 struct ClaimedExpiredSession {
     scope_id: String,
-    browser_page_id: Option<String>,
+    browser: Option<BrowserBinding>,
+    _scope_lock: crate::WorkspaceScopeLock,
 }
 
 pub async fn cleanup_expired_retained_sessions(
     mux: &WorkspaceMux,
-    orca: &OrcaConfig,
+    browsers: &BrowserPool,
     now_ms: u64,
     legacy_ttl_ms: u64,
     exclude_scope_id: Option<&str>,
@@ -40,14 +43,34 @@ pub async fn cleanup_expired_retained_sessions(
             continue;
         };
 
-        let close_result = match claimed.browser_page_id.as_deref() {
-            Some(page) => close_browser_page(orca, page).await,
+        let close_result = match claimed.browser.as_ref() {
+            Some(binding) => browsers.close(binding).await,
             None => Ok(()),
+        };
+        let scope_removed = if close_result.is_ok() {
+            let workspace = mux.resolve(&claimed.scope_id)?;
+            release_session_retention(&workspace, &claimed.scope_id)
+                .map_err(crate::BridgeError::Path)?;
+            mux.remove(&claimed.scope_id)?;
+            true
+        } else {
+            false
         };
         cleaned.push(ExpiredSessionCleanup {
             scope_id: claimed.scope_id,
-            browser_page_id: claimed.browser_page_id,
-            scope_removed: true,
+            browser_page_id: claimed
+                .browser
+                .as_ref()
+                .map(|binding| binding.page_id.clone()),
+            account_id: claimed
+                .browser
+                .as_ref()
+                .map(|binding| binding.account_id.clone()),
+            browser_instance: claimed
+                .browser
+                .as_ref()
+                .map(|binding| binding.instance.clone()),
+            scope_removed,
             page_closed: close_result.is_ok(),
             close_error: close_result.err().map(|error| error.to_string()),
         });
@@ -62,7 +85,7 @@ fn claim_expired_retained_scope(
     now_ms: u64,
     legacy_ttl_ms: u64,
 ) -> Result<Option<ClaimedExpiredSession>> {
-    let Some(_lock) = mux.try_lock_scope(&listed_scope.scope_id)? else {
+    let Some(scope_lock) = mux.try_lock_scope(&listed_scope.scope_id)? else {
         return Ok(None);
     };
 
@@ -91,21 +114,23 @@ fn claim_expired_retained_scope(
         return Ok(None);
     }
 
-    release_session_retention(&workspace, &scope.scope_id).map_err(crate::BridgeError::Path)?;
-    mux.remove(&scope.scope_id)?;
     Ok(Some(ClaimedExpiredSession {
         scope_id: scope.scope_id,
-        browser_page_id: scope.browser_page_id,
+        browser: scope.browser,
+        _scope_lock: scope_lock,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orca::{BrowserDriverConfig, BrowserDriverKind};
     use crate::tools::task_state::{
         load_delegation_lifecycle, mark_session_retained, record_terminal_evidence,
         start_fresh_delegation_lifecycle, DelegationTerminalState,
     };
+    use crate::{BrowserBinding, LegacyAccountConfig};
+    use std::fs;
     use tempfile::tempdir;
 
     fn retained_scope_with_lease(
@@ -121,7 +146,12 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let state = tempdir().unwrap();
         let mux = WorkspaceMux::new(mount.path(), state.path()).unwrap();
-        let scope = mux.register_browser(&project, "page-a".into()).unwrap();
+        let scope = mux
+            .register_browser_binding(
+                &project,
+                BrowserBinding::new("default", BrowserDriverKind::Orca, "legacy", "page-a"),
+            )
+            .unwrap();
         let workspace = mux.resolve(&scope.scope_id).unwrap();
         start_fresh_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
         record_terminal_evidence(
@@ -152,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_retained_scope_is_atomically_released_and_removed() {
+    fn expired_retained_scope_claim_preserves_binding_until_browser_close_succeeds() {
         let (_mount, _state, mux, scope) = retained_scope_with_lease(60_000);
         let workspace = mux.resolve(&scope.scope_id).unwrap();
         let lifecycle = load_delegation_lifecycle(&workspace, &scope.scope_id)
@@ -163,13 +193,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(claimed.scope_id, scope.scope_id);
-        assert_eq!(claimed.browser_page_id.as_deref(), Some("page-a"));
-        assert!(mux.lookup(&scope.scope_id).is_err());
+        let binding = claimed.browser.unwrap();
+        assert_eq!(binding.account_id, "default");
+        assert_eq!(binding.instance, "legacy");
+        assert_eq!(binding.page_id, "page-a");
+        assert!(mux.lookup(&scope.scope_id).is_ok());
         let lifecycle = load_delegation_lifecycle(&workspace, &scope.scope_id)
             .unwrap()
             .unwrap();
-        assert!(!lifecycle.session_retained);
-        assert!(lifecycle.lease_expires_ms.is_none());
+        assert!(lifecycle.session_retained);
+        assert_eq!(lifecycle.lease_expires_ms, Some(expiry));
     }
 
     #[test]
@@ -202,5 +235,72 @@ mod tests {
             .unwrap();
         assert!(migrated.lease_expires_ms.is_some());
         assert!(mux.lookup(&scope.scope_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cleanup_uses_bound_account_instance_and_reports_missing_account_safely() {
+        let root = tempdir().unwrap();
+        let mount = root.path().join("mount");
+        let bridge = root.path().join("bridge");
+        let scopes = root.path().join("scopes");
+        let project = mount.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&bridge).unwrap();
+        let mux = WorkspaceMux::new(&mount, &scopes).unwrap();
+        let scope = mux
+            .register_browser_binding(
+                &project,
+                BrowserBinding::new(
+                    "removed",
+                    BrowserDriverKind::Orca,
+                    "instance-a",
+                    "same-page",
+                ),
+            )
+            .unwrap();
+        let workspace = mux.resolve(&scope.scope_id).unwrap();
+        start_fresh_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
+        record_terminal_evidence(
+            &workspace,
+            &scope.scope_id,
+            DelegationTerminalState::Completed,
+            Some("done"),
+        )
+        .unwrap();
+        let lifecycle = retain_session_with_lease(&workspace, &scope.scope_id, 1).unwrap();
+        let pool = BrowserPool::new(
+            &bridge,
+            &mount,
+            LegacyAccountConfig::default(),
+            BrowserDriverConfig::with_driver(
+                Some(BrowserDriverKind::Orca),
+                Some("orca".into()),
+                "active",
+                None,
+            ),
+        );
+        let cleaned = cleanup_expired_retained_sessions(
+            &mux,
+            &pool,
+            lifecycle.lease_expires_ms.unwrap(),
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].account_id.as_deref(), Some("removed"));
+        assert_eq!(cleaned[0].browser_instance.as_deref(), Some("instance-a"));
+        assert!(!cleaned[0].page_closed);
+        assert!(cleaned[0]
+            .close_error
+            .as_deref()
+            .is_some_and(|error| error.contains("BROWSER_ACCOUNT_UNAVAILABLE")));
+        assert!(!cleaned[0].scope_removed);
+        assert!(mux.lookup(&scope.scope_id).is_ok());
+        let lifecycle = load_delegation_lifecycle(&workspace, &scope.scope_id)
+            .unwrap()
+            .unwrap();
+        assert!(lifecycle.session_retained);
     }
 }

@@ -690,7 +690,7 @@ pub fn clear_delegation_lifecycle(
     }
 }
 
-fn record_readiness_evidence(
+pub fn record_readiness_evidence(
     ws: &Workspace,
     scope_id: &str,
 ) -> std::result::Result<DelegationLifecycle, String> {

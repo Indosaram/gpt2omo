@@ -190,13 +190,13 @@ Compiled binaries in `target/release/`:
 # Local development (default bind is 127.0.0.1:18800 and mount-root is .):
 ./target/release/gpt2omo
 
-# Non-loopback exposure (--token is MANDATORY for non-loopback exposure):
+# Non-loopback bridge-control exposure (--token protects `/events`):
 ./target/release/gpt2omo --bind 0.0.0.0:18800 --token "$OMO_BRIDGE_TOKEN"
 ```
 
-Or connect via Cloudflare Tunnel (`--token` is mandatory for non-loopback/remote access exposure):
+Or connect via Cloudflare Tunnel. MCP tool calls authenticate with the per-delegation `scope_id`; do not configure a static Authorization header in the ChatGPT MCP connector. If a local relay subscribes to `/events`, keep its control token configured:
 ```bash
-# Start daemon with mandatory token authentication:
+# Start daemon with an optional relay-control token:
 ./target/release/gpt2omo --token "$OMO_BRIDGE_TOKEN"
 
 # Forward loopback traffic through tunnel:

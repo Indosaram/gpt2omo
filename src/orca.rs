@@ -21,13 +21,14 @@ pub const MAX_RESET_AFTER_SECONDS: u64 = 31 * 24 * 60 * 60;
 pub enum BrowserDriverKind {
     Maho,
     Orca,
+    Cmux,
     AgentBrowser,
     Aside,
 }
 
 impl BrowserDriverKind {
     pub fn supports_chatgpt_dom_probe(self) -> bool {
-        matches!(self, Self::Orca | Self::AgentBrowser)
+        matches!(self, Self::Orca | Self::Cmux | Self::AgentBrowser)
     }
 }
 
@@ -36,6 +37,7 @@ impl std::fmt::Display for BrowserDriverKind {
         match self {
             Self::Maho => write!(f, "maho"),
             Self::Orca => write!(f, "orca"),
+            Self::Cmux => write!(f, "cmux"),
             Self::AgentBrowser => write!(f, "agent-browser"),
             Self::Aside => write!(f, "aside"),
         }
@@ -49,10 +51,11 @@ impl std::str::FromStr for BrowserDriverKind {
         match s.to_lowercase().trim() {
             "maho" => Ok(Self::Maho),
             "orca" => Ok(Self::Orca),
+            "cmux" => Ok(Self::Cmux),
             "agent-browser" | "agent_browser" => Ok(Self::AgentBrowser),
             "aside" => Ok(Self::Aside),
             other => Err(anyhow!(
-                "unsupported browser driver '{other}'; supported: maho, orca, agent-browser, aside"
+                "unsupported browser driver '{other}'; supported: maho, orca, cmux, agent-browser, aside"
             )),
         }
     }
@@ -195,6 +198,7 @@ impl BrowserDriverConfig {
                     resolve_maho_bin().unwrap_or_else(|| PathBuf::from("maho"))
                 }
                 BrowserDriverKind::Orca => PathBuf::from("orca"),
+                BrowserDriverKind::Cmux => PathBuf::from("cmux"),
                 BrowserDriverKind::AgentBrowser => PathBuf::from("agent-browser"),
                 BrowserDriverKind::Aside => PathBuf::from("aside"),
             };
@@ -283,15 +287,16 @@ const CHATGPT_UI_PROBE_EXPRESSION: &str = r#"(() => {
     .map((el) => (el.innerText || el.textContent || '').trim().toLowerCase())
     .filter(Boolean);
 
-  const composer = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], textarea[placeholder]');
-  const sendButton = document.querySelector('button[data-testid="send-button"], button[aria-label="Send prompt"], #composer-submit-button');
-  const stopButton = document.querySelector('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop answering"]');
+  const firstVisible = (selector) => Array.from(document.querySelectorAll(selector)).find(isVisible) || null;
+  const composer = firstVisible('#prompt-textarea, [data-testid="composer-text-input"], textarea[placeholder], [contenteditable="true"]');
+  const sendButton = firstVisible('button[data-testid="send-button"], button[aria-label="Send prompt"], #composer-submit-button');
+  const stopButton = firstVisible('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop answering"]');
   const composerDisabled = !!(
     (composer && (composer.disabled || composer.getAttribute('aria-disabled') === 'true')) ||
     (sendButton && (sendButton.disabled || sendButton.getAttribute('aria-disabled') === 'true'))
   );
-  const generating = !!stopButton && isVisible(stopButton);
-  const ready = !!composer && isVisible(composer);
+  const generating = !!stopButton;
+  const ready = !!composer;
 
   const rateReason = (text) => {
     if (/\btoo many (?:requests|messages)\b|\brate limit(?:ed| reached)?\b|\bmaking requests too quickly\b|\btemporarily limited access\b|\blimited access to your conversations\b|\bwait a few minutes before trying again\b/.test(text)) return 'too_many_requests';
@@ -344,6 +349,19 @@ const CHATGPT_UI_PROBE_EXPRESSION: &str = r#"(() => {
     delivery_recoverable: deliveryRecoverable,
     authentication_required: authRequired
   };
+})()"#;
+
+const CHATGPT_SEND_EXPRESSION: &str = r#"(() => {
+  const visible = (candidate) => {
+    if (!candidate || !(candidate instanceof Element)) return false;
+    const style = window.getComputedStyle(candidate);
+    const rect = candidate.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+  };
+  const btn = Array.from(document.querySelectorAll('button[data-testid="send-button"], button[aria-label="Send prompt"], #composer-submit-button')).find(visible);
+  if (!btn || btn.disabled) return { ok: false, error: 'no_send_button' };
+  btn.click();
+  return { ok: true };
 })()"#;
 
 pub async fn probe_chatgpt_ui_condition(
@@ -417,9 +435,48 @@ pub async fn create_chatgpt_tab(config: &BrowserDriverConfig) -> Result<String> 
     match kind {
         BrowserDriverKind::Maho => create_chatgpt_tab_maho(&bin, config).await,
         BrowserDriverKind::Orca => create_chatgpt_tab_orca(&bin, config).await,
+        BrowserDriverKind::Cmux => create_chatgpt_tab_cmux(&bin, config).await,
         BrowserDriverKind::AgentBrowser => create_chatgpt_tab_agent_browser(&bin).await,
         BrowserDriverKind::Aside => create_chatgpt_tab_aside(&bin).await,
     }
+}
+
+async fn create_chatgpt_tab_cmux(bin: &PathBuf, config: &BrowserDriverConfig) -> Result<String> {
+    let args = cmux_new_browser_surface_args(&config.worktree);
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let result = run_command_json(bin, &args).await?;
+    let page = cmux_surface_ref(&result)?;
+
+    if let Err(error) = wait_for_chatgpt_prompt(config, &page).await {
+        let _ = close_browser_page(config, &page).await;
+        return Err(error);
+    }
+    Ok(page)
+}
+
+fn cmux_new_browser_surface_args(worktree: &str) -> Vec<String> {
+    let mut args = vec![
+        "--json".into(),
+        "new-surface".into(),
+        "--type".into(),
+        "browser".into(),
+        "--url".into(),
+        "https://chatgpt.com".into(),
+    ];
+    if worktree.trim() != "active" {
+        args.extend(["--workspace".into(), worktree.into()]);
+    }
+    args.extend(["--focus".into(), "false".into()]);
+    args
+}
+
+fn cmux_close_surface_args(worktree: &str, page: &str) -> Vec<String> {
+    let mut args = vec!["--json".into(), "close-surface".into()];
+    if worktree.trim() != "active" {
+        args.extend(["--workspace".into(), worktree.into()]);
+    }
+    args.extend(["--surface".into(), page.into()]);
+    args
 }
 
 async fn create_chatgpt_tab_maho(bin: &PathBuf, config: &BrowserDriverConfig) -> Result<String> {
@@ -457,6 +514,18 @@ fn value_as_identifier(value: &Value) -> Option<String> {
         Value::Number(number) => Some(number.to_string()),
         _ => None,
     }
+}
+
+fn cmux_surface_ref(result: &Value) -> Result<String> {
+    result
+        .pointer("/surface/ref")
+        .or_else(|| result.pointer("/result/surface/ref"))
+        .or_else(|| result.pointer("/surface_ref"))
+        .or_else(|| result.pointer("/result/surface_ref"))
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("surface:"))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("cmux browser surface creation returned no surface ref: {result}"))
 }
 
 async fn create_chatgpt_tab_orca(bin: &PathBuf, config: &BrowserDriverConfig) -> Result<String> {
@@ -529,6 +598,12 @@ pub async fn close_browser_page(config: &BrowserDriverConfig, page: &str) -> Res
             }
             Ok(())
         }
+        BrowserDriverKind::Cmux => {
+            let args = cmux_close_surface_args(&config.worktree, page);
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let _ = run_command_json(&bin, &args).await?;
+            Ok(())
+        }
         BrowserDriverKind::AgentBrowser => {
             let _ = run_command_json(&bin, &["--session", page, "close", "--json"]).await;
             Ok(())
@@ -547,12 +622,21 @@ pub async fn verify_chatgpt_page(
     if page.trim().is_empty() {
         return Err(anyhow!("browser_page_id cannot be empty"));
     }
-    let expression = r#"(() => ({
-  ready: !!(document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]')),
+    let expression = r#"(() => {
+  const visible = (el) => {
+    if (!el || !(el instanceof Element)) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+  };
+  const composer = Array.from(document.querySelectorAll('#prompt-textarea, [data-testid="composer-text-input"], textarea[placeholder], [contenteditable="true"]')).find(visible);
+  return {
+  ready: !!composer,
   generating: !!document.querySelector('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop answering"]'),
   url: location.href,
   title: document.title
-}))()"#;
+};
+})()"#;
     let value = eval_json(config, page, expression).await?;
     validate_chatgpt_page_probe(&value)
 }
@@ -570,7 +654,13 @@ pub async fn send_chatgpt_prompt(
     let prompt_json = serde_json::to_string(prompt)?;
     let insert_expression = format!(
         r#"(() => {{
-  const el = document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
+  const visible = (candidate) => {{
+    if (!candidate || !(candidate instanceof Element)) return false;
+    const style = window.getComputedStyle(candidate);
+    const rect = candidate.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+  }};
+  const el = Array.from(document.querySelectorAll('#prompt-textarea, [data-testid="composer-text-input"], textarea[placeholder], [contenteditable="true"]')).find(visible);
   if (!el) return {{ ok: false, error: 'no_textbox' }};
   el.focus();
   document.execCommand('selectAll', false, null);
@@ -586,13 +676,7 @@ pub async fn send_chatgpt_prompt(
     }
 
     sleep(Duration::from_millis(250)).await;
-    let send_expression = r#"(() => {
-  const btn = document.querySelector('button[data-testid="send-button"], button[aria-label="Send prompt"], #composer-submit-button');
-  if (!btn || btn.disabled) return { ok: false, error: 'no_send_button' };
-  btn.click();
-  return { ok: true };
-})()"#;
-    let sent = eval_json(config, page, send_expression).await?;
+    let sent = eval_json(config, page, CHATGPT_SEND_EXPRESSION).await?;
     if sent.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(anyhow!("unable to send ChatGPT prompt: {sent}"));
     }
@@ -626,8 +710,13 @@ async fn wait_for_chatgpt_prompt(config: &BrowserDriverConfig, page: &str) -> Re
     sleep(Duration::from_millis(500)).await;
 
     let probe_expr = r#"(() => {
-        const el = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], textarea[placeholder], [contenteditable="true"]');
-        return !!el;
+        const visible = (candidate) => {
+            if (!candidate || !(candidate instanceof Element)) return false;
+            const style = window.getComputedStyle(candidate);
+            const rect = candidate.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+        };
+        return Array.from(document.querySelectorAll('#prompt-textarea, [data-testid="composer-text-input"], textarea[placeholder], [contenteditable="true"]')).some(visible);
     })()"#;
 
     loop {
@@ -701,6 +790,16 @@ async fn eval_json(config: &BrowserDriverConfig, page: &str, expression: &str) -
                 return decode_eval_value(val);
             }
             Err(anyhow!("agent-browser eval returned no result"))
+        }
+        BrowserDriverKind::Cmux => {
+            let result =
+                run_command_json(&bin, &["--json", "browser", page, "eval", expression]).await?;
+            let raw = result
+                .pointer("/result")
+                .or_else(|| result.pointer("/value"))
+                .or_else(|| result.pointer("/data/result"))
+                .ok_or_else(|| anyhow!("cmux browser eval returned no result: {result}"))?;
+            decode_eval_value(raw)
         }
         BrowserDriverKind::Maho | BrowserDriverKind::Aside => {
             if is_executable_in_path("orca").await {
@@ -1061,6 +1160,88 @@ mod tests {
             "aside".parse::<BrowserDriverKind>().unwrap(),
             BrowserDriverKind::Aside
         );
+        assert_eq!(
+            "cmux".parse::<BrowserDriverKind>().unwrap(),
+            BrowserDriverKind::Cmux
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_cmux_driver_uses_cmux_binary() {
+        let config = BrowserDriverConfig::with_driver(
+            Some(BrowserDriverKind::Cmux),
+            None,
+            "workspace:6",
+            None,
+        );
+
+        assert_eq!(
+            config.detect().await.unwrap(),
+            (BrowserDriverKind::Cmux, PathBuf::from("cmux"))
+        );
+    }
+
+    #[test]
+    fn cmux_surface_creation_requires_a_surface_reference() {
+        let result = serde_json::json!({"surface":{"ref":"surface:42"}});
+        assert_eq!(cmux_surface_ref(&result).unwrap(), "surface:42");
+
+        let missing_ref = serde_json::json!({"surface":{"ref":"browser:42"}});
+        assert!(cmux_surface_ref(&missing_ref).is_err());
+    }
+
+    #[test]
+    fn cmux_active_workspace_uses_the_current_workspace() {
+        let args = cmux_new_browser_surface_args("active");
+        assert!(!args.iter().any(|argument| argument == "--workspace"));
+        assert_eq!(
+            args,
+            vec![
+                "--json",
+                "new-surface",
+                "--type",
+                "browser",
+                "--url",
+                "https://chatgpt.com",
+                "--focus",
+                "false",
+            ]
+        );
+    }
+
+    #[test]
+    fn cmux_explicit_workspace_is_forwarded_to_surface_creation() {
+        let args = cmux_new_browser_surface_args("workspace:7");
+        assert_eq!(
+            args,
+            vec![
+                "--json",
+                "new-surface",
+                "--type",
+                "browser",
+                "--url",
+                "https://chatgpt.com",
+                "--workspace",
+                "workspace:7",
+                "--focus",
+                "false",
+            ]
+        );
+    }
+
+    #[test]
+    fn cmux_surface_close_uses_its_configured_workspace() {
+        assert_eq!(
+            cmux_close_surface_args("workspace:7", "surface:43"),
+            vec![
+                "--json",
+                "close-surface",
+                "--workspace",
+                "workspace:7",
+                "--surface",
+                "surface:43",
+            ]
+        );
     }
 
     #[test]
@@ -1069,6 +1250,7 @@ mod tests {
         assert!(CHATGPT_UI_PROBE_EXPRESSION.contains("article"));
         assert!(CHATGPT_UI_PROBE_EXPRESSION.contains("conversation-turn"));
         assert!(CHATGPT_UI_PROBE_EXPRESSION.contains("isConversationRegion"));
+        assert!(CHATGPT_UI_PROBE_EXPRESSION.contains("firstVisible"));
         assert!(!CHATGPT_UI_PROBE_EXPRESSION.contains("document.body"));
     }
 
@@ -1166,6 +1348,12 @@ mod tests {
         let prompt = "test prompt with \"quotes\" and \n newlines";
         let prompt_json = serde_json::to_string(prompt).unwrap();
         assert!(prompt_json.starts_with('"') && prompt_json.ends_with('"'));
+    }
+
+    #[test]
+    fn cmux_send_expression_contains_valid_object_braces() {
+        assert!(!CHATGPT_SEND_EXPRESSION.contains("{{"));
+        assert!(!CHATGPT_SEND_EXPRESSION.contains("}}"));
     }
 
     #[tokio::test]

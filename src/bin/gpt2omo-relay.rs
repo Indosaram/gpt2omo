@@ -2,14 +2,19 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::StreamExt;
 use gpt2omo::orca::{
-    resolve_terminal, resolve_terminal_for_marker, send_chatgpt_prompt, send_prompt, OrcaConfig,
+    resolve_terminal, resolve_terminal_for_marker, send_chatgpt_prompt, send_prompt,
+    BrowserDriverKind, OrcaConfig,
 };
 use gpt2omo::server::sanitize_continuation_prompt;
 use gpt2omo::web_session::cleanup_expired_retained_sessions;
-use gpt2omo::{default_scope_dir, WorkspaceMux};
+use gpt2omo::{
+    default_bridge_base_dir, default_scope_dir, BrowserInstanceConfig, BrowserPool,
+    LegacyAccountConfig, WorkspaceMux,
+};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
@@ -42,21 +47,29 @@ struct Cli {
     #[arg(long, env = "OMO_SCOPE_DIR")]
     scope_dir: Option<PathBuf>,
 
-    /// Orca worktree selector used for browser pages and legacy terminal discovery.
-    #[arg(long, default_value = "active")]
+    /// Browser workspace selector used for browser pages and legacy terminal discovery.
+    #[arg(long, default_value = "active", env = "OMO_BROWSER_WORKSPACE")]
     worktree: String,
 
     /// Pin a terminal only for --resolve-only or legacy terminal-scoped delegations.
     #[arg(long, env = "OMO_RELAY_TERMINAL")]
     terminal: Option<String>,
 
-    /// Orca CLI executable.
-    #[arg(long, default_value = "orca")]
+    /// Browser CLI executable for the configured legacy driver.
+    #[arg(long, default_value = "orca", env = "OMO_BROWSER_BIN")]
     orca_bin: String,
+
+    /// Browser driver for the legacy account when accounts.json is absent.
+    #[arg(long, env = "OMO_BROWSER_DRIVER")]
+    browser_driver: Option<BrowserDriverKind>,
 
     /// Optional bearer token used by gpt2omo.
     #[arg(long, env = "OMO_BRIDGE_TOKEN")]
     token: Option<String>,
+
+    /// Optional path to a file containing the bearer token used by gpt2omo.
+    #[arg(long, env = "OMO_BRIDGE_TOKEN_FILE")]
+    token_file: Option<PathBuf>,
 
     /// Resolve and print the generic orchestrator terminal without subscribing.
     #[arg(long)]
@@ -88,12 +101,29 @@ struct Cli {
 }
 
 impl Cli {
+    fn load_token_file(&mut self) -> Result<()> {
+        if self.token.is_none() {
+            if let Some(path) = self.token_file.as_deref() {
+                self.token = Some(fs::read_to_string(path)?.trim().to_string());
+            }
+        }
+        Ok(())
+    }
+
     fn orca(&self) -> OrcaConfig {
-        OrcaConfig::new(
+        OrcaConfig::with_driver(
+            self.browser_driver,
+            Some(self.orca_bin.clone().into()),
             self.worktree.clone(),
             self.terminal.clone(),
-            self.orca_bin.clone(),
         )
+    }
+
+    fn legacy_account(&self) -> LegacyAccountConfig {
+        LegacyAccountConfig {
+            browser: BrowserInstanceConfig::legacy(self.worktree.clone()),
+            ..LegacyAccountConfig::default()
+        }
     }
 }
 
@@ -130,7 +160,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.load_token_file()?;
     let orca = cli.orca();
     if cli.resolve_only {
         println!("{}", resolve_terminal(&orca).await?);
@@ -150,6 +181,13 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_scope_dir(port));
     let mux = WorkspaceMux::new(&cli.mount_root, &scope_dir)?;
+    let browsers = BrowserPool::new(
+        default_bridge_base_dir(),
+        cli.mount_root.clone(),
+        cli.legacy_account(),
+        orca.clone(),
+    );
+    browsers.provision_profiles()?;
     info!(
         scope_dir = %scope_dir.display(),
         session_ttl_minutes = cli.session_ttl_minutes,
@@ -158,10 +196,10 @@ async fn main() -> Result<()> {
     );
 
     if !cli.dry_run {
-        run_session_gc(&mux, &orca, ttl_ms).await;
+        run_session_gc(&mux, &browsers, ttl_ms).await;
         spawn_session_janitor(
             mux.clone(),
-            orca.clone(),
+            browsers.clone(),
             ttl_ms,
             cli.session_gc_interval_secs,
         );
@@ -173,7 +211,16 @@ async fn main() -> Result<()> {
     let mut last_continuation_seq = HashMap::<String, u64>::new();
 
     loop {
-        match consume_events(&client, &cli, &orca, &mux, &mut last_continuation_seq).await {
+        match consume_events(
+            &client,
+            &cli,
+            &orca,
+            &browsers,
+            &mux,
+            &mut last_continuation_seq,
+        )
+        .await
+        {
             Ok(()) => warn!("event stream closed; reconnecting"),
             Err(error) => warn!(error = %error, "event stream failed; reconnecting"),
         }
@@ -181,31 +228,40 @@ async fn main() -> Result<()> {
     }
 }
 
-fn spawn_session_janitor(mux: WorkspaceMux, orca: OrcaConfig, ttl_ms: u64, interval_secs: u64) {
+fn spawn_session_janitor(
+    mux: WorkspaceMux,
+    browsers: BrowserPool,
+    ttl_ms: u64,
+    interval_secs: u64,
+) {
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(interval_secs)).await;
-            run_session_gc(&mux, &orca, ttl_ms).await;
+            run_session_gc(&mux, &browsers, ttl_ms).await;
         }
     });
 }
 
-async fn run_session_gc(mux: &WorkspaceMux, orca: &OrcaConfig, ttl_ms: u64) {
-    match cleanup_expired_retained_sessions(mux, orca, epoch_ms(), ttl_ms, None).await {
+async fn run_session_gc(mux: &WorkspaceMux, browsers: &BrowserPool, ttl_ms: u64) {
+    match cleanup_expired_retained_sessions(mux, browsers, epoch_ms(), ttl_ms, None).await {
         Ok(cleaned) => {
             for session in cleaned {
                 if let Some(error) = session.close_error {
                     warn!(
                         scope_id = %session.scope_id,
+                        account_id = ?session.account_id,
+                        browser_instance = ?session.browser_instance,
                         browser_page_id = ?session.browser_page_id,
                         error = %error,
-                        "expired retained Web scope was removed but browser tab close failed"
+                        "expired retained Web scope was removed but bound browser tab close failed"
                     );
                 } else {
                     info!(
                         scope_id = %session.scope_id,
+                        account_id = ?session.account_id,
+                        browser_instance = ?session.browser_instance,
                         browser_page_id = ?session.browser_page_id,
-                        "expired retained Web session closed"
+                        "expired retained Web session closed on its bound browser instance"
                     );
                 }
             }
@@ -218,6 +274,7 @@ async fn consume_events(
     client: &reqwest::Client,
     cli: &Cli,
     orca: &OrcaConfig,
+    browsers: &BrowserPool,
     mux: &WorkspaceMux,
     last_continuation_seq: &mut HashMap<String, u64>,
 ) -> Result<()> {
@@ -256,9 +313,16 @@ async fn consume_events(
                 if let Some(parsed) = frame.take_json() {
                     match parsed {
                         Ok((event, payload)) => {
-                            if let Err(error) =
-                                handle_event(cli, orca, mux, last_continuation_seq, &event, payload)
-                                    .await
+                            if let Err(error) = handle_event(
+                                cli,
+                                orca,
+                                browsers,
+                                mux,
+                                last_continuation_seq,
+                                &event,
+                                payload,
+                            )
+                            .await
                             {
                                 warn!(event, error = %error, "failed to process SSE event; continuing stream");
                             }
@@ -288,6 +352,7 @@ async fn consume_events(
 async fn handle_event(
     cli: &Cli,
     orca: &OrcaConfig,
+    browsers: &BrowserPool,
     mux: &WorkspaceMux,
     last_continuation_seq: &mut HashMap<String, u64>,
     event: &str,
@@ -312,7 +377,7 @@ async fn handle_event(
             info!(scope_id, ready, "completion state received");
         }
         "continuation_required" => {
-            relay_continuation(cli, orca, mux, last_continuation_seq, &payload).await?;
+            relay_continuation(cli, orca, browsers, mux, last_continuation_seq, &payload).await?;
         }
         "lagged" => {
             warn!(payload = %payload, "SSE subscriber lagged; scope task_state should be reconciled")
@@ -325,6 +390,7 @@ async fn handle_event(
 async fn relay_continuation(
     cli: &Cli,
     orca: &OrcaConfig,
+    browsers: &BrowserPool,
     mux: &WorkspaceMux,
     last_continuation_seq: &mut HashMap<String, u64>,
     payload: &Value,
@@ -364,25 +430,52 @@ async fn relay_continuation(
     }
 
     let scope = continuation_scope(mux, scope_id)?;
-    if let Some(page) = scope.browser_page_id.as_deref() {
+    if let Some(binding) = scope.browser.as_ref() {
         if cli.dry_run {
-            info!(scope_id, seq, browser_page_id = page, prompt = %prompt, "dry-run continuation relay to ChatGPT Web");
+            info!(
+                scope_id,
+                seq,
+                account_id = %binding.account_id,
+                browser_instance = %binding.instance,
+                browser_page_id = %binding.page_id,
+                prompt = %prompt,
+                "dry-run continuation relay to bound ChatGPT Web instance"
+            );
         } else {
-            send_chatgpt_prompt(orca, page, &prompt)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to relay continuation directly to ChatGPT Web page {page} for scope {scope_id}"
-                    )
-                })?;
+            browsers.send(binding, &prompt).await.with_context(|| {
+                format!(
+                    "failed to relay continuation to account '{}' instance '{}' page '{}' for scope {}",
+                    binding.account_id, binding.instance, binding.page_id, scope_id
+                )
+            })?;
         }
         last_continuation_seq.insert(scope_id.to_string(), last.max(seq));
         info!(
             scope_id,
             seq,
-            browser_page_id = page,
-            "continuation relayed directly to ChatGPT Web"
+            account_id = %binding.account_id,
+            browser_instance = %binding.instance,
+            browser_page_id = %binding.page_id,
+            "continuation relayed to exact bound ChatGPT Web instance"
         );
+        return Ok(());
+    }
+
+    if let Some(page) = scope.browser_page_id.as_deref() {
+        // V1 browser scopes have no account/instance identity. Preserve single-account compatibility,
+        // but never use this path for V2 multi-account bindings.
+        if cli.dry_run {
+            info!(scope_id, seq, browser_page_id = page, prompt = %prompt, "dry-run legacy V1 browser continuation relay");
+        } else {
+            send_chatgpt_prompt(orca, page, &prompt)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to relay legacy V1 continuation directly to ChatGPT Web page {page} for scope {scope_id}"
+                    )
+                })?;
+        }
+        last_continuation_seq.insert(scope_id.to_string(), last.max(seq));
         return Ok(());
     }
 
@@ -402,7 +495,7 @@ async fn relay_continuation(
             }
             None => {
                 return Err(marker_error
-                    .context("scope has neither browser page nor stored terminal fallback"))
+                    .context("scope has neither browser binding nor stored terminal fallback"))
             }
         },
     };
@@ -497,33 +590,43 @@ mod tests {
     }
 
     #[test]
-    fn continuation_scope_routes_each_scope_to_its_exact_browser_page_id() {
+    fn continuation_scope_routes_each_scope_to_its_exact_browser_binding() {
         let mount = tempdir().unwrap();
         let project = mount.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let states = tempdir().unwrap();
         let mux = WorkspaceMux::new(mount.path(), states.path()).unwrap();
         let first = mux
-            .register_browser(&project, "browser-page-a".into())
+            .register_browser_binding(
+                &project,
+                gpt2omo::BrowserBinding::new(
+                    "a",
+                    gpt2omo::orca::BrowserDriverKind::Orca,
+                    "ia",
+                    "same",
+                ),
+            )
             .unwrap();
         let second = mux
-            .register_browser(&project, "browser-page-b".into())
+            .register_browser_binding(
+                &project,
+                gpt2omo::BrowserBinding::new(
+                    "b",
+                    gpt2omo::orca::BrowserDriverKind::Orca,
+                    "ib",
+                    "same",
+                ),
+            )
             .unwrap();
 
-        assert_eq!(
-            continuation_scope(&mux, &first.scope_id)
-                .unwrap()
-                .browser_page_id
-                .as_deref(),
-            Some("browser-page-a")
-        );
-        assert_eq!(
-            continuation_scope(&mux, &second.scope_id)
-                .unwrap()
-                .browser_page_id
-                .as_deref(),
-            Some("browser-page-b")
-        );
+        let a = continuation_scope(&mux, &first.scope_id).unwrap();
+        let b = continuation_scope(&mux, &second.scope_id).unwrap();
+        assert_eq!(a.browser.as_ref().unwrap().account_id, "a");
+        assert_eq!(a.browser.as_ref().unwrap().instance, "ia");
+        assert_eq!(a.browser.as_ref().unwrap().page_id, "same");
+        assert_eq!(b.browser.as_ref().unwrap().account_id, "b");
+        assert_eq!(b.browser.as_ref().unwrap().instance, "ib");
+        assert_eq!(b.browser.as_ref().unwrap().page_id, "same");
     }
 
     #[test]
@@ -552,5 +655,22 @@ mod tests {
             7_200_000
         );
         assert!(session_ttl_ms(0).is_err());
+    }
+
+    #[test]
+    fn token_file_populates_token_when_direct_token_is_absent() {
+        let dir = tempdir().unwrap();
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, " relay-token\n").unwrap();
+        let mut cli = Cli::try_parse_from([
+            "gpt2omo-relay",
+            "--token-file",
+            token_file.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        cli.load_token_file().unwrap();
+
+        assert_eq!(cli.token.as_deref(), Some("relay-token"));
     }
 }

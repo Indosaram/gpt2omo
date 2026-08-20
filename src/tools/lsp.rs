@@ -383,7 +383,8 @@ fn release_session(key: (PathBuf, String), mut session: LspSession) {
 
 /// Terminate all pooled LSP servers for a specific workspace root.
 pub fn terminate_workspace_lsp(workspace_root: &Path) -> usize {
-    let canonical = dunce::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical =
+        dunce::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     let mut terminated = 0;
     if let Ok(mut guard) = SESSION_CACHE.lock() {
         let mut keys_to_remove = Vec::new();
@@ -411,7 +412,9 @@ pub fn terminate_idle_lsp(max_idle: Duration) -> usize {
         for sessions in guard.values_mut() {
             let mut active = Vec::new();
             for mut pooled in sessions.drain(..) {
-                if now.saturating_duration_since(pooled.last_used) > max_idle || !pooled.session.is_alive() {
+                if now.saturating_duration_since(pooled.last_used) > max_idle
+                    || !pooled.session.is_alive()
+                {
                     pooled.session.terminate();
                     terminated += 1;
                 } else {
@@ -762,6 +765,8 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    static SESSION_POOL_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
     #[test]
     fn maps_supported_extensions() {
         let rust = detect_server(Path::new("a.rs")).unwrap();
@@ -838,6 +843,7 @@ mod tests {
 
     #[test]
     fn pool_acquire_and_release_lifecycle() {
+        let _pool_lock = SESSION_POOL_TEST_LOCK.lock().unwrap();
         shutdown_lsp_pool();
         assert_eq!(lsp_pool_size(), 0);
 
@@ -856,6 +862,7 @@ mod tests {
 
     #[test]
     fn pool_stores_and_terminates_spawned_session() {
+        let _pool_lock = SESSION_POOL_TEST_LOCK.lock().unwrap();
         shutdown_lsp_pool();
         let temp_dir = tempfile::tempdir().unwrap();
         let ws_path = dunce::canonicalize(temp_dir.path()).unwrap();
@@ -866,7 +873,8 @@ mod tests {
             language_id: "test".into(),
         };
 
-        let session = LspSession::spawn(&spec, &ws_path).expect("failed to spawn cat dummy session");
+        let session =
+            LspSession::spawn(&spec, &ws_path).expect("failed to spawn cat dummy session");
         let key = (ws_path.clone(), "dummy-cat".to_string());
 
         // Pool was empty
@@ -896,6 +904,7 @@ mod tests {
 
     #[test]
     fn pool_idle_reaping_and_shutdown() {
+        let _pool_lock = SESSION_POOL_TEST_LOCK.lock().unwrap();
         shutdown_lsp_pool();
         let temp_dir = tempfile::tempdir().unwrap();
         let ws_path = dunce::canonicalize(temp_dir.path()).unwrap();

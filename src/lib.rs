@@ -1,20 +1,37 @@
+pub mod account_diagnostics;
+pub mod account_state;
+pub mod accounts;
+pub mod browser_pool;
 pub mod cli;
 pub mod error;
 pub mod events;
 pub mod mass_ulw_web;
 pub mod orca;
+pub mod router;
 pub mod security;
 pub mod server;
 pub mod telemetry;
 pub mod tools;
 pub mod web_session;
 
+pub use account_diagnostics::{
+    collect_account_diagnostics, recover_stale_account_health, AccountDiagnostic,
+    AccountDiagnosticsReport, AccountRoutingState, ACCOUNT_DIAGNOSTICS_VERSION,
+};
+pub use accounts::{
+    AccountConfig, AccountDefaults, AccountLimits, AccountsConfig, BrowserInstanceConfig,
+    CooldownConfig, LegacyAccountConfig, RoutingConfig, RoutingStrategy, LEGACY_ACCOUNT_ID,
+};
+pub use browser_pool::{
+    BrowserHealth, BrowserLoginState, BrowserPool, BrowserReachability, BrowserTarget, PageHandle,
+};
 pub use cli::Cli;
 pub use error::{BridgeError, Result};
 pub use events::{EventBus, HarnessEvent};
+pub use router::{AccountRouter, RouteReservation, RouterError, RoutingExhausted};
 pub use security::{
-    default_bridge_base_dir, default_scope_dir, Workspace, WorkspaceMux, WorkspaceScope,
-    WorkspaceScopeLock,
+    default_bridge_base_dir, default_scope_dir, BrowserBinding, Workspace, WorkspaceMux,
+    WorkspaceScope, WorkspaceScopeLock,
 };
 pub use server::{create_router, AppState};
 

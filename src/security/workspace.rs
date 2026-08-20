@@ -1,4 +1,6 @@
+use crate::accounts::LEGACY_ACCOUNT_ID;
 use crate::error::{BridgeError, Result};
+use crate::orca::BrowserDriverKind;
 use crate::security::PathPolicy;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
@@ -71,17 +73,68 @@ impl Workspace {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserBinding {
+    pub account_id: String,
+    pub driver: BrowserDriverKind,
+    pub instance: String,
+    pub page_id: String,
+}
+
+impl BrowserBinding {
+    pub fn new(
+        account_id: impl Into<String>,
+        driver: BrowserDriverKind,
+        instance: impl Into<String>,
+        page_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            account_id: account_id.into(),
+            driver,
+            instance: instance.into(),
+            page_id: page_id.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceScope {
     pub version: u32,
     pub scope_id: String,
     pub workspace: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<BrowserBinding>,
+    // V1 compatibility field. V2 writes only `browser`; lookup repopulates this in-memory
+    // compatibility view so existing callers can continue using the exact page id.
+    #[serde(default, skip_serializing)]
     pub browser_page_id: Option<String>,
     pub created_ms: u64,
     pub updated_ms: u64,
+}
+
+impl WorkspaceScope {
+    pub fn account_id(&self) -> &str {
+        self.browser
+            .as_ref()
+            .map(|binding| binding.account_id.as_str())
+            .unwrap_or(LEGACY_ACCOUNT_ID)
+    }
+
+    pub fn browser_instance(&self) -> Option<&str> {
+        self.browser
+            .as_ref()
+            .map(|binding| binding.instance.as_str())
+    }
+
+    pub fn page_id(&self) -> Option<&str> {
+        self.browser
+            .as_ref()
+            .map(|binding| binding.page_id.as_str())
+            .or(self.browser_page_id.as_deref())
+    }
 }
 
 pub struct WorkspaceScopeLock {
@@ -108,9 +161,14 @@ impl WorkspaceMux {
             return Err(BridgeError::Path("Mount root must be a directory".into()));
         }
 
+        fs::create_dir_all(scope_dir.as_ref())?;
+        let scope_dir = dunce::canonicalize(scope_dir.as_ref()).map_err(|e| {
+            BridgeError::Path(format!("Failed to canonicalize scope directory: {}", e))
+        })?;
+
         Ok(Self {
             mount_root,
-            scope_dir: scope_dir.as_ref().to_path_buf(),
+            scope_dir,
         })
     }
 
@@ -136,8 +194,25 @@ impl WorkspaceMux {
         workspace: impl AsRef<Path>,
         browser_page_id: String,
     ) -> Result<WorkspaceScope> {
+        self.register_browser_binding(
+            workspace,
+            BrowserBinding::new(
+                LEGACY_ACCOUNT_ID,
+                BrowserDriverKind::Orca,
+                "legacy",
+                browser_page_id,
+            ),
+        )
+    }
+
+    pub fn register_browser_binding(
+        &self,
+        workspace: impl AsRef<Path>,
+        browser: BrowserBinding,
+    ) -> Result<WorkspaceScope> {
+        validate_browser_binding(&browser)?;
         let scope_id = uuid::Uuid::new_v4().to_string();
-        self.register_with_id(&scope_id, workspace, None, Some(browser_page_id))
+        self.register_with_id(&scope_id, workspace, None, Some(browser))
     }
 
     fn register_with_id(
@@ -145,23 +220,24 @@ impl WorkspaceMux {
         scope_id: &str,
         workspace: impl AsRef<Path>,
         terminal: Option<String>,
-        browser_page_id: Option<String>,
+        browser: Option<BrowserBinding>,
     ) -> Result<WorkspaceScope> {
         validate_scope_id(scope_id)?;
         let workspace = Workspace::open(workspace)?;
         self.ensure_within_mount(workspace.root())?;
-        if self.mount_root.parent().is_none() && workspace.root() == self.mount_root {
-            return Err(BridgeError::Security(
-                "Refusing to register the filesystem root itself as a workspace scope".into(),
-            ));
-        }
+        self.ensure_safe_workspace_root(workspace.root())?;
 
+        if let Some(binding) = browser.as_ref() {
+            validate_browser_binding(binding)?;
+        }
         let now = now_ms();
+        let browser_page_id = browser.as_ref().map(|binding| binding.page_id.clone());
         let scope = WorkspaceScope {
-            version: 1,
+            version: 2,
             scope_id: scope_id.to_string(),
             workspace: workspace.root().to_string_lossy().to_string(),
             terminal,
+            browser,
             browser_page_id,
             created_ms: now,
             updated_ms: now,
@@ -179,20 +255,48 @@ impl WorkspaceMux {
                 BridgeError::Io(e)
             }
         })?;
-        let scope: WorkspaceScope = serde_json::from_slice(&bytes)?;
-        if scope.version != 1 || scope.scope_id != scope_id {
+        let mut scope: WorkspaceScope = serde_json::from_slice(&bytes)?;
+        if !matches!(scope.version, 1 | 2) || scope.scope_id != scope_id {
             return Err(BridgeError::Path(format!(
                 "Invalid workspace scope state for {}",
                 scope_id
             )));
         }
+        match scope.version {
+            1 => {
+                if scope.browser.is_some() {
+                    return Err(BridgeError::Path(format!(
+                        "Invalid V1 workspace scope browser binding for {}",
+                        scope_id
+                    )));
+                }
+            }
+            2 => {
+                if let Some(binding) = scope.browser.as_ref() {
+                    validate_browser_binding(binding)?;
+                    if scope
+                        .browser_page_id
+                        .as_ref()
+                        .is_some_and(|legacy| legacy != &binding.page_id)
+                    {
+                        return Err(BridgeError::Path(format!(
+                            "Conflicting browser page ids in workspace scope {}",
+                            scope_id
+                        )));
+                    }
+                    scope.browser_page_id = Some(binding.page_id.clone());
+                } else if scope.browser_page_id.is_some() {
+                    return Err(BridgeError::Path(format!(
+                        "V2 workspace scope {} contains legacy browser_page_id without browser binding",
+                        scope_id
+                    )));
+                }
+            }
+            _ => unreachable!(),
+        }
         let workspace = Workspace::open(&scope.workspace)?;
         self.ensure_within_mount(workspace.root())?;
-        if self.mount_root.parent().is_none() && workspace.root() == self.mount_root {
-            return Err(BridgeError::Security(
-                "Filesystem root cannot be used as a workspace scope".into(),
-            ));
-        }
+        self.ensure_safe_workspace_root(workspace.root())?;
         Ok(scope)
     }
 
@@ -289,6 +393,42 @@ impl WorkspaceMux {
         Ok(())
     }
 
+    fn ensure_safe_workspace_root(&self, workspace: &Path) -> Result<()> {
+        if workspace.parent().is_none() {
+            return Err(BridgeError::Security(
+                "Refusing to register the filesystem root itself as a workspace scope".into(),
+            ));
+        }
+
+        if let Some(home) = std::env::var_os("HOME") {
+            if let Ok(home) = dunce::canonicalize(PathBuf::from(home)) {
+                if home.starts_with(workspace) {
+                    return Err(BridgeError::Security(
+                        "Refusing a workspace root that is $HOME or a broader ancestor".into(),
+                    ));
+                }
+            }
+        }
+
+        for (label, control) in [
+            ("workspace scope control directory", self.scope_dir.clone()),
+            (
+                "bridge control directory",
+                absolute_control_path(&default_bridge_base_dir()),
+            ),
+        ] {
+            if control.starts_with(workspace) || workspace.starts_with(&control) {
+                return Err(BridgeError::Security(format!(
+                    "Refusing workspace {} because it overlaps the {} {}",
+                    workspace.display(),
+                    label,
+                    control.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn persist(&self, scope: &WorkspaceScope) -> Result<()> {
         fs::create_dir_all(&self.scope_dir)?;
         let bytes = serde_json::to_vec_pretty(scope)?;
@@ -307,6 +447,19 @@ impl WorkspaceMux {
 
     fn scope_path(&self, scope_id: &str) -> PathBuf {
         self.scope_dir.join(format!("{}.json", scope_id))
+    }
+}
+
+fn absolute_control_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = dunce::canonicalize(path) {
+        return canonical;
+    }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
     }
 }
 
@@ -332,6 +485,26 @@ fn validate_scope_id(scope_id: &str) -> Result<()> {
     uuid::Uuid::parse_str(scope_id)
         .map(|_| ())
         .map_err(|_| BridgeError::Security("Invalid workspace scope id".into()))
+}
+
+fn validate_browser_binding(binding: &BrowserBinding) -> Result<()> {
+    let valid_account = !binding.account_id.is_empty()
+        && binding.account_id.len() <= 128
+        && binding
+            .account_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if !valid_account {
+        return Err(BridgeError::Security(
+            "Invalid browser binding account id".into(),
+        ));
+    }
+    if binding.instance.trim().is_empty() || binding.page_id.trim().is_empty() {
+        return Err(BridgeError::Precondition(
+            "Browser binding instance and page_id must be non-empty".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -402,6 +575,64 @@ mod tests {
             mux.lookup(&b.scope_id).unwrap().browser_page_id.as_deref(),
             Some("page-b")
         );
+        assert_eq!(mux.lookup(&b.scope_id).unwrap().account_id(), "default");
+    }
+
+    #[test]
+    fn v2_browser_binding_persists_account_affinity_without_legacy_scalar() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let state = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), state.path()).unwrap();
+        let scope = mux
+            .register_browser_binding(
+                &project,
+                BrowserBinding::new("web-a", BrowserDriverKind::Orca, "instance-a", "same-page"),
+            )
+            .unwrap();
+        let raw =
+            fs::read_to_string(state.path().join(format!("{}.json", scope.scope_id))).unwrap();
+        assert!(raw.contains("\"browser\""));
+        assert!(raw.contains("\"account_id\": \"web-a\""));
+        assert!(!raw.contains("browser_page_id"));
+
+        let loaded = mux.lookup(&scope.scope_id).unwrap();
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.account_id(), "web-a");
+        assert_eq!(loaded.browser_instance(), Some("instance-a"));
+        assert_eq!(loaded.page_id(), Some("same-page"));
+        assert_eq!(loaded.browser_page_id.as_deref(), Some("same-page"));
+    }
+
+    #[test]
+    fn v1_scope_migrates_logically_to_legacy_default_account() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let state = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), state.path()).unwrap();
+        let scope_id = uuid::Uuid::new_v4().to_string();
+        let raw = serde_json::json!({
+            "version": 1,
+            "scope_id": scope_id,
+            "workspace": dunce::canonicalize(&project).unwrap().to_string_lossy(),
+            "browser_page_id": "legacy-page",
+            "created_ms": 1,
+            "updated_ms": 1
+        });
+        fs::create_dir_all(state.path()).unwrap();
+        fs::write(
+            state
+                .path()
+                .join(format!("{}.json", raw["scope_id"].as_str().unwrap())),
+            serde_json::to_vec(&raw).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = mux.lookup(raw["scope_id"].as_str().unwrap()).unwrap();
+        assert_eq!(loaded.account_id(), LEGACY_ACCOUNT_ID);
+        assert_eq!(loaded.page_id(), Some("legacy-page"));
     }
 
     #[test]
@@ -466,6 +697,21 @@ mod tests {
         assert!(mux.lookup(&scope.scope_id).is_ok());
         mux.remove(&scope.scope_id).unwrap();
         assert!(mux.lookup(&scope.scope_id).is_err());
+    }
+
+    #[test]
+    fn mux_rejects_workspace_that_contains_or_enters_scope_control_plane() {
+        let mount = tempdir().unwrap();
+        let scope_dir = mount.path().join("control/scopes");
+        let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
+        let broad = mux.register(mount.path(), None).unwrap_err().to_string();
+        assert!(broad.contains("overlaps"));
+        fs::create_dir_all(scope_dir.join("nested")).unwrap();
+        let nested = mux
+            .register(scope_dir.join("nested"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(nested.contains("overlaps"));
     }
 
     #[test]
