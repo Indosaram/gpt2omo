@@ -1,5 +1,6 @@
 use crate::account_state::{
-    AccountHealth, AccountReservation, AccountRuntimeState, AccountStateStore, RouterRuntimeState,
+    AccountActivationLock, AccountHealth, AccountReservation, AccountRuntimeState,
+    AccountStateStore, RouterRuntimeState,
 };
 use crate::accounts::{
     load_accounts_config, AccountConfig, AccountsConfig, LegacyAccountConfig, RoutingStrategy,
@@ -83,6 +84,10 @@ impl AccountRouter {
             &self.mount_root,
             self.legacy.clone(),
         )?)
+    }
+
+    pub fn lock_account_activation(&self) -> RouterResult<AccountActivationLock> {
+        Ok(self.store.lock_account_activation()?)
     }
 
     pub fn reserve_batch_for_mux(

@@ -554,6 +554,27 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn flag_free_relay_uses_browser_auto_detection() {
+        let cli = Cli::try_parse_from(["gpt2omo-relay"]).expect("default relay CLI should parse");
+        assert_eq!(cli.browser_driver, None);
+        assert_eq!(cli.orca_bin, "orca");
+    }
+
+    #[test]
+    fn relay_allows_explicit_orca_override() {
+        let cli = Cli::try_parse_from([
+            "gpt2omo-relay",
+            "--browser-driver",
+            "orca",
+            "--orca-bin",
+            "orca",
+        ])
+        .expect("explicit Orca relay CLI should parse");
+        assert_eq!(cli.browser_driver, Some(BrowserDriverKind::Orca));
+        assert_eq!(cli.orca_bin, "orca");
+    }
+
+    #[test]
     fn malformed_sse_payload_is_discarded_without_poisoning_next_frame() {
         let mut frame = SseFrame {
             event: "completion".to_string(),

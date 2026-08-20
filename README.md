@@ -229,6 +229,71 @@ echo "Add unit tests for token expiration." | ./target/release/delegate_to_chatg
   --json
 ```
 
+### 5. Use the Web delegation skills
+
+`gpt2omo` has two deliberately separate OMO skills for ChatGPT Web work. Choose the
+smallest one that matches the dependency shape; do not use a DAG merely to create
+more browser workers.
+
+#### `delegate-web`: one bounded Web-session workflow
+
+Install or refresh the managed `/delegate-web` prompt and skill after building the
+helper:
+
+```bash
+cargo build --bin delegate_to_chatgpt_web --bin install_delegate_web
+./target/debug/install_delegate_web
+./target/debug/install_delegate_web --check --json
+```
+
+Then ask OMO to use `/delegate-web` for one focused coding task, a pair of independent
+tasks, a follow-up to one returned scope, or an explicit session close. The coordinator
+invokes `delegate_to_chatgpt_web` once with a JSON batch; it does not create worktrees,
+spawn OMO subagents, or improvise alternate browser/session control.
+
+```text
+/delegate-web Fix the OAuth callback validation and add regression tests.
+```
+
+Fresh work supports one or two ChatGPT Web workers. Every result reports the exact
+`scope_id`, `browser_page_id`, readiness/terminal state, and whether the session is
+`IDLE_RETAINED`. Retained sessions are for a later follow-up in the same conversation:
+
+```bash
+echo "Now add coverage for the missing-state callback." |
+  ./target/debug/delegate_to_chatgpt_web \
+    --bridge-url https://code.checka.cc \
+    --resume-scope '<exact-scope-id>' --stdin --json
+
+./target/debug/delegate_to_chatgpt_web \
+  --close-scope '<exact-scope-id>' --json
+```
+
+Only resume or close the exact returned scope. Do not reuse a prior conversation for
+unrelated work, migrate a retained scope to a different browser driver, or close a
+scope merely because the coding task reached a terminal state.
+
+#### `delegate-web-dag`: dependency-shaped Web workflows
+
+Use the separately installed `delegate-web-dag` OMO skill only when work has real
+fan-out/fan-in or ordered stages: for example, two disjoint Web investigations followed
+by one reconciliation and verification node. It enables the native `dag` control plane;
+it is not a replacement for `/delegate-web` on a single task.
+
+Each DAG node that needs ChatGPT Web must invoke one scoped
+`delegate_to_chatgpt_web --batch-stdin --json` helper batch. Put independent Web tasks
+in that one batch; do not launch parallel fresh helper processes for the same account.
+Add a final verification node that depends on every producer, and close scopes only
+after that verifier accepts their results. A resume node must carry the exact retained
+`scope_id` it is allowed to continue.
+
+The default browser policy is **cmux first, then Orca fallback**. Leave
+`--browser-driver` unset to use that policy. An explicit CLI driver or an account
+`browser.driver` setting overrides it. Fresh cmux ChatGPT surfaces are focused when
+created so the browser tab is visible. See
+[`docs/multi-account-and-shared-safety.md`](docs/multi-account-and-shared-safety.md)
+for isolated multi-account onboarding, profile/CDP requirements, and activation safety.
+
 ---
 
 ## 🧪 Verification & Quality Gates

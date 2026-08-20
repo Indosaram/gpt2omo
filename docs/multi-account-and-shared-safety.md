@@ -12,6 +12,22 @@ Architecture and security design for `gpt2omo` Web delegation. This document is 
 4. **Do not treat a shared ChatGPT account as a security boundary.** If another user of the same ChatGPT account can see the delegation conversation/sidebar, they can see the `scope_id`, workspace path, prompts, and tool results. If that shared account can invoke the same MCP connector, a leaked live scope is replayable. Shared-account use is acceptable only when every account user is mutually trusted, or the connector is reduced to a low-risk/read-only policy with additional host isolation.
 5. **Close current host-security gaps before advertising shared-account safety.** Bearer authentication is conditional on `cli.token`; `main` currently calls `load_token_file()` rather than `ensure_auth()`. `run_command` is not an OS sandbox: it executes allowed programs as the daemon user with the workspace only as `cwd`. Control-plane secrets must also be kept outside any workspace-visible path.
 
+## Current operational setup
+
+Run `gpt2omo-account-onboard prepare --account <id> ...` to create the pending configuration, provision isolated profiles, and open the account login pages. After logging in, use `gpt2omo-account-onboard wait --timeout-seconds 600` (or `status` for one check), then `gpt2omo-account-onboard activate --confirm`. The command promotes `accounts.pending.json` to `accounts.json` only when every browser is ready and no active, retained, or unknown legacy scope remains. `docs/accounts.example.json` is a schema reference, not a file to copy over live routing.
+
+Each enabled account must have a unique `browser.instance`, `browser.user_data_dir`, and loopback `browser.cdp_endpoint`. The runtime uses the CDP endpoint to address the exact profile that owns each page; a separate cmux workspace alone does not isolate ChatGPT cookies.
+
+Before enabling the file:
+
+1. Run `gpt2omo-account-onboard prepare --account primary --account secondary` and log into the intended ChatGPT account in each opened profile.
+2. Run the bridge with a mount root narrower than `/` and containing every delegated repository, for example `/Users/example/code/project`. Profile paths must remain outside that mount root, so the current `--mount-root /` development launch intentionally cannot accept isolated profile configuration.
+3. Run `gpt2omo-account-onboard status`; only after it reports every account ready may `gpt2omo-account-onboard activate --confirm` promote routing. The activation itself rejects active or retained legacy scopes. Restart the bridge and relay only after activation and after active delegations have completed, then run `gpt2omo-account-status --mount-root <mount-root>` to verify both accounts are reachable and have the expected login state.
+
+Leave `browser.driver` unset when the intended policy is automatic **cmux first, then Orca fallback**. Set it only to deliberately pin a specific driver for an account.
+
+Fresh work is scheduled account-by-account. Retained scopes stay bound to the account and browser instance that created them; disabling an account prevents new work but does not silently migrate retained scopes.
+
 ---
 
 ## 1. Current implementation: relevant facts

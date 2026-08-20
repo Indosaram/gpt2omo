@@ -162,6 +162,15 @@ impl AccountStateStore {
         }
     }
 
+    pub fn lock_account_activation(&self) -> Result<AccountActivationLock> {
+        prepare_private_dir(&self.bridge_dir)?;
+        let lock_dir = self.bridge_dir.join("locks");
+        prepare_private_dir(&lock_dir)?;
+        let file = open_private_file(&lock_dir.join("account-activation.lock"))?;
+        file.lock().map_err(BridgeError::Io)?;
+        Ok(AccountActivationLock { file })
+    }
+
     pub fn load_account(&self, account_id: &str) -> Result<AccountRuntimeState> {
         validate_state_account_id(account_id)?;
         let path = self.account_state_path(account_id);
@@ -236,6 +245,16 @@ pub struct RouterLock {
 }
 
 impl Drop for RouterLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+pub struct AccountActivationLock {
+    file: File,
+}
+
+impl Drop for AccountActivationLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
     }

@@ -228,8 +228,21 @@ pub fn load_accounts_config(
     mount_root: &Path,
     legacy: LegacyAccountConfig,
 ) -> Result<AccountsConfig> {
-    let path = bridge_dir.join("accounts.json");
-    match fs::read_to_string(&path) {
+    load_accounts_config_from_path(
+        &bridge_dir.join("accounts.json"),
+        bridge_dir,
+        mount_root,
+        legacy,
+    )
+}
+
+pub fn load_accounts_config_from_path(
+    path: &Path,
+    bridge_dir: &Path,
+    mount_root: &Path,
+    legacy: LegacyAccountConfig,
+) -> Result<AccountsConfig> {
+    match fs::read_to_string(path) {
         Ok(content) => parse_accounts_config(&content, bridge_dir, mount_root),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             validate_legacy(&legacy)?;

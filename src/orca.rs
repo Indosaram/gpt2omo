@@ -205,23 +205,13 @@ impl BrowserDriverConfig {
             return Ok((*kind, default_bin));
         }
 
-        if is_executable_in_path("orca").await {
-            return Ok((BrowserDriverKind::Orca, PathBuf::from("orca")));
+        for (kind, command) in automatic_browser_driver_priority() {
+            if is_executable_in_path(command).await {
+                return Ok((*kind, PathBuf::from(command)));
+            }
         }
         if let Some(maho_bin) = resolve_maho_bin() {
             return Ok((BrowserDriverKind::Maho, maho_bin));
-        }
-        if is_executable_in_path("maho").await {
-            return Ok((BrowserDriverKind::Maho, PathBuf::from("maho")));
-        }
-        if is_executable_in_path("agent-browser").await {
-            return Ok((
-                BrowserDriverKind::AgentBrowser,
-                PathBuf::from("agent-browser"),
-            ));
-        }
-        if is_executable_in_path("aside").await {
-            return Ok((BrowserDriverKind::Aside, PathBuf::from("aside")));
         }
 
         Ok((
@@ -229,6 +219,16 @@ impl BrowserDriverConfig {
             resolve_maho_bin().unwrap_or_else(|| PathBuf::from("maho")),
         ))
     }
+}
+
+fn automatic_browser_driver_priority() -> &'static [(BrowserDriverKind, &'static str)] {
+    &[
+        (BrowserDriverKind::Cmux, "cmux"),
+        (BrowserDriverKind::Orca, "orca"),
+        (BrowserDriverKind::Maho, "maho"),
+        (BrowserDriverKind::AgentBrowser, "agent-browser"),
+        (BrowserDriverKind::Aside, "aside"),
+    ]
 }
 
 pub type OrcaConfig = BrowserDriverConfig;
@@ -466,7 +466,7 @@ fn cmux_new_browser_surface_args(worktree: &str) -> Vec<String> {
     if worktree.trim() != "active" {
         args.extend(["--workspace".into(), worktree.into()]);
     }
-    args.extend(["--focus".into(), "false".into()]);
+    args.extend(["--focus".into(), "true".into()]);
     args
 }
 
@@ -1143,6 +1143,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn automatic_driver_priority_prefers_cmux_then_orca() {
+        assert_eq!(
+            automatic_browser_driver_priority(),
+            [
+                (BrowserDriverKind::Cmux, "cmux"),
+                (BrowserDriverKind::Orca, "orca"),
+                (BrowserDriverKind::Maho, "maho"),
+                (BrowserDriverKind::AgentBrowser, "agent-browser"),
+                (BrowserDriverKind::Aside, "aside"),
+            ]
+        );
+    }
+
+    #[test]
     fn parses_browser_driver_kinds() {
         assert_eq!(
             "maho".parse::<BrowserDriverKind>().unwrap(),
@@ -1204,7 +1218,7 @@ mod tests {
                 "--url",
                 "https://chatgpt.com",
                 "--focus",
-                "false",
+                "true",
             ]
         );
     }
@@ -1224,7 +1238,7 @@ mod tests {
                 "--workspace",
                 "workspace:7",
                 "--focus",
-                "false",
+                "true",
             ]
         );
     }

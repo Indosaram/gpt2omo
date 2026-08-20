@@ -1,4 +1,6 @@
-use crate::accounts::{load_accounts_config, AccountConfig, LegacyAccountConfig};
+use crate::accounts::{
+    load_accounts_config, load_accounts_config_from_path, AccountConfig, LegacyAccountConfig,
+};
 use crate::error::{BridgeError, Result as BridgeResult};
 use crate::orca::{
     close_browser_page, create_chatgpt_tab, probe_chatgpt_ui_condition, send_chatgpt_prompt,
@@ -86,6 +88,7 @@ pub struct BrowserHealth {
 pub struct BrowserPool {
     bridge_dir: Arc<PathBuf>,
     mount_root: Arc<PathBuf>,
+    config_path: Option<Arc<PathBuf>>,
     legacy: LegacyAccountConfig,
     legacy_driver: BrowserDriverConfig,
     http: reqwest::Client,
@@ -111,6 +114,28 @@ impl BrowserPool {
         Self {
             bridge_dir: Arc::new(bridge_dir.into()),
             mount_root: Arc::new(mount_root.into()),
+            config_path: None,
+            legacy,
+            legacy_driver,
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        }
+    }
+
+    pub fn with_config_path(
+        bridge_dir: impl Into<PathBuf>,
+        mount_root: impl Into<PathBuf>,
+        legacy: LegacyAccountConfig,
+        legacy_driver: BrowserDriverConfig,
+        config_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            bridge_dir: Arc::new(bridge_dir.into()),
+            mount_root: Arc::new(mount_root.into()),
+            config_path: Some(Arc::new(config_path.into())),
             legacy,
             legacy_driver,
             http: reqwest::Client::builder()
@@ -122,7 +147,15 @@ impl BrowserPool {
     }
 
     pub fn load_config(&self) -> BridgeResult<crate::accounts::AccountsConfig> {
-        load_accounts_config(&self.bridge_dir, &self.mount_root, self.legacy.clone())
+        match self.config_path.as_deref() {
+            Some(path) => load_accounts_config_from_path(
+                path,
+                &self.bridge_dir,
+                &self.mount_root,
+                self.legacy.clone(),
+            ),
+            None => load_accounts_config(&self.bridge_dir, &self.mount_root, self.legacy.clone()),
+        }
     }
 
     pub async fn target_for_account(
@@ -176,7 +209,6 @@ impl BrowserPool {
     async fn target_from_account(&self, account: &AccountConfig) -> Result<BrowserTarget> {
         let driver = match account.browser.driver {
             Some(driver) => driver,
-            None if account.browser.cdp_endpoint.is_some() => BrowserDriverKind::Orca,
             None => self.legacy_driver.detect().await?.0,
         };
         Ok(BrowserTarget {
@@ -249,6 +281,21 @@ impl BrowserPool {
 
         let driver_config = self.driver_config(&target);
         let page_id = create_chatgpt_tab(&driver_config).await?;
+        Ok(PageHandle { target, page_id })
+    }
+
+    pub async fn open_chatgpt_login_page(&self, account_id: &str) -> Result<PageHandle> {
+        let target = self.target_for_account(account_id, false).await?;
+        self.validate_creation_isolation(&target)?;
+        if let Some(endpoint) = target.cdp_endpoint.as_deref() {
+            self.ensure_browser_instance(&target).await?;
+            return Ok(PageHandle {
+                page_id: self.cdp_create_page(endpoint).await?,
+                target,
+            });
+        }
+
+        let page_id = create_chatgpt_tab(&self.driver_config(&target)).await?;
         Ok(PageHandle { target, page_id })
     }
 

@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "routing": {
+    "strategy": "least_loaded",
+    "reservation_ttl_seconds": 120,
+    "selection_failure_backoff_seconds": 30
+  },
+  "defaults": {
+    "limits": {
+      "window_seconds": 3600,
+      "max_dispatches": 12,
+      "max_active_workers": 2
+    },
+    "cooldown": {
+      "unknown_rate_limit_seconds": 900,
+      "delivery_failure_seconds": 30
+    }
+  },
+  "accounts": [
+    {
+      "id": "chatgpt-primary",
+      "enabled": true,
+      "draining": false,
+      "browser": {
+        "instance": "chatgpt-primary",
+        "user_data_dir": "/Users/example/.omo/bridge/browser-profiles/chatgpt-primary",
+        "cdp_endpoint": "http://127.0.0.1:9223",
+        "worktree": "active"
+      }
+    },
+    {
+      "id": "chatgpt-secondary",
+      "enabled": true,
+      "draining": false,
+      "browser": {
+        "instance": "chatgpt-secondary",
+        "user_data_dir": "/Users/example/.omo/bridge/browser-profiles/chatgpt-secondary",
+        "cdp_endpoint": "http://127.0.0.1:9224",
+        "worktree": "active"
+      }
+    }
+  ]
+}

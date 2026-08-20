@@ -254,6 +254,17 @@ enum UiProbeAction {
     Terminal(TerminalObservation),
 }
 
+fn legacy_browser_config(cli: &Cli) -> OrcaConfig {
+    let browser_binary = (cli.browser_driver.is_some() || cli.orca_bin != "orca")
+        .then(|| cli.orca_bin.clone().into());
+    OrcaConfig::with_driver(
+        cli.browser_driver,
+        browser_binary,
+        cli.worktree.clone(),
+        cli.terminal.clone(),
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     gpt2omo::load_dotenv_if_present();
@@ -274,12 +285,7 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_scope_dir(port));
     let mux = WorkspaceMux::new(&cli.mount_root, &scope_dir)?;
-    let orca = OrcaConfig::with_driver(
-        cli.browser_driver,
-        Some(cli.orca_bin.clone().into()),
-        cli.worktree.clone(),
-        cli.terminal.clone(),
-    );
+    let orca = legacy_browser_config(&cli);
     let legacy_account = legacy_account_config(&cli);
     let account_router = AccountRouter::new(
         default_bridge_base_dir(),
@@ -848,6 +854,9 @@ async fn stage_browser_delegations(
     router: &AccountRouter,
     tasks: &[PreparedTask],
 ) -> Result<(Vec<StagedDelegation>, Vec<WorkspaceScopeLock>)> {
+    let _activation_lock = router
+        .lock_account_activation()
+        .map_err(|error| anyhow!(error.to_string()))?;
     let reservations = router
         .reserve_batch_for_mux(mux, tasks.len(), epoch_ms())
         .map_err(|error| anyhow!(error.to_string()))?;
@@ -2236,6 +2245,40 @@ mod tests {
         start_fresh_delegation_lifecycle,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn flag_free_delegation_uses_browser_auto_detection() {
+        let cli = Cli::try_parse_from(["delegate_to_chatgpt_web", "--dry-run", "smoke"])
+            .expect("default delegation CLI should parse");
+        assert_eq!(cli.browser_driver, None);
+        assert_eq!(cli.orca_bin, "orca");
+    }
+
+    #[test]
+    fn flag_free_delegation_does_not_pin_orca_binary() {
+        let cli = Cli::try_parse_from(["delegate_to_chatgpt_web", "--dry-run", "smoke"])
+            .expect("default delegation CLI should parse");
+        let browser = legacy_browser_config(&cli);
+
+        assert_eq!(browser.driver, None);
+        assert_eq!(browser.binary, None);
+    }
+
+    #[test]
+    fn delegation_allows_explicit_orca_override() {
+        let cli = Cli::try_parse_from([
+            "delegate_to_chatgpt_web",
+            "--browser-driver",
+            "orca",
+            "--orca-bin",
+            "orca",
+            "--dry-run",
+            "smoke",
+        ])
+        .expect("explicit Orca delegation CLI should parse");
+        assert_eq!(cli.browser_driver, Some(BrowserDriverKind::Orca));
+        assert_eq!(cli.orca_bin, "orca");
+    }
 
     fn cli_for_test() -> Cli {
         Cli {

@@ -6,6 +6,7 @@ pub mod cli;
 pub mod error;
 pub mod events;
 pub mod mass_ulw_web;
+pub mod onboarding;
 pub mod orca;
 pub mod router;
 pub mod security;
@@ -28,6 +29,11 @@ pub use browser_pool::{
 pub use cli::Cli;
 pub use error::{BridgeError, Result};
 pub use events::{EventBus, HarnessEvent};
+pub use onboarding::{
+    activate_pending_accounts_config, activation_blocking_scope_ids, legacy_scope_blockers,
+    load_pending_accounts_config, pending_account_health, pending_accounts_path,
+    prepare_pending_accounts_config, LegacyScopeBlocker, LegacyScopeBlockerKind,
+};
 pub use router::{AccountRouter, RouteReservation, RouterError, RoutingExhausted};
 pub use security::{
     default_bridge_base_dir, default_scope_dir, BrowserBinding, Workspace, WorkspaceMux,

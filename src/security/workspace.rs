@@ -301,6 +301,14 @@ impl WorkspaceMux {
     }
 
     pub fn list_scopes(&self) -> Result<Vec<WorkspaceScope>> {
+        self.list_scopes_impl(false)
+    }
+
+    pub fn list_scopes_strict(&self) -> Result<Vec<WorkspaceScope>> {
+        self.list_scopes_impl(true)
+    }
+
+    fn list_scopes_impl(&self, strict: bool) -> Result<Vec<WorkspaceScope>> {
         let entries = match fs::read_dir(&self.scope_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -315,14 +323,28 @@ impl WorkspaceMux {
                 continue;
             }
             let Some(scope_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                if strict {
+                    return Err(BridgeError::Precondition(format!(
+                        "invalid scope state filename: {}",
+                        path.display()
+                    )));
+                }
                 continue;
             };
             if uuid::Uuid::parse_str(scope_id).is_err() {
+                if strict {
+                    return Err(BridgeError::Precondition(format!(
+                        "invalid scope state id: {scope_id}"
+                    )));
+                }
                 continue;
             }
             match self.lookup(scope_id) {
                 Ok(scope) => scopes.push(scope),
                 Err(error) => {
+                    if strict {
+                        return Err(error);
+                    }
                     tracing::warn!(scope_id, error = %error, "Skipping corrupted scope file");
                 }
             }
