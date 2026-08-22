@@ -650,7 +650,14 @@ async fn verification_completion_and_continuation_events_keep_scope() {
                     "scope_id": scope_id,
                     "require_task_plan": false,
                     "require_verification": false,
-                    "require_changes": false
+                    "require_changes": false,
+                    "result": {
+                        "summary": "Verified completion event flow",
+                        "changed_files": [],
+                        "verification": ["cargo fmt --check: passed"],
+                        "blockers": [],
+                        "final_message": "Completion event flow verified."
+                    }
                 }
             }
         }),
@@ -668,6 +675,10 @@ async fn verification_completion_and_continuation_events_keep_scope() {
     let completion = completion.expect("completion event was not published");
     assert_eq!(completion.data["scope_id"], scope_id);
     assert_eq!(completion.data["ready"], true);
+    assert_eq!(
+        completion.data["task_result"]["summary"],
+        "Verified completion event flow"
+    );
 
     let workspace = dir.path();
     let completed_lifecycle =

@@ -229,7 +229,23 @@ echo "Add unit tests for token expiration." | ./target/release/delegate_to_chatg
   --json
 ```
 
-### 5. Use the Web delegation skills
+### 5. Recover a Lost Helper Notification
+
+If a helper process exits after reporting a browser scope but before it returns terminal
+JSON, attach to the exact existing scope rather than creating or resuming a worker:
+
+```bash
+./target/release/delegate_to_chatgpt_web \
+  --mount-root / \
+  --observe-scope '<scope-id>' \
+  --json --progress-json
+```
+
+This only watches durable lifecycle state. It sends no browser prompt and starts no new
+generation. If the scope is already terminal, replace `--observe-scope` with
+`--report-scope` to replay the stored result immediately.
+
+### 6. Use the Web delegation skills
 
 `gpt2omo` has two deliberately separate OMO skills for ChatGPT Web work. Choose the
 smallest one that matches the dependency shape; do not use a DAG merely to create
@@ -283,6 +299,17 @@ it is not a replacement for `/delegate-web` on a single task.
 Each DAG node that needs ChatGPT Web must invoke one scoped
 `delegate_to_chatgpt_web --batch-stdin --json` helper batch. Put independent Web tasks
 in that one batch; do not launch parallel fresh helper processes for the same account.
+That one native DAG node contains the browser-level fan-out: it reports an opt-in
+`dispatched` progress event with every distinct scope/page once all workers are ready
+and their tasks are sent, then remains **RUNNING** until every worker has terminal
+evidence. A progress observer timing out must never close the helper, scope, or tab.
+The second browser tab intentionally opens 10 seconds after the first to prevent account
+bursting; after both readiness handshakes, the actual task prompts are dispatched
+concurrently. Native `dag` dependencies provide ordering only, so any downstream phase
+that changes source must explicitly run a fresh helper batch or resume an exact retained
+Web `scope_id`; a generic DAG coding node is not a Web worker. Use ordinary downstream
+nodes only for local verification, then inject their feedback into a staged Web-resume
+run.
 Add a final verification node that depends on every producer, and close scopes only
 after that verifier accepts their results. A resume node must carry the exact retained
 `scope_id` it is allowed to continue.

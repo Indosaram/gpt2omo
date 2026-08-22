@@ -253,7 +253,7 @@ async fn run_session_gc(mux: &WorkspaceMux, browsers: &BrowserPool, ttl_ms: u64)
                         browser_instance = ?session.browser_instance,
                         browser_page_id = ?session.browser_page_id,
                         error = %error,
-                        "expired retained Web scope was removed but bound browser tab close failed"
+                        "expired retained Web scope preserved because bound browser tab close failed"
                     );
                 } else {
                     info!(

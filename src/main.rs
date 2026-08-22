@@ -1,5 +1,8 @@
 use clap::Parser;
-use gpt2omo::{create_router, default_scope_dir, AppState, Cli, EventBus, WorkspaceMux};
+use gpt2omo::{
+    create_router, default_bridge_base_dir, default_scope_dir, AppState, Cli, EventBus,
+    WorkspaceMux,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -37,12 +40,13 @@ async fn main() -> anyhow::Result<()> {
         );
     } else {
         warn!(
-            "Command execution is daemon-owned but not OS-sandboxed. Treat every holder of a live scope_id in a shared ChatGPT account as one trust principal; use --read-only for untrusted shared access."
+            "Command execution is daemon-owned but not OS-sandboxed. Treat every holder of a live scope_id in a shared ChatGPT account as one trust principal; writable mode is loopback-only."
         );
     }
 
-    let events = Arc::new(EventBus::new(
+    let events = Arc::new(EventBus::new_persistent(
         workspaces.mount_root().to_string_lossy().to_string(),
+        default_bridge_base_dir().join("pending-continuations"),
     ));
     let state = AppState {
         workspace: Arc::new(workspaces),

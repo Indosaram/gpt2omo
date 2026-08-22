@@ -5,6 +5,7 @@ pub mod browser_pool;
 pub mod cli;
 pub mod error;
 pub mod events;
+pub mod fresh_dispatch;
 pub mod mass_ulw_web;
 pub mod onboarding;
 pub mod orca;

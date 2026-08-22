@@ -3,8 +3,9 @@ use clap::Parser;
 use gpt2omo::cli::default_mount_root;
 use gpt2omo::orca::OrcaConfig;
 use gpt2omo::{
-    collect_account_diagnostics, default_bridge_base_dir, default_scope_dir, AccountRouter,
-    BrowserInstanceConfig, BrowserPool, LegacyAccountConfig, WorkspaceMux,
+    collect_account_diagnostics, default_bridge_base_dir, default_scope_dir,
+    recover_stale_account_health, AccountRouter, BrowserInstanceConfig, BrowserPool,
+    LegacyAccountConfig, WorkspaceMux,
 };
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,6 +41,10 @@ struct Cli {
     #[arg(long, default_value = "orca")]
     orca_bin: String,
 
+    /// Explicitly repair stale scheduler health before reporting. Status is read-only by default.
+    #[arg(long)]
+    recover_stale_health: bool,
+
     /// Emit compact JSON instead of pretty-printed JSON.
     #[arg(long)]
     compact: bool,
@@ -59,7 +64,11 @@ async fn main() -> Result<()> {
     let router = AccountRouter::new(&bridge_dir, &cli.mount_root, legacy.clone());
     let browsers = BrowserPool::new(&bridge_dir, &cli.mount_root, legacy, orca);
     let mux = WorkspaceMux::new(&cli.mount_root, &scope_dir)?;
-    let report = collect_account_diagnostics(&router, &browsers, &mux, epoch_ms()).await?;
+    let now_ms = epoch_ms();
+    if cli.recover_stale_health {
+        recover_stale_account_health(&router, &browsers, now_ms).await?;
+    }
+    let report = collect_account_diagnostics(&router, &browsers, &mux, now_ms).await?;
 
     if cli.compact {
         println!("{}", serde_json::to_string(&report)?);
@@ -74,4 +83,19 @@ fn epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn status_is_read_only_by_default_and_recovery_is_opt_in() {
+        let default = Cli::try_parse_from(["gpt2omo-account-status"]).unwrap();
+        assert!(!default.recover_stale_health);
+        let repairing =
+            Cli::try_parse_from(["gpt2omo-account-status", "--recover-stale-health"]).unwrap();
+        assert!(repairing.recover_stale_health);
+    }
 }

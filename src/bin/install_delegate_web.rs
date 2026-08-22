@@ -221,7 +221,10 @@ __OMO_DELEGATE_WEB_BATCH__
 ### Session Retention Policy
 
 - **Dispatch with `IDLE_RETAINED` by default** (120 min lease).
-- **Do NOT pass `--close-on-terminal` on initial dispatch**: Keep the session retained until you receive, inspect, and extract the complete output/plan/changes without risking premature tab closure.
+- **Read the authoritative `task_result` from each helper `event:"terminal"` and final terminal JSON**. The worker supplies it as the `result` object in its final `completion_check`; it contains the summary, changed files, verification, blockers, and user-facing final message for that exact scope and generation.
+- A `COMPLETED` terminal result without `task_result` is invalid: report the missing artifact and do not claim the worker output was received.
+- **Do NOT resume a retained completed session merely to ask for its report**. The result artifact is the handoff. Resume only for a real same-task follow-up that needs another worker action.
+- **Do NOT pass `--close-on-terminal` on initial dispatch**: Keep the session retained until you have inspected the returned `task_result` without risking premature tab closure.
 - `--close-on-terminal` is strictly reserved for throwaway executions where the output is not needed.
 
 ## When and How to Close a Session
@@ -278,11 +281,42 @@ TTL is a safety net, not evidence that a task completed and not a substitute for
   - Inform the user of the exact reset wait time, or resume an existing retained session (`--resume-scope`) instead of creating a new worker.
 - **Enforced defaults**: 60-minute window limit (12 dispatches), max 2 fresh workers per batch, and max 3 concurrent in-flight sessions.
 
+## Duplicate Active Dispatch — Hard Stop
+
+When the helper returns a terminal JSON document with
+`code: "DUPLICATE_ACTIVE_DISPATCH"`, a fresh Web request for the same workspace/task
+ownership domain already owns one or more browser-bound nonterminal scopes. This result
+is a **hard stop for this coordinator turn**:
+
+- Report the returned `scope_id`, `browser_page_id`, generation, `session_state`, and
+  authoritative `lifecycle` to the user, then stop.
+- Do **not** retry the same ownership domain by paraphrasing or reformatting task text.
+  A distinct label is allowed only when it represents intentionally disjoint ownership.
+- Do **not** call `--resume-scope` while the returned session is `ACTIVE`. Resume is
+  allowed only after that exact scope becomes `IDLE_RETAINED` and only for a true
+  follow-up to the same task.
+- A helper exit error, an observer timeout, missing prose output, or a ChatGPT text claim
+  is not evidence that the referenced worker died. Observe/report its authoritative
+  lifecycle instead.
+- Only an authoritative terminal lifecycle result permits an intentional new fresh
+  dispatch. A retained terminal conversation does not require—or authorize—an immediate
+  replacement tab.
+
 ## Background Execution & Event Verification Contract
 
 - **Single Native Notification Channel**: When launching `delegate_to_chatgpt_web` in the background (`run_in_background: true`), **NEVER spawn ad-hoc `while ps ...` or `monitor` polling loops**. The harness will automatically wake you and deliver the true completion notification with the final JSON payload and exit code when the helper process terminates.
 - **Strict Session ID & Exit Code Validation**: When a completion event arrives, verify that the event's `bash_id` and `exit_code` match the actual delegation command before assuming the task is finished.
 - **Never Close Tabs on Transitory Errors**: Never proactively kill or remove browser tabs/scope files upon observing temporary errors, rate-limits, or timeouts. Sessions must stay retained until authoritative `completion_check.ready=true` is reached or the user explicitly commands a close.
+
+### Helper-exit recovery
+
+If a helper exits before emitting its final terminal JSON but it already reported a browser-bound `scope_id`, do not create a replacement worker and do not use `--resume-scope`. Attach a read-only lifecycle observer to that exact scope:
+
+```bash
+{bin} --mount-root / --observe-scope '<exact-scope-id>' --json --progress-json
+```
+
+`--observe-scope` sends no prompt, does not inspect or navigate the browser, does not start a new generation, and returns the persisted terminal `task_result` when the worker reaches an authoritative terminal state. For a scope already terminal, use `--report-scope` with the same arguments to replay its persisted terminal JSON immediately.
 
 ## Authoritative task lifecycle
 

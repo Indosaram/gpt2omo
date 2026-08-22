@@ -6,6 +6,9 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -165,6 +168,7 @@ impl WorkspaceMux {
         let scope_dir = dunce::canonicalize(scope_dir.as_ref()).map_err(|e| {
             BridgeError::Path(format!("Failed to canonicalize scope directory: {}", e))
         })?;
+        harden_control_plane_permissions(&scope_dir)?;
 
         Ok(Self {
             mount_root,
@@ -248,7 +252,11 @@ impl WorkspaceMux {
 
     pub fn lookup(&self, scope_id: &str) -> Result<WorkspaceScope> {
         validate_scope_id(scope_id)?;
-        let bytes = fs::read(self.scope_path(scope_id)).map_err(|e| {
+        let path = self.scope_path(scope_id);
+        if path.exists() {
+            set_private_file(&path)?;
+        }
+        let bytes = fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 BridgeError::Path(format!("Unknown or expired workspace scope: {}", scope_id))
             } else {
@@ -395,13 +403,15 @@ impl WorkspaceMux {
     fn open_lock_file(&self, scope_id: &str) -> Result<File> {
         let lock_dir = self.scope_dir.join(".locks");
         fs::create_dir_all(&lock_dir)?;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_dir.join(format!("{}.lock", scope_id)))
-            .map_err(BridgeError::Io)
+        set_private_dir(&lock_dir)?;
+        let lock_path = lock_dir.join(format!("{}.lock", scope_id));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&lock_path).map_err(BridgeError::Io)?;
+        set_private_file(&lock_path)?;
+        Ok(file)
     }
 
     fn ensure_within_mount(&self, workspace: &Path) -> Result<()> {
@@ -453,16 +463,31 @@ impl WorkspaceMux {
 
     fn persist(&self, scope: &WorkspaceScope) -> Result<()> {
         fs::create_dir_all(&self.scope_dir)?;
+        set_private_dir(&self.scope_dir)?;
         let bytes = serde_json::to_vec_pretty(scope)?;
         let temp = self.scope_dir.join(format!(
             ".scope-{}-{}.tmp",
             scope.scope_id,
             uuid::Uuid::new_v4()
         ));
-        fs::write(&temp, bytes)?;
-        if let Err(error) = fs::rename(&temp, self.scope_path(&scope.scope_id)) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp).map_err(BridgeError::Io)?;
+        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
             let _ = fs::remove_file(&temp);
             return Err(BridgeError::Io(error));
+        }
+        drop(file);
+        let final_path = self.scope_path(&scope.scope_id);
+        if let Err(error) = fs::rename(&temp, &final_path) {
+            let _ = fs::remove_file(&temp);
+            return Err(BridgeError::Io(error));
+        }
+        set_private_file(&final_path)?;
+        if let Ok(directory) = File::open(&self.scope_dir) {
+            let _ = directory.sync_all();
         }
         Ok(())
     }
@@ -470,6 +495,47 @@ impl WorkspaceMux {
     fn scope_path(&self, scope_id: &str) -> PathBuf {
         self.scope_dir.join(format!("{}.json", scope_id))
     }
+}
+
+fn harden_control_plane_permissions(scope_dir: &Path) -> Result<()> {
+    set_private_dir(scope_dir)?;
+    let lock_dir = scope_dir.join(".locks");
+    if lock_dir.exists() {
+        set_private_dir(&lock_dir)?;
+        for entry in fs::read_dir(&lock_dir)? {
+            let path = entry?.path();
+            if path.is_file() {
+                set_private_file(&path)?;
+            }
+        }
+    }
+    for entry in fs::read_dir(scope_dir)? {
+        let path = entry?.path();
+        if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("json") {
+            set_private_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_dir(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(BridgeError::Io)
+}
+
+#[cfg(not(unix))]
+fn set_private_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(BridgeError::Io)
+}
+
+#[cfg(not(unix))]
+fn set_private_file(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn absolute_control_path(path: &Path) -> PathBuf {
@@ -759,5 +825,45 @@ mod tests {
         let state = tempdir().unwrap();
         let mux = WorkspaceMux::new(mount.path(), state.path()).unwrap();
         assert!(mux.lookup("../escape").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mux_control_plane_permissions_are_private() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let state = tempdir().unwrap();
+        fs::set_permissions(state.path(), fs::Permissions::from_mode(0o777)).unwrap();
+
+        let mux = WorkspaceMux::new(mount.path(), state.path()).unwrap();
+        let scope = mux.register_browser(&project, "page".into()).unwrap();
+        let _lock = mux.lock_scope(&scope.scope_id).unwrap();
+
+        assert_eq!(
+            fs::metadata(state.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(state.path().join(format!("{}.json", scope.scope_id)))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(
+                state
+                    .path()
+                    .join(".locks")
+                    .join(format!("{}.lock", scope.scope_id))
+            )
+            .unwrap()
+            .permissions()
+            .mode()
+                & 0o777,
+            0o600
+        );
     }
 }

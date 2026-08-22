@@ -4,6 +4,31 @@ This guide defines the integration contract between OMO mass-ulw DAG orchestrati
 
 The central rule is simple: **mass-ulw schedules workflow phases; `delegate_to_chatgpt_web` remains the authority for Web-worker lifecycle and safety policy.** The DAG layer must not open browser tabs itself, bypass readiness, or implement a competing worker semaphore.
 
+## Result handoff
+
+Completion is not a prose claim in the browser. A Web worker supplies a structured
+`result` object in its final `completion_check` call; the bridge atomically saves
+the resulting `task_result` for its exact scope/generation before it can return
+`ready: true`. The helper includes that artifact in both the worker's
+`event:"terminal"` NDJSON record and its final aggregate JSON:
+
+```json
+{
+  "task_result": {
+    "summary": "...",
+    "changed_files": ["..."],
+    "verification": ["..."],
+    "blockers": [],
+    "final_message": "..."
+  }
+}
+```
+
+The DAG coordinator must consume this payload as the authoritative worker report.
+It must not resume a completed retained browser session merely to ask for prose
+output. A `COMPLETED` terminal record without `task_result` is a contract failure,
+not a successful result handoff.
+
 ## Architecture
 
 ```text
@@ -23,6 +48,8 @@ OMO mass-ulw / tool.dag / JS SDK / Python eval
        +------------+-------------+
                     |
           ChatGPT Web workers
+                    |
+          dispatched NDJSON event
                     |
           terminal JSON result
                     |
@@ -79,6 +106,45 @@ The delegate CLI then performs all of the following in one authority domain:
 6. Waits for both workers to reach terminal state and returns one JSON result containing both retained scope IDs.
 
 A mass-ulw fan-in node should depend on that batch node, so it cannot run while either worker is still active.
+
+The 10-second tab-creation stagger is intentional anti-burst protection, not serial task
+execution. Once both tabs are created and both readiness handshakes succeed, the helper
+sends the actual prompts concurrently. A two-worker batch therefore has two distinct
+browser scopes even though the second tab becomes visible slightly later.
+
+### Observe batch fan-out without weakening the terminal barrier
+
+`parallelPairInvocation` adds `--progress-json` to its helper invocation. After every
+worker has passed readiness and received its actual task, the helper flushes one
+newline-delimited JSON event with `event: "dispatched"`, `parallel_count`, and every
+worker's distinct `scope_id` and `browser_page_id`.
+
+That event proves the browser-level fan-out while the native DAG still displays one
+running batch node. It is not terminal evidence: one completed browser worker plus one
+active worker means the batch node is **RUNNING**, not blocked. Report the event through
+`runInvocation(..., { onProgress })`, but do not start a dependent node, close a scope,
+or terminate the helper when an observer's wait expires. The final Promise result remains
+the only terminal batch result and is emitted after every worker becomes terminal.
+
+`onProgress` also receives one `event: "terminal"` record for each worker as soon as its
+authoritative terminal lifecycle is recorded. Treat that record as the worker's immediate
+completion notification, but do not close the retained scope or release downstream DAG
+dependencies until the aggregate terminal JSON arrives.
+
+### Recovering an exited helper without touching the worker
+
+If the native helper exits before producing terminal JSON but its earlier dispatched event
+identified a browser-bound `scope_id`, do not replace or resume the worker. Attach a
+read-only durable lifecycle observer instead:
+
+```bash
+delegate_to_chatgpt_web --mount-root / --observe-scope "$SCOPE_ID" --json --progress-json
+```
+
+The observer does not send a prompt, inspect or navigate the browser, or create a new
+generation. It returns the authoritative terminal JSON and persisted `task_result` when
+that exact scope becomes terminal. If the lifecycle is already terminal, use
+`--report-scope "$SCOPE_ID"` to replay the same artifact immediately.
 
 ## Single retained session + resume loop
 
@@ -233,6 +299,32 @@ For a single worker:
 ```text
 web-initial -> local-verify -> [web-resume -> local-verify]* -> final-review -> cleanup
 ```
+
+### Web-only source-changing phases
+
+Native `dag` node categories describe OMO-side execution; `dependsOn` provides ordering
+only and never carries a retained `scope_id` into a downstream prompt. Consequently, a
+downstream node is an ordinary OMO worker unless its own invocation explicitly calls
+`delegate_to_chatgpt_web`.
+
+For a Web-owned workflow, use this rule:
+
+- a **source-changing** phase is always a fresh helper batch or an exact
+  `resumeInvocation` / `--resume-scope` Web invocation;
+- a **local verification** phase may be an ordinary DAG node, but it only runs
+  build/test/lint and returns structured feedback; and
+- a **fan-in/fix** phase resumes one exact retained Web scope with that feedback. Do not
+  express it as a generic `deep`, `quick`, or other coding node.
+
+Because native DAG does not pass prior outputs into later prompts, use a staged run when
+the next Web phase needs returned scope IDs: wait for the terminal batch JSON, extract
+the exact retained IDs, then define the next DAG run with those IDs embedded in the
+`resumeInvocation` inputs. Never substitute a newly spawned ordinary node merely because
+the IDs are not automatically available.
+
+For more than two independent Web tasks, schedule safe two-worker waves. Finish the
+first batch and preserve its retained scopes before launching the next batch; do not
+work around the bridge capacity limit with concurrent helper processes.
 
 ## Python `eval` pipeline
 

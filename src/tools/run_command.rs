@@ -1,7 +1,7 @@
 use crate::security::Workspace;
 use crate::tools::command_manager::CommandManager;
 use crate::tools::ToolCallResult;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 const LEGACY_SCOPE_ID: &str = "00000000-0000-4000-8000-000000000000";
 
@@ -48,6 +48,11 @@ fn extract_binary_name(binary: &str) -> &str {
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or(binary)
+}
+
+fn has_explicit_path(binary: &str) -> bool {
+    let path = Path::new(binary);
+    path.is_absolute() || path.components().count() > 1
 }
 
 pub(crate) fn is_arbitrary_commands_allowed() -> bool {
@@ -110,10 +115,21 @@ pub(crate) fn validate_binary_with_policy(
         ));
     }
 
+    if has_explicit_path(binary) {
+        if explicit_whitelist.iter().any(|allowed| allowed == binary) {
+            return Ok(());
+        }
+        return Err(format!(
+            "explicit command path '{}' is blocked; use a PATH-resolved whitelisted binary or whitelist this exact path with OMO_ALLOWED_BINARIES",
+            binary
+        ));
+    }
+
     if explicit_whitelist.iter().any(|w| {
-        w.eq_ignore_ascii_case(bin_clean)
-            || w.eq_ignore_ascii_case(&bin_lower)
-            || w.eq_ignore_ascii_case(bin_name)
+        !has_explicit_path(w)
+            && (w.eq_ignore_ascii_case(bin_clean)
+                || w.eq_ignore_ascii_case(&bin_lower)
+                || w.eq_ignore_ascii_case(bin_name))
     }) {
         return Ok(());
     }
@@ -267,6 +283,29 @@ fn validate_obvious_path_escapes(
     Ok(())
 }
 
+fn canonicalize_nearest(path: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        match dunce::canonicalize(&current) {
+            Ok(resolved) => {
+                let mut result = resolved;
+                for component in tail.iter().rev() {
+                    result.push(component);
+                }
+                return result;
+            }
+            Err(_) => match (current.parent(), current.file_name()) {
+                (Some(parent), Some(name)) if parent != current => {
+                    tail.push(name.to_os_string());
+                    current = parent.to_path_buf();
+                }
+                _ => return path.to_path_buf(),
+            },
+        }
+    }
+}
+
 fn validate_path_candidate(ws: &Workspace, value: &str) -> std::result::Result<(), String> {
     let path = Path::new(value);
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -277,7 +316,7 @@ fn validate_path_candidate(ws: &Workspace, value: &str) -> std::result::Result<(
     }
 
     if path.is_absolute() {
-        let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canonical = canonicalize_nearest(path);
         if !canonical.starts_with(ws.root()) {
             return Err(format!(
                 "Absolute path outside the mounted workspace is forbidden: {}",
@@ -322,6 +361,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_absolute_path_via_symlink_to_nonexistent_leaf_is_denied() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        let link = dir.path().join("escape-link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let candidate = link.join("not-yet-created.txt");
+        let error = validate_path_candidate(&ws, candidate.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("outside the mounted workspace"));
+    }
+
+    #[test]
+    fn test_nonexistent_absolute_path_inside_workspace_is_allowed() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        let candidate = dir.path().join("brand-new-file.txt");
+        assert!(validate_path_candidate(&ws, candidate.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
     fn test_parent_traversal_inside_option_value_is_denied() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
@@ -354,10 +415,11 @@ mod tests {
                 "Expected binary '{}' to be allowed",
                 bin
             );
+            let explicit_path = format!("/tmp/{}", bin);
             assert!(
-                validate_binary(&format!("/usr/bin/{}", bin)).is_ok(),
-                "Expected binary path '/usr/bin/{}' to be allowed",
-                bin
+                validate_binary(&explicit_path).is_err(),
+                "Expected untrusted explicit binary path '{}' to be rejected",
+                explicit_path
             );
         }
     }
@@ -509,13 +571,18 @@ mod tests {
         assert!(prepare_command_with_policy(&ws, "curl https://example.com", true).is_ok());
         assert!(prepare_command_with_policy(&ws, "git -c core.pager=cat status", true).is_ok());
 
-        // Explicit whitelist allows specific custom binaries
-        let explicit = vec!["custom_runner".to_string(), "my-tool".to_string()];
+        // Explicit whitelist allows specific custom basenames and exact full paths.
+        let explicit = vec![
+            "custom_runner".to_string(),
+            "my-tool".to_string(),
+            "/usr/local/bin/custom_runner".to_string(),
+        ];
         assert!(validate_binary_with_policy("custom_runner", false, &explicit).is_ok());
         assert!(validate_binary_with_policy("my-tool", false, &explicit).is_ok());
         assert!(
             validate_binary_with_policy("/usr/local/bin/custom_runner", false, &explicit).is_ok()
         );
+        assert!(validate_binary_with_policy("/tmp/custom_runner", false, &explicit).is_err());
         assert!(validate_binary_with_policy("unlisted_tool", false, &explicit).is_err());
     }
 }

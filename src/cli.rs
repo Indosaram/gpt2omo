@@ -108,6 +108,12 @@ impl Cli {
                     .into(),
             );
         }
+        if !addr.ip().is_loopback() && !self.read_only {
+            return Err(
+                "non-loopback bridge access is read-only by policy because run_command children are not OS-sandboxed; start the daemon with --read-only or keep writable access on loopback"
+                    .into(),
+            );
+        }
         Ok(())
     }
 
@@ -274,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_bind_requires_effective_bearer_authentication() {
+    fn remote_bind_requires_effective_bearer_and_read_only_mode() {
         let remote: std::net::SocketAddr = "0.0.0.0:18800".parse().unwrap();
         let local: std::net::SocketAddr = "127.0.0.1:18800".parse().unwrap();
         let mut cli = Cli {
@@ -283,7 +289,11 @@ mod tests {
         };
         assert!(cli.validate_bind_security(&local).is_ok());
         assert!(cli.validate_bind_security(&remote).is_err());
+
         cli.token = Some("configured".into());
+        assert!(cli.validate_bind_security(&remote).is_err());
+
+        cli.read_only = true;
         assert!(cli.validate_bind_security(&remote).is_ok());
     }
 

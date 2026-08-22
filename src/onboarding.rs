@@ -360,6 +360,7 @@ mod tests {
         let health = vec![BrowserHealth {
             account_id: "primary".into(),
             instance: "chatgpt-primary".into(),
+            driver: Some(BrowserDriverKind::Orca),
             reachability: crate::BrowserReachability::Reachable,
             login_state: BrowserLoginState::Ready,
             login_required: false,
@@ -395,6 +396,7 @@ mod tests {
         let health = vec![BrowserHealth {
             account_id: "primary".into(),
             instance: "chatgpt-primary".into(),
+            driver: Some(BrowserDriverKind::Orca),
             reachability: crate::BrowserReachability::Reachable,
             login_state: BrowserLoginState::Ready,
             login_required: false,
@@ -429,6 +431,7 @@ mod tests {
         let health = vec![BrowserHealth {
             account_id: "primary".into(),
             instance: "different-instance".into(),
+            driver: Some(BrowserDriverKind::Orca),
             reachability: crate::BrowserReachability::Reachable,
             login_state: BrowserLoginState::Ready,
             login_required: false,

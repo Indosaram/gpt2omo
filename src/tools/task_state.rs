@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const MAX_VERIFICATION_HISTORY: usize = 50;
+const MAX_RESULT_TEXT_CHARS: usize = 16_000;
+const MAX_RESULT_LIST_ITEMS: usize = 100;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +67,19 @@ pub struct DelegationLifecycle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_expires_ms: Option<u64>,
     pub updated_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskResult {
+    pub version: u32,
+    pub scope_id: String,
+    pub generation: u64,
+    pub summary: String,
+    pub changed_files: Vec<String>,
+    pub verification: Vec<String>,
+    pub blockers: Vec<String>,
+    pub final_message: String,
+    pub recorded_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -448,6 +463,120 @@ pub fn start_next_delegation_generation(
     Ok(lifecycle)
 }
 
+pub fn handle_task_result(
+    ws: &Workspace,
+    scope_id: &str,
+    summary: &str,
+    changed_files: Vec<String>,
+    verification: Vec<String>,
+    blockers: Vec<String>,
+    final_message: &str,
+) -> ToolCallResult {
+    let summary = match normalize_result_text(summary, "summary") {
+        Ok(value) => value,
+        Err(error) => return ToolCallResult::err(error),
+    };
+    let final_message = match normalize_result_text(final_message, "final_message") {
+        Ok(value) => value,
+        Err(error) => return ToolCallResult::err(error),
+    };
+    let changed_files = match normalize_result_list(changed_files, "changed_files") {
+        Ok(value) => value,
+        Err(error) => return ToolCallResult::err(error),
+    };
+    let verification = match normalize_result_list(verification, "verification") {
+        Ok(value) => value,
+        Err(error) => return ToolCallResult::err(error),
+    };
+    let blockers = match normalize_result_list(blockers, "blockers") {
+        Ok(value) => value,
+        Err(error) => return ToolCallResult::err(error),
+    };
+
+    let lifecycle_path = match lifecycle_path(ws, scope_id) {
+        Ok(path) => path,
+        Err(error) => return ToolCallResult::err(error),
+    };
+    let _lock = match LifecycleClaimLock::acquire(&lifecycle_path) {
+        Ok(lock) => lock,
+        Err(error) => return ToolCallResult::err(error),
+    };
+    let lifecycle = match load_delegation_lifecycle(ws, scope_id) {
+        Ok(Some(lifecycle)) if lifecycle.terminal_state.is_none() => lifecycle,
+        Ok(Some(_)) => {
+            return ToolCallResult::err(
+                "Cannot record task result after this delegation generation is terminal",
+            )
+        }
+        Ok(None) => return ToolCallResult::err("No active delegation lifecycle exists"),
+        Err(error) => return ToolCallResult::err(error),
+    };
+    let result = TaskResult {
+        version: 1,
+        scope_id: scope_id.to_string(),
+        generation: lifecycle.generation,
+        summary,
+        changed_files,
+        verification,
+        blockers,
+        final_message,
+        recorded_ms: now_ms(),
+    };
+    if let Err(error) = save_task_result(ws, scope_id, lifecycle.generation, &result) {
+        return ToolCallResult::err(error);
+    }
+    ToolCallResult::ok(result)
+}
+
+pub fn load_task_result(
+    ws: &Workspace,
+    scope_id: &str,
+    generation: u64,
+) -> std::result::Result<Option<TaskResult>, String> {
+    if generation == 0 {
+        return Err("Task result generation must be greater than zero".to_string());
+    }
+    let path = task_result_path(ws, scope_id, generation)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).map_err(|error| format!("Failed to read task result: {error}"))?;
+    let result: TaskResult = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Failed to parse task result: {error}"))?;
+    if result.version != 1 || result.scope_id != scope_id || result.generation != generation {
+        return Err(format!("Invalid task result state for {scope_id}"));
+    }
+    Ok(Some(result))
+}
+
+fn normalize_result_text(value: &str, field: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("task_result {field} cannot be empty"));
+    }
+    if value.chars().count() > MAX_RESULT_TEXT_CHARS {
+        return Err(format!(
+            "task_result {field} cannot exceed {MAX_RESULT_TEXT_CHARS} characters"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_result_list(
+    values: Vec<String>,
+    field: &str,
+) -> std::result::Result<Vec<String>, String> {
+    if values.len() > MAX_RESULT_LIST_ITEMS {
+        return Err(format!(
+            "task_result {field} cannot contain more than {MAX_RESULT_LIST_ITEMS} items"
+        ));
+    }
+    values
+        .into_iter()
+        .map(|value| normalize_result_text(&value, field))
+        .collect()
+}
+
 pub fn retain_session_with_lease(
     ws: &Workspace,
     scope_id: &str,
@@ -766,6 +895,16 @@ fn save_lifecycle(
     atomic_write_json(&path, state, "delegation lifecycle")
 }
 
+fn save_task_result(
+    ws: &Workspace,
+    scope_id: &str,
+    generation: u64,
+    result: &TaskResult,
+) -> std::result::Result<(), String> {
+    let path = task_result_path(ws, scope_id, generation)?;
+    atomic_write_json(&path, result, "task result")
+}
+
 fn atomic_write_json<T: Serialize>(
     path: &PathBuf,
     state: &T,
@@ -823,6 +962,18 @@ fn lifecycle_path(ws: &Workspace, scope_id: &str) -> std::result::Result<PathBuf
     Ok(default_bridge_base_dir()
         .join("delegation-lifecycle")
         .join(format!("{}.json", scope_key(ws, scope_id)?)))
+}
+
+fn task_result_path(
+    ws: &Workspace,
+    scope_id: &str,
+    generation: u64,
+) -> std::result::Result<PathBuf, String> {
+    Ok(default_bridge_base_dir().join("task-results").join(format!(
+        "{}-{}.json",
+        scope_key(ws, scope_id)?,
+        generation
+    )))
 }
 
 fn scope_key(ws: &Workspace, scope_id: &str) -> std::result::Result<String, String> {

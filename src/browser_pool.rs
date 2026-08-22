@@ -12,14 +12,15 @@ use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, timeout, Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
@@ -28,6 +29,8 @@ const PAGE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const GENERATION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const BROWSER_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const BROWSER_STARTUP_POLL: Duration = Duration::from_millis(250);
+const CDP_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CDP_WS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BrowserTarget {
@@ -77,6 +80,7 @@ pub enum BrowserLoginState {
 pub struct BrowserHealth {
     pub account_id: String,
     pub instance: String,
+    pub driver: Option<BrowserDriverKind>,
     pub reachability: BrowserReachability,
     pub login_state: BrowserLoginState,
     pub login_required: bool,
@@ -92,6 +96,7 @@ pub struct BrowserPool {
     legacy: LegacyAccountConfig,
     legacy_driver: BrowserDriverConfig,
     http: reqwest::Client,
+    profile_leases: Arc<Mutex<HashMap<PathBuf, BrowserProfileLock>>>,
 }
 
 pub struct BrowserProfileLock {
@@ -122,6 +127,7 @@ impl BrowserPool {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            profile_leases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -143,6 +149,7 @@ impl BrowserPool {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            profile_leases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -249,12 +256,13 @@ impl BrowserPool {
         #[cfg(unix)]
         fs::set_permissions(profile, fs::Permissions::from_mode(0o700))?;
         let lock_path = profile.join(".gpt2omo-profile.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&lock_path)?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         match file.try_lock() {
             Ok(()) => Ok(Some(BrowserProfileLock { file })),
             Err(TryLockError::WouldBlock) => Err(anyhow!(
@@ -263,6 +271,27 @@ impl BrowserPool {
             )),
             Err(TryLockError::Error(error)) => Err(error.into()),
         }
+    }
+
+    fn ensure_profile_lease(&self, target: &BrowserTarget) -> Result<()> {
+        let Some(profile) = target.user_data_dir.as_ref() else {
+            return Ok(());
+        };
+        let mut leases = self
+            .profile_leases
+            .lock()
+            .map_err(|_| anyhow!("browser profile lease registry is poisoned"))?;
+        if leases.contains_key(profile) {
+            return Ok(());
+        }
+        let lease = self.try_lock_profile(target)?.ok_or_else(|| {
+            anyhow!(
+                "account '{}' has a CDP endpoint but no browser.user_data_dir for safe browser ownership",
+                target.account_id
+            )
+        })?;
+        leases.insert(profile.clone(), lease);
+        Ok(())
     }
 
     pub async fn create_chatgpt_page(&self, account_id: &str) -> Result<PageHandle> {
@@ -304,18 +333,7 @@ impl BrowserPool {
             .cdp_endpoint
             .as_deref()
             .ok_or_else(|| anyhow!("browser target has no CDP endpoint"))?;
-        if self.ensure_cdp_reachable(endpoint).await.is_ok() {
-            return Ok(());
-        }
-
-        let _profile_lock = self.try_lock_profile(target)?.ok_or_else(|| {
-            anyhow!(
-                "account '{}' has a CDP endpoint but no browser.user_data_dir for safe process startup",
-                target.account_id
-            )
-        })?;
-
-        // Another dispatcher may have won the launch race before this process acquired the profile lock.
+        self.ensure_profile_lease(target)?;
         if self.ensure_cdp_reachable(endpoint).await.is_ok() {
             return Ok(());
         }
@@ -389,6 +407,7 @@ impl BrowserPool {
     pub async fn verify(&self, binding: &BrowserBinding) -> Result<ChatgptPageProbe> {
         let target = self.target_for_binding(binding).await?;
         if target.cdp_endpoint.is_some() {
+            self.ensure_profile_lease(&target)?;
             return self.cdp_verify(&target, &binding.page_id).await;
         }
         verify_chatgpt_page(&self.driver_config(&target), &binding.page_id).await
@@ -399,6 +418,9 @@ impl BrowserPool {
             return ChatgptUiCondition::Unknown;
         };
         if target.cdp_endpoint.is_some() {
+            if self.ensure_profile_lease(&target).is_err() {
+                return ChatgptUiCondition::Unknown;
+            }
             return self.cdp_probe(&target, &binding.page_id).await;
         }
         probe_chatgpt_ui_condition(&self.driver_config(&target), &binding.page_id).await
@@ -407,6 +429,7 @@ impl BrowserPool {
     pub async fn send(&self, binding: &BrowserBinding, prompt: &str) -> Result<()> {
         let target = self.target_for_binding(binding).await?;
         if target.cdp_endpoint.is_some() {
+            self.ensure_profile_lease(&target)?;
             return self.cdp_send(&target, &binding.page_id, prompt).await;
         }
         send_chatgpt_prompt(&self.driver_config(&target), &binding.page_id, prompt).await
@@ -415,6 +438,7 @@ impl BrowserPool {
     pub async fn close(&self, binding: &BrowserBinding) -> Result<()> {
         let target = self.target_for_binding(binding).await?;
         if let Some(endpoint) = target.cdp_endpoint.as_deref() {
+            self.ensure_profile_lease(&target)?;
             return self.cdp_close_page(endpoint, &binding.page_id).await;
         }
         close_browser_page(&self.driver_config(&target), &binding.page_id).await
@@ -427,6 +451,7 @@ impl BrowserPool {
                 return BrowserHealth {
                     account_id: account_id.to_string(),
                     instance: String::new(),
+                    driver: None,
                     reachability: BrowserReachability::Unreachable,
                     login_state: BrowserLoginState::Unknown,
                     login_required: false,
@@ -435,10 +460,22 @@ impl BrowserPool {
             }
         };
         if let Some(endpoint) = target.cdp_endpoint.as_deref() {
+            if let Err(error) = self.ensure_profile_lease(&target) {
+                return BrowserHealth {
+                    account_id: target.account_id,
+                    instance: target.instance,
+                    driver: Some(target.driver),
+                    reachability: BrowserReachability::Unreachable,
+                    login_state: BrowserLoginState::Unknown,
+                    login_required: false,
+                    detail: Some(error.to_string()),
+                };
+            }
             if let Err(error) = self.ensure_cdp_reachable(endpoint).await {
                 return BrowserHealth {
                     account_id: target.account_id,
                     instance: target.instance,
+                    driver: Some(target.driver),
                     reachability: BrowserReachability::Unreachable,
                     login_state: BrowserLoginState::Unknown,
                     login_required: false,
@@ -452,6 +489,7 @@ impl BrowserPool {
                     return BrowserHealth {
                         account_id: target.account_id,
                         instance: target.instance,
+                        driver: Some(target.driver),
                         reachability: BrowserReachability::Reachable,
                         login_state: BrowserLoginState::Unknown,
                         login_required: false,
@@ -466,6 +504,7 @@ impl BrowserPool {
                 return BrowserHealth {
                     account_id: target.account_id,
                     instance: target.instance,
+                    driver: Some(target.driver),
                     reachability: BrowserReachability::Reachable,
                     login_state: BrowserLoginState::Unknown,
                     login_required: false,
@@ -487,6 +526,7 @@ impl BrowserPool {
             BrowserHealth {
                 account_id: target.account_id,
                 instance: target.instance,
+                driver: Some(target.driver),
                 reachability: BrowserReachability::Reachable,
                 login_required: login_state == BrowserLoginState::AuthenticationRequired,
                 login_state,
@@ -497,6 +537,7 @@ impl BrowserPool {
                 Ok(_) => BrowserHealth {
                     account_id: target.account_id,
                     instance: target.instance,
+                    driver: Some(target.driver),
                     reachability: BrowserReachability::Reachable,
                     login_state: BrowserLoginState::Unknown,
                     login_required: false,
@@ -507,6 +548,7 @@ impl BrowserPool {
                 Err(error) => BrowserHealth {
                     account_id: target.account_id,
                     instance: target.instance,
+                    driver: Some(target.driver),
                     reachability: BrowserReachability::Unreachable,
                     login_state: BrowserLoginState::Unknown,
                     login_required: false,
@@ -571,6 +613,14 @@ impl BrowserPool {
         validate_page_id(page_id)?;
         let url = cdp_url(endpoint, &format!("json/close/{page_id}"))?;
         let response = self.http.get(url.clone()).send().await?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+        ) {
+            // Idempotent close: a prior GC/close may have already removed the target before
+            // its retained-scope metadata was durably cleaned up.
+            return Ok(());
+        }
         if !response.status().is_success() {
             return Err(anyhow!(
                 "CDP close for page {} failed with HTTP {}",
@@ -620,9 +670,17 @@ impl BrowserPool {
             .as_deref()
             .ok_or_else(|| anyhow!("browser target has no CDP endpoint"))?;
         let ws_url = self.cdp_target_ws(endpoint, page_id).await?;
-        let (mut socket, _) = connect_async(&ws_url).await.with_context(|| {
-            format!("failed to connect to CDP websocket for {}", target.instance)
-        })?;
+        let (mut socket, _) = timeout(CDP_WS_CONNECT_TIMEOUT, connect_async(&ws_url))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "timed out connecting to CDP websocket for {}",
+                    target.instance
+                )
+            })?
+            .with_context(|| {
+                format!("failed to connect to CDP websocket for {}", target.instance)
+            })?;
         let request_id = 1u64;
         let request = json!({
             "id": request_id,
@@ -634,10 +692,37 @@ impl BrowserPool {
                 "userGesture": true
             }
         });
-        socket
-            .send(Message::Text(request.to_string().into()))
-            .await?;
-        while let Some(message) = socket.next().await {
+        timeout(
+            CDP_WS_RESPONSE_TIMEOUT,
+            socket.send(Message::Text(request.to_string().into())),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timed out sending CDP Runtime.evaluate request for {}",
+                target.instance
+            )
+        })??;
+        let deadline = Instant::now() + CDP_WS_RESPONSE_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "timed out waiting for CDP Runtime.evaluate response for {}",
+                    target.instance
+                ));
+            }
+            let message = timeout(remaining, socket.next()).await.map_err(|_| {
+                anyhow!(
+                    "timed out waiting for CDP Runtime.evaluate response for {}",
+                    target.instance
+                )
+            })?;
+            let Some(message) = message else {
+                return Err(anyhow!(
+                    "CDP websocket closed before Runtime.evaluate response"
+                ));
+            };
             let message = message?;
             let Message::Text(text) = message else {
                 continue;
@@ -666,9 +751,6 @@ impl BrowserPool {
             }
             return Ok(Value::Null);
         }
-        Err(anyhow!(
-            "CDP websocket closed before Runtime.evaluate response"
-        ))
     }
 
     async fn wait_for_prompt(&self, handle: &PageHandle) -> Result<()> {
@@ -1136,6 +1218,37 @@ mod tests {
     }
 
     #[test]
+    fn profile_lease_is_held_for_browser_pool_lifetime() {
+        let root = tempdir().unwrap();
+        let profile = root.path().join("profile");
+        fs::create_dir_all(&profile).unwrap();
+        let target = BrowserTarget {
+            account_id: "a".into(),
+            instance: "ia".into(),
+            driver: BrowserDriverKind::Orca,
+            user_data_dir: Some(profile),
+            cdp_endpoint: Some("http://127.0.0.1:9223".into()),
+            worktree: "active".into(),
+        };
+        let first = BrowserPool::new(
+            root.path().join("bridge-a"),
+            root.path().join("mount-a"),
+            legacy(),
+            BrowserDriverConfig::with_driver(Some(BrowserDriverKind::Orca), None, "active", None),
+        );
+        let second = BrowserPool::new(
+            root.path().join("bridge-b"),
+            root.path().join("mount-b"),
+            legacy(),
+            BrowserDriverConfig::with_driver(Some(BrowserDriverKind::Orca), None, "active", None),
+        );
+        first.ensure_profile_lease(&target).unwrap();
+        assert!(second.ensure_profile_lease(&target).is_err());
+        drop(first);
+        second.ensure_profile_lease(&target).unwrap();
+    }
+
+    #[test]
     fn isolated_browser_launch_arguments_bind_exact_profile_and_loopback_port() {
         let root = tempdir().unwrap();
         let target = BrowserTarget {
@@ -1166,5 +1279,13 @@ mod tests {
         assert!(validate_loopback_ws("ws://127.0.0.1:9222/devtools/page/abc").is_ok());
         assert!(validate_loopback_ws("ws://[::1]:9222/devtools/page/abc").is_ok());
         assert!(validate_loopback_ws("ws://192.0.2.8:9222/devtools/page/abc").is_err());
+    }
+
+    #[test]
+    fn cdp_websocket_timeouts_are_bounded() {
+        assert!(CDP_WS_CONNECT_TIMEOUT <= Duration::from_secs(10));
+        assert!(CDP_WS_RESPONSE_TIMEOUT <= Duration::from_secs(15));
+        assert!(CDP_WS_CONNECT_TIMEOUT < PAGE_READY_TIMEOUT);
+        assert!(CDP_WS_RESPONSE_TIMEOUT < PAGE_READY_TIMEOUT);
     }
 }

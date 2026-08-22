@@ -26,6 +26,8 @@ const DEFAULT_SYNC_WAIT_MS: u64 = 15_000;
 const DEFAULT_KILL_GRACE_MS: u64 = 1_500;
 const NORMAL_DESCENDANT_GRACE_MS: u64 = 100;
 const WAIT_TICK_MS: u64 = 20;
+const DEFAULT_MAX_ACTIVE_COMMANDS_GLOBAL: usize = 32;
+const DEFAULT_MAX_ACTIVE_COMMANDS_PER_SCOPE: usize = 8;
 const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 const ALLOWED_CHILD_ENV: &[&str] = &[
@@ -59,6 +61,8 @@ struct CommandManagerInner {
     sync_wait: Duration,
     kill_grace: Duration,
     allow_arbitrary: bool,
+    max_active_global: usize,
+    max_active_per_scope: usize,
 }
 
 #[derive(Default)]
@@ -210,6 +214,8 @@ impl CommandManager {
             Duration::from_millis(DEFAULT_SYNC_WAIT_MS),
             Duration::from_millis(DEFAULT_KILL_GRACE_MS),
             is_arbitrary_commands_allowed(),
+            DEFAULT_MAX_ACTIVE_COMMANDS_GLOBAL,
+            DEFAULT_MAX_ACTIVE_COMMANDS_PER_SCOPE,
         )
     }
 
@@ -218,18 +224,44 @@ impl CommandManager {
             Duration::from_millis(DEFAULT_SYNC_WAIT_MS),
             Duration::from_millis(DEFAULT_KILL_GRACE_MS),
             allow_arbitrary || is_arbitrary_commands_allowed(),
+            DEFAULT_MAX_ACTIVE_COMMANDS_GLOBAL,
+            DEFAULT_MAX_ACTIVE_COMMANDS_PER_SCOPE,
         )
     }
 
     #[cfg(test)]
     fn with_limits(sync_wait: Duration, kill_grace: Duration) -> Self {
-        Self::with_limits_and_policy(sync_wait, kill_grace, is_arbitrary_commands_allowed())
+        Self::with_limits_and_policy(
+            sync_wait,
+            kill_grace,
+            is_arbitrary_commands_allowed(),
+            DEFAULT_MAX_ACTIVE_COMMANDS_GLOBAL,
+            DEFAULT_MAX_ACTIVE_COMMANDS_PER_SCOPE,
+        )
+    }
+
+    #[cfg(test)]
+    fn with_capacity_limits(
+        sync_wait: Duration,
+        kill_grace: Duration,
+        max_active_global: usize,
+        max_active_per_scope: usize,
+    ) -> Self {
+        Self::with_limits_and_policy(
+            sync_wait,
+            kill_grace,
+            is_arbitrary_commands_allowed(),
+            max_active_global,
+            max_active_per_scope,
+        )
     }
 
     fn with_limits_and_policy(
         sync_wait: Duration,
         kill_grace: Duration,
         allow_arbitrary: bool,
+        max_active_global: usize,
+        max_active_per_scope: usize,
     ) -> Self {
         Self {
             inner: Arc::new(CommandManagerInner {
@@ -238,6 +270,8 @@ impl CommandManager {
                 sync_wait,
                 kill_grace,
                 allow_arbitrary,
+                max_active_global: max_active_global.max(1),
+                max_active_per_scope: max_active_per_scope.max(1),
             }),
         }
     }
@@ -349,6 +383,31 @@ impl CommandManager {
 
         {
             let mut state = lock_unpoisoned(&self.inner.state);
+            let global_active = state
+                .commands
+                .values()
+                .filter(|record| record.status == CommandStatus::Running)
+                .count();
+            if global_active >= self.inner.max_active_global {
+                return ToolCallResult::err(format!(
+                    "command admission limit reached: {} active daemon commands globally (limit {})",
+                    global_active, self.inner.max_active_global
+                ));
+            }
+            let scope_active = state
+                .commands
+                .values()
+                .filter(|record| {
+                    record.status == CommandStatus::Running && record.scope_id == scope_id
+                })
+                .count();
+            if scope_active >= self.inner.max_active_per_scope {
+                return ToolCallResult::err(format!(
+                    "command admission limit reached for scope {}: {} active commands (limit {})",
+                    scope_id, scope_active, self.inner.max_active_per_scope
+                ));
+            }
+
             revision = state
                 .workspace_revisions
                 .get(scope_id)
@@ -617,6 +676,8 @@ impl CommandManager {
             "generation": generation,
             "workspace_revision": current_revision,
             "active_count": active_count,
+            "active_limit_per_scope": self.inner.max_active_per_scope,
+            "active_limit_global": self.inner.max_active_global,
             "commands": commands,
         }))
     }
@@ -758,7 +819,13 @@ fn command_snapshot(
     record.stderr_cursor = stderr_page.next_offset;
 
     let mut value = command_summary(record, current_generation, current_revision);
-    let object = value.as_object_mut().expect("command summary is an object");
+    let Some(object) = value.as_object_mut() else {
+        return json!({
+            "command_id": record.command_id,
+            "status": "failed",
+            "error": "internal command summary serialization invariant failed"
+        });
+    };
     let stdout_key = if delta_names {
         "stdout_delta"
     } else {
@@ -1069,6 +1136,8 @@ mod tests {
         assert_eq!(DEFAULT_SYNC_WAIT_MS, 15_000);
         assert_eq!(MAX_POLL_WAIT_MS, 15_000);
         assert_eq!(MAX_RESPONSE_BYTES_PER_STREAM * 2, 64 * 1024);
+        assert_eq!(DEFAULT_MAX_ACTIVE_COMMANDS_GLOBAL, 32);
+        assert_eq!(DEFAULT_MAX_ACTIVE_COMMANDS_PER_SCOPE, 8);
     }
 
     #[test]
@@ -1106,14 +1175,12 @@ mod tests {
         assert_eq!(ring.end_offset, MAX_RING_BYTES_PER_STREAM as u64);
         assert_eq!(ring.dropped_bytes, 0);
 
-        // Push another small chunk that triggers partial bulk drain
         ring.push(b"12345");
         assert_eq!(ring.bytes.len(), MAX_RING_BYTES_PER_STREAM);
         assert_eq!(ring.start_offset, 5);
         assert_eq!(ring.end_offset, MAX_RING_BYTES_PER_STREAM as u64 + 5);
         assert_eq!(ring.dropped_bytes, 5);
 
-        // Push empty chunk
         ring.push(b"");
         assert_eq!(ring.bytes.len(), MAX_RING_BYTES_PER_STREAM);
         assert_eq!(ring.start_offset, 5);
@@ -1196,6 +1263,55 @@ mod tests {
         let data = polled.data.unwrap();
         assert_eq!(data["status"], "completed");
         assert_eq!(data["command_success"], true);
+    }
+
+    #[test]
+    fn active_command_limits_reject_scope_and_global_overload() {
+        let first_scope = uuid::Uuid::new_v4().to_string();
+        let second_scope = uuid::Uuid::new_v4().to_string();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Makefile"), "test:\n\t@sleep 1\n").unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        let manager = CommandManager::with_capacity_limits(
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+            2,
+            1,
+        );
+
+        let first = manager.run_command(&ws, &first_scope, "make test", 5_000, None);
+        assert!(first.success);
+        let first_id = first.data.unwrap()["command_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let same_scope = manager.run_command(&ws, &first_scope, "make test", 5_000, None);
+        assert!(!same_scope.success);
+        assert!(same_scope
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("admission limit reached for scope"));
+
+        let second = manager.run_command(&ws, &second_scope, "make test", 5_000, None);
+        assert!(second.success);
+        let second_id = second.data.unwrap()["command_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let third_scope = uuid::Uuid::new_v4().to_string();
+        let global = manager.run_command(&ws, &third_scope, "make test", 5_000, None);
+        assert!(!global.success);
+        assert!(global
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("active daemon commands globally"));
+
+        let _ = manager.cancel_command(&ws, &first_scope, &first_id);
+        let _ = manager.cancel_command(&ws, &second_scope, &second_id);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::account_state::{AccountHealth, AccountRuntimeState};
 use crate::accounts::AccountConfig;
 use crate::browser_pool::{BrowserHealth, BrowserLoginState, BrowserPool, BrowserReachability};
+use crate::orca::BrowserDriverKind;
 use crate::router::AccountRouter;
 use crate::security::WorkspaceMux;
 use crate::tools::task_state::load_delegation_lifecycle;
@@ -76,31 +77,41 @@ pub async fn recover_stale_account_health(
             .state_for_account(&account.id, now_ms)
             .with_context(|| format!("failed to inspect account health for '{}'", account.id))?;
         if state.health != AccountHealth::Ready {
-            candidates.push(account.id.clone());
+            candidates.push(account);
         }
     }
     let health = join_all(
         candidates
             .iter()
-            .map(|account_id| browsers.health(account_id)),
+            .map(|account| browsers.health(&account.id)),
     )
     .await;
     let mut recovered = 0usize;
-    for (account_id, browser) in candidates.iter().zip(health.iter()) {
+    for (account, browser) in candidates.iter().zip(health.iter()) {
         match browser.login_state {
             BrowserLoginState::Ready => {
                 router
-                    .mark_ready(account_id, now_ms)
-                    .with_context(|| format!("failed to mark account '{}' ready", account_id))?;
+                    .mark_ready(&account.id, now_ms)
+                    .with_context(|| format!("failed to mark account '{}' ready", account.id))?;
+                recovered += 1;
+            }
+            BrowserLoginState::Unknown if can_recover_legacy_cmux_auth(browser) => {
+                // The legacy cmux driver can prove its browser is reachable but cannot enumerate
+                // an existing ChatGPT page to distinguish a logged-in session from an old auth
+                // failure. Clear only the stale scheduler block here; staging still performs the
+                // authoritative composer probe before sending any user task.
+                router.mark_ready(&account.id, now_ms).with_context(|| {
+                    format!("failed to recover legacy account '{}'", account.id)
+                })?;
                 recovered += 1;
             }
             BrowserLoginState::AuthenticationRequired => {
                 router
-                    .mark_auth_required(account_id, now_ms)
+                    .mark_auth_required(&account.id, now_ms)
                     .with_context(|| {
                         format!(
                             "failed to preserve auth-required state for '{}'",
-                            account_id
+                            account.id
                         )
                     })?;
             }
@@ -108,6 +119,12 @@ pub async fn recover_stale_account_health(
         }
     }
     Ok(recovered)
+}
+
+fn can_recover_legacy_cmux_auth(browser: &BrowserHealth) -> bool {
+    browser.login_state == BrowserLoginState::Unknown
+        && browser.reachability == BrowserReachability::Reachable
+        && browser.driver == Some(BrowserDriverKind::Cmux)
 }
 
 pub async fn collect_account_diagnostics(
@@ -364,11 +381,40 @@ mod tests {
         BrowserHealth {
             account_id: "alpha".into(),
             instance: "alpha-browser".into(),
+            driver: Some(BrowserDriverKind::Orca),
             reachability: BrowserReachability::Reachable,
             login_state: BrowserLoginState::Ready,
             login_required: false,
             detail: Some("this field must not enter diagnostics".into()),
         }
+    }
+
+    #[test]
+    fn only_reachable_unknown_cmux_health_recovers_stale_auth() {
+        let cmux_unknown = BrowserHealth {
+            driver: Some(BrowserDriverKind::Cmux),
+            login_state: BrowserLoginState::Unknown,
+            ..browser()
+        };
+        assert!(can_recover_legacy_cmux_auth(&cmux_unknown));
+
+        let cmux_unreachable = BrowserHealth {
+            reachability: BrowserReachability::Unreachable,
+            ..cmux_unknown.clone()
+        };
+        assert!(!can_recover_legacy_cmux_auth(&cmux_unreachable));
+
+        let explicit_auth_required = BrowserHealth {
+            login_state: BrowserLoginState::AuthenticationRequired,
+            ..cmux_unknown
+        };
+        assert!(!can_recover_legacy_cmux_auth(&explicit_auth_required));
+
+        let orca_unknown = BrowserHealth {
+            login_state: BrowserLoginState::Unknown,
+            ..browser()
+        };
+        assert!(!can_recover_legacy_cmux_auth(&orca_unknown));
     }
 
     #[test]

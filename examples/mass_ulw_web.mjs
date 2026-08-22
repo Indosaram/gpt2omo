@@ -43,7 +43,7 @@ export function parallelPairInvocation({
   }));
   return {
     program: binary,
-    args: [...commonArgs(bridgeUrl), "--batch-stdin", "--json"],
+    args: [...commonArgs(bridgeUrl), "--batch-stdin", "--json", "--progress-json"],
     stdin: JSON.stringify({ tasks: normalized }),
   };
 }
@@ -83,7 +83,7 @@ export function closeInvocation({
   };
 }
 
-export async function runInvocation(invocation, { cwd, env = process.env } = {}) {
+export async function runInvocation(invocation, { cwd, env = process.env, onProgress } = {}) {
   return await new Promise((resolve, reject) => {
     const child = spawn(invocation.program, invocation.args, {
       cwd,
@@ -92,9 +92,26 @@ export async function runInvocation(invocation, { cwd, env = process.env } = {})
     });
     let stdout = "";
     let stderr = "";
+    let pendingLine = "";
+    let finalResult;
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      pendingLine += chunk;
+      const lines = pendingLine.split("\n");
+      pendingLine = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+          if (event.event) onProgress?.(event);
+          else finalResult = event;
+        } catch (error) {
+          reject(new Error(`invalid delegate JSON line: ${error.message}; line=${line}`));
+        }
+      }
+    });
     child.stderr.on("data", (chunk) => (stderr += chunk));
     child.on("error", reject);
     child.on("close", (code) => {
@@ -102,11 +119,21 @@ export async function runInvocation(invocation, { cwd, env = process.env } = {})
         reject(new Error(`delegate_to_chatgpt_web exited ${code}: ${stderr.trim()}`));
         return;
       }
-      try {
-        resolve(JSON.parse(stdout));
-      } catch (error) {
-        reject(new Error(`invalid delegate JSON: ${error.message}; stdout=${stdout}`));
+      if (pendingLine.trim()) {
+        try {
+          const event = JSON.parse(pendingLine);
+          if (event.event) onProgress?.(event);
+          else finalResult = event;
+        } catch (error) {
+          reject(new Error(`invalid delegate JSON line: ${error.message}; stdout=${stdout}`));
+          return;
+        }
       }
+      if (!finalResult?.terminal) {
+        reject(new Error(`delegate exited without terminal JSON: stdout=${stdout}`));
+        return;
+      }
+      resolve(finalResult);
     });
     if (invocation.stdin !== undefined) child.stdin.write(invocation.stdin);
     child.stdin.end();

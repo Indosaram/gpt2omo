@@ -47,12 +47,34 @@ pub async fn cleanup_expired_retained_sessions(
             Some(binding) => browsers.close(binding).await,
             None => Ok(()),
         };
-        let scope_removed = if close_result.is_ok() {
-            let workspace = mux.resolve(&claimed.scope_id)?;
-            release_session_retention(&workspace, &claimed.scope_id)
-                .map_err(crate::BridgeError::Path)?;
-            mux.remove(&claimed.scope_id)?;
-            true
+        let page_closed = close_result.is_ok();
+        let mut cleanup_error = close_result.as_ref().err().map(ToString::to_string);
+        let scope_removed = if page_closed {
+            match mux.resolve(&claimed.scope_id) {
+                Ok(workspace) => match mux.remove(&claimed.scope_id) {
+                    Ok(()) => {
+                        if let Err(error) = release_session_retention(&workspace, &claimed.scope_id)
+                        {
+                            cleanup_error = Some(format!(
+                                "browser tab closed and scope removed, but retained lifecycle cleanup failed: {error}"
+                            ));
+                        }
+                        true
+                    }
+                    Err(error) => {
+                        cleanup_error = Some(format!(
+                            "browser tab closed, but scope metadata cleanup failed; retry is safe because browser close is idempotent for CDP targets: {error}"
+                        ));
+                        false
+                    }
+                },
+                Err(error) => {
+                    cleanup_error = Some(format!(
+                        "browser tab closed, but workspace resolution failed before scope cleanup: {error}"
+                    ));
+                    false
+                }
+            }
         } else {
             false
         };
@@ -71,8 +93,8 @@ pub async fn cleanup_expired_retained_sessions(
                 .as_ref()
                 .map(|binding| binding.instance.clone()),
             scope_removed,
-            page_closed: close_result.is_ok(),
-            close_error: close_result.err().map(|error| error.to_string()),
+            page_closed,
+            close_error: cleanup_error,
         });
     }
 
@@ -268,6 +290,7 @@ mod tests {
         )
         .unwrap();
         let lifecycle = retain_session_with_lease(&workspace, &scope.scope_id, 1).unwrap();
+        let lease_expires_ms = lifecycle.lease_expires_ms;
         let pool = BrowserPool::new(
             &bridge,
             &mount,
@@ -302,5 +325,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(lifecycle.session_retained);
+        assert_eq!(lifecycle.lease_expires_ms, lease_expires_ms);
     }
 }
