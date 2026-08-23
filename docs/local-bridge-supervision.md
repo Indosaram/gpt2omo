@@ -14,6 +14,18 @@ This guide installs two per-user `launchd` agents:
 Neither agent deletes scopes. They share the existing scope directory, so a restart
 preserves generation state and retained-session leases.
 
+Every `delegate_to_chatgpt_web` invocation must use the same broad mount root as the
+bridge. The helper validates a retained scope's stored workspace before it contacts
+the bridge, so its default of the current directory can reject a valid scope from
+another repository:
+
+```bash
+./target/debug/delegate_to_chatgpt_web \
+  --bridge-url http://127.0.0.1:18800 \
+  --mount-root / \
+  --resume-scope '<exact-retained-scope-id>' --stdin --json
+```
+
 ## Prerequisites
 
 Build both binaries before installation:
