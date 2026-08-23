@@ -113,7 +113,7 @@ impl Cli {
     fn orca(&self) -> OrcaConfig {
         OrcaConfig::with_driver(
             self.browser_driver,
-            Some(self.orca_bin.clone().into()),
+            (self.orca_bin != "orca").then(|| self.orca_bin.clone().into()),
             self.worktree.clone(),
             self.terminal.clone(),
         )
@@ -572,6 +572,13 @@ mod tests {
         .expect("explicit Orca relay CLI should parse");
         assert_eq!(cli.browser_driver, Some(BrowserDriverKind::Orca));
         assert_eq!(cli.orca_bin, "orca");
+    }
+
+    #[test]
+    fn explicit_cmux_driver_does_not_inherit_default_orca_binary() {
+        let cli = Cli::try_parse_from(["gpt2omo-relay", "--browser-driver", "cmux"])
+            .expect("explicit cmux relay CLI should parse");
+        assert_eq!(cli.orca().binary, None);
     }
 
     #[test]
