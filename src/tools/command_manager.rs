@@ -1250,7 +1250,13 @@ mod tests {
     #[test]
     fn slow_command_auto_detaches_and_long_poll_finishes() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("Makefile"), "test:\n\t@sleep 0.80\n").unwrap();
+        let gate = dir.path().join("gate");
+        assert!(Command::new("mkfifo")
+            .arg(&gate)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(dir.path().join("Makefile"), "test:\n\t@cat gate > /dev/null\n").unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         let manager = test_manager();
         let result = manager.run_command(&ws, SCOPE, "make test", 2_000, None);
@@ -1258,7 +1264,14 @@ mod tests {
         let data = result.data.unwrap();
         assert_eq!(data["status"], "detached_running");
         let command_id = data["command_id"].as_str().unwrap();
+        let gate_writer = thread::spawn(move || {
+            use std::io::Write;
+
+            let mut gate = fs::OpenOptions::new().write(true).open(gate).unwrap();
+            gate.write_all(b"release\n").unwrap();
+        });
         let polled = manager.poll_command(&ws, SCOPE, command_id, Some(2_000));
+        gate_writer.join().unwrap();
         assert!(polled.success);
         let data = polled.data.unwrap();
         assert_eq!(data["status"], "completed");
