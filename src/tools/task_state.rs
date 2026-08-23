@@ -501,16 +501,42 @@ pub fn handle_task_result(
         Ok(lock) => lock,
         Err(error) => return ToolCallResult::err(error),
     };
-    let lifecycle = match load_delegation_lifecycle(ws, scope_id) {
-        Ok(Some(lifecycle)) if lifecycle.terminal_state.is_none() => lifecycle,
-        Ok(Some(_)) => {
-            return ToolCallResult::err(
-                "Cannot record task result after this delegation generation is terminal",
-            )
-        }
-        Ok(None) => return ToolCallResult::err("No active delegation lifecycle exists"),
-        Err(error) => return ToolCallResult::err(error),
-    };
+    let lifecycle =
+        match load_delegation_lifecycle(ws, scope_id) {
+            Ok(Some(lifecycle)) if lifecycle.terminal_state.is_none() => lifecycle,
+            Ok(Some(lifecycle))
+                if lifecycle.terminal_state == Some(DelegationTerminalState::Completed) =>
+            {
+                let previous_result = match load_task_result(ws, scope_id, lifecycle.generation) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => return ToolCallResult::err(
+                        "Cannot record task result after this delegation generation is terminal",
+                    ),
+                    Err(error) => return ToolCallResult::err(error),
+                };
+                let task_state = match load_task_state(ws, scope_id) {
+                    Ok(Some(state)) => state,
+                    Ok(None) => return ToolCallResult::err(
+                        "Cannot record task result after this delegation generation is terminal",
+                    ),
+                    Err(error) => return ToolCallResult::err(error),
+                };
+                if previous_result.recorded_ms < task_state.updated_ms {
+                    lifecycle
+                } else {
+                    return ToolCallResult::err(
+                        "Cannot record task result after this delegation generation is terminal",
+                    );
+                }
+            }
+            Ok(Some(_)) => {
+                return ToolCallResult::err(
+                    "Cannot record task result after this delegation generation is terminal",
+                )
+            }
+            Ok(None) => return ToolCallResult::err("No active delegation lifecycle exists"),
+            Err(error) => return ToolCallResult::err(error),
+        };
     let result = TaskResult {
         version: 1,
         scope_id: scope_id.to_string(),
@@ -995,6 +1021,9 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::completion::{
+        handle_completion_check, handle_completion_check_with_result, CompletionResultInput,
+    };
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::tempdir;
@@ -1232,6 +1261,93 @@ mod tests {
         .unwrap();
         assert_eq!(state.terminal_state, Some(DelegationTerminalState::Failed));
         assert_eq!(state.terminal_detail.as_deref(), Some("transport failed"));
+    }
+
+    #[test]
+    fn completed_generation_refreshes_stale_result_when_inline_completion_result_is_supplied() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        assert!(handle_task_plan(&ws, SCOPE_A, "Implement", vec!["Finish".into()]).success);
+        assert!(handle_task_update(&ws, SCOPE_A, "T1", "done", None).success);
+        assert!(
+            handle_task_result(
+                &ws,
+                SCOPE_A,
+                "Initial result",
+                vec![],
+                vec![],
+                vec![],
+                "Initial result.",
+            )
+            .success
+        );
+        assert_eq!(
+            handle_completion_check(&ws, SCOPE_A, Some(true), Some(false), Some(false))
+                .data
+                .unwrap()["ready"],
+            true
+        );
+
+        let previous = load_task_result(&ws, SCOPE_A, 1).unwrap().unwrap();
+        let mut state = load_task_state(&ws, SCOPE_A).unwrap().unwrap();
+        state.updated_ms = previous.recorded_ms.saturating_add(1);
+        save_task_state(&ws, SCOPE_A, &state).unwrap();
+
+        let refreshed = handle_completion_check_with_result(
+            &ws,
+            SCOPE_A,
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(CompletionResultInput {
+                summary: "Refreshed result".into(),
+                changed_files: vec![],
+                verification: vec![],
+                blockers: vec![],
+                final_message: "Refreshed result.".into(),
+            }),
+        );
+
+        assert!(refreshed.success);
+        let data = refreshed.data.unwrap();
+        assert_eq!(data["ready"], true);
+        assert_eq!(data["task_result"]["summary"], "Refreshed result");
+    }
+
+    #[test]
+    fn stale_structured_result_requires_refresh_after_task_state_update() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+        assert!(handle_task_plan(&ws, SCOPE_A, "Implement", vec!["Finish".into()]).success);
+        assert!(
+            handle_task_result(
+                &ws,
+                SCOPE_A,
+                "Premature result",
+                vec![],
+                vec![],
+                vec![],
+                "Premature result.",
+            )
+            .success
+        );
+        assert!(handle_task_update(&ws, SCOPE_A, "T1", "done", None).success);
+        let previous = load_task_result(&ws, SCOPE_A, 1).unwrap().unwrap();
+        let mut state = load_task_state(&ws, SCOPE_A).unwrap().unwrap();
+        state.updated_ms = state.updated_ms.max(previous.recorded_ms.saturating_add(1));
+        save_task_state(&ws, SCOPE_A, &state).unwrap();
+
+        let result = handle_completion_check(&ws, SCOPE_A, Some(true), Some(false), Some(false));
+        assert!(result.success);
+        let data = result.data.unwrap();
+        assert_eq!(data["ready"], false);
+        assert!(data["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().contains("task_result is stale")));
     }
 
     #[test]

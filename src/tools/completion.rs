@@ -436,38 +436,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_structured_result_requires_refresh_after_task_state_update() {
-        let dir = tempdir().unwrap();
-        let ws = Workspace::open(dir.path()).unwrap();
-        start_fresh_delegation_lifecycle(&ws, SCOPE).unwrap();
-        assert!(handle_task_plan(&ws, SCOPE, "Implement", vec!["Finish".into()]).success);
-        assert!(
-            handle_task_result(
-                &ws,
-                SCOPE,
-                "Premature result",
-                vec![],
-                vec![],
-                vec![],
-                "Premature result.",
-            )
-            .success
-        );
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        assert!(handle_task_update(&ws, SCOPE, "T1", "done", None).success);
-
-        let result = handle_completion_check(&ws, SCOPE, Some(true), Some(false), Some(false));
-        assert!(result.success);
-        let data = result.data.unwrap();
-        assert_eq!(data["ready"], false);
-        assert!(data["blockers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item.as_str().unwrap().contains("task_result is stale")));
-    }
-
-    #[test]
     fn manager_backed_completion_rejects_stale_revision_evidence() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
