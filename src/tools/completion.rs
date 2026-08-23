@@ -155,8 +155,10 @@ fn handle_completion_check_inner(
                 serde_json::to_value(result).ok()
             }
             Ok(None) => {
-                blockers
-                    .push("No structured task_result exists for this delegation generation".into());
+                blockers.push(
+                    "No structured task_result exists for this delegation generation; call completion_check with a result object (summary, changed_files, verification, blockers, final_message)"
+                        .into(),
+                );
                 None
             }
             Err(error) => {
@@ -404,6 +406,28 @@ mod tests {
         let data = result.data.unwrap();
         assert!(data["ready"].as_bool().unwrap());
         assert_eq!(data["task_result"]["summary"], "Inline result transport");
+    }
+
+    #[test]
+    fn missing_task_result_blocker_teaches_submission() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        start_fresh_delegation_lifecycle(&ws, SCOPE).unwrap();
+
+        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        assert!(result.success);
+        let data = result.data.unwrap();
+        assert_eq!(data["ready"], false);
+        let missing = data["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|blocker| blocker.contains("No structured task_result"))
+            .expect("missing task_result blocker");
+        assert!(missing.contains("completion_check"));
+        assert!(missing.contains("summary"));
+        assert!(missing.contains("final_message"));
     }
 
     #[test]

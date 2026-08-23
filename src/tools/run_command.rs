@@ -12,8 +12,8 @@ pub struct PreparedCommand {
 }
 
 pub const ALLOWED_BINARIES: &[&str] = &[
-    "cargo", "rustc", "npm", "pnpm", "yarn", "bun", "node", "python", "python3", "pytest", "uv",
-    "go", "make", "git", "vitest", "jest", "tsc", "biome", "ruff", "sg", "ast-grep",
+    "cargo", "rustc", "npm", "pnpm", "yarn", "bun", "bunx", "node", "python", "python3", "pytest",
+    "uv", "go", "make", "git", "vitest", "jest", "tsc", "biome", "ruff", "sg", "ast-grep",
 ];
 
 pub const BLOCKED_SHELL_WRAPPERS: &[&str] = &[
@@ -406,8 +406,9 @@ mod tests {
     #[test]
     fn test_allowed_binaries_pass_validation() {
         let expected_allowed = [
-            "cargo", "rustc", "npm", "pnpm", "yarn", "bun", "node", "python", "python3", "pytest",
-            "uv", "go", "make", "git", "vitest", "jest", "tsc", "biome", "ruff", "sg", "ast-grep",
+            "cargo", "rustc", "npm", "pnpm", "yarn", "bun", "bunx", "node", "python", "python3",
+            "pytest", "uv", "go", "make", "git", "vitest", "jest", "tsc", "biome", "ruff", "sg",
+            "ast-grep",
         ];
         for bin in expected_allowed {
             assert!(

@@ -349,6 +349,12 @@ pub fn is_verification_command(command: &str) -> bool {
         "npm run build",
         "npm run lint",
         "npm run typecheck",
+        "bun test",
+        "bun run test",
+        "bun run build",
+        "bun run lint",
+        "bun run typecheck",
+        "bunx tsc",
         "pytest",
         "vitest",
         "go test",
@@ -1438,6 +1444,23 @@ mod tests {
         assert_eq!(state.last_mutation_path.as_deref(), Some("src/lib.rs"));
         assert_eq!(state.verifications.len(), 1);
         assert!(state.verifications[0].success);
+    }
+
+    #[test]
+    fn bun_toolchain_commands_are_verification_commands() {
+        for command in [
+            "bun test",
+            "bun run test",
+            "bun run build",
+            "bun run lint",
+            "bun run typecheck",
+            "bunx tsc --noEmit",
+            "BUN TEST",
+        ] {
+            assert!(is_verification_command(command), "{command} should count");
+        }
+        assert!(!is_verification_command("bun install"));
+        assert!(!is_verification_command("bunx sh -c anything"));
     }
 
     #[test]

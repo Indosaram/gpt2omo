@@ -101,8 +101,12 @@ arguments for the bridge and relay when local control endpoints need bearer auth
 `run_command` intentionally clears each child environment and rebuilds it from the
 bridge's own PATH. Adding the Rust toolchain directory here is therefore required for
 allowlisted `cargo` and `rustc` commands. It also makes `rust-analyzer` available to
-the MCP language-server tool. Do not widen command policy or add an arbitrary-command
-exception just to compensate for a missing LaunchAgent PATH.
+the MCP language-server tool. The same rule covers the JavaScript toolchain
+directories (`~/.bun/bin` for `bun`/`bunx`/`tsc`, `~/.local/bin` and
+`/opt/homebrew/bin` for `node`/`npm`); without them, delegated UI verification such
+as `bun --cwd ui run test` or `bunx tsc --noEmit` fails before the command runs. Do
+not widen command policy or add an arbitrary-command exception just to compensate
+for a missing LaunchAgent PATH.
 
 ## Install the relay agent
 
