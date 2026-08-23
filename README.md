@@ -320,6 +320,8 @@ The default browser policy is **cmux first, then Orca fallback**. Leave
 created so the browser tab is visible. See
 [`docs/multi-account-and-shared-safety.md`](docs/multi-account-and-shared-safety.md)
 for isolated multi-account onboarding, profile/CDP requirements, and activation safety.
+For a local bridge that must survive terminal, agent, and login-session handoffs, use
+the scope-safe [`launchd` supervision guide](docs/local-bridge-supervision.md).
 
 ---
 

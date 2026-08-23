@@ -1,0 +1,187 @@
+# Local bridge and relay supervision on macOS
+
+`gpt2omo` and `gpt2omo-relay` must be owned by a process supervisor when they are
+used as shared local infrastructure. Starting either binary from an interactive
+terminal, a tool PTY, or a one-off agent command makes its lifetime depend on that
+session. A turn ending must not make the bridge disappear.
+
+This guide installs two per-user `launchd` agents:
+
+- `com.omo.gpt2omo.bridge`: owns the loopback MCP/SSE bridge.
+- `com.omo.gpt2omo.relay`: owns continuation-event delivery and retained-session
+  reaping.
+
+Neither agent deletes scopes. They share the existing scope directory, so a restart
+preserves generation state and retained-session leases.
+
+## Prerequisites
+
+Build both binaries before installation:
+
+```bash
+cargo build --bin gpt2omo --bin gpt2omo-relay
+```
+
+The examples use these local paths:
+
+```text
+repository: /Users/YOU/code/project/omo-bridge
+scope directory: /Users/YOU/.omo/bridge/scopes-18800
+cmux binary directory: /Applications/cmux.app/Contents/Resources/bin
+```
+
+Replace `YOU` with your macOS account name. `launchd` does not expand `~` inside a
+plist, so every path in the service definition must be absolute.
+
+## Install the bridge agent
+
+Create `~/Library/LaunchAgents/com.omo.gpt2omo.bridge.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.omo.gpt2omo.bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/code/project/omo-bridge/target/debug/gpt2omo</string>
+    <string>--mount-root</string>
+    <string>/</string>
+    <string>--scope-dir</string>
+    <string>/Users/YOU/.omo/bridge/scopes-18800</string>
+    <string>--insecure-no-auth</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/YOU/code/project/omo-bridge</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/YOU/.cargo/bin:/Applications/cmux.app/Contents/Resources/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/YOU</string>
+    <key>CARGO_HOME</key>
+    <string>/Users/YOU/.cargo</string>
+    <key>RUSTUP_HOME</key>
+    <string>/Users/YOU/.rustup</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/.omo/bridge/gpt2omo.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/.omo/bridge/gpt2omo.launchd.err.log</string>
+</dict>
+</plist>
+```
+
+The `--insecure-no-auth` profile is only for a trusted local account with the bridge
+bound to `127.0.0.1`; scope IDs remain the per-delegation capability. Do not expose
+that profile on a non-loopback interface. Use matching `--token` or `--token-file`
+arguments for the bridge and relay when local control endpoints need bearer auth.
+
+`run_command` intentionally clears each child environment and rebuilds it from the
+bridge's own PATH. Adding the Rust toolchain directory here is therefore required for
+allowlisted `cargo` and `rustc` commands. It also makes `rust-analyzer` available to
+the MCP language-server tool. Do not widen command policy or add an arbitrary-command
+exception just to compensate for a missing LaunchAgent PATH.
+
+## Install the relay agent
+
+Create `~/Library/LaunchAgents/com.omo.gpt2omo.relay.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.omo.gpt2omo.relay</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/code/project/omo-bridge/target/debug/gpt2omo-relay</string>
+    <string>--mount-root</string>
+    <string>/</string>
+    <string>--scope-dir</string>
+    <string>/Users/YOU/.omo/bridge/scopes-18800</string>
+    <string>--events-url</string>
+    <string>http://127.0.0.1:18800/events</string>
+    <string>--browser-driver</string>
+    <string>cmux</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/YOU/code/project/omo-bridge</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Applications/cmux.app/Contents/Resources/bin:/Users/YOU/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/.omo/bridge/gpt2omo-relay.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/.omo/bridge/gpt2omo-relay.launchd.err.log</string>
+</dict>
+</plist>
+```
+
+The explicit `cmux` selection and GUI-app binary path matter: user LaunchAgents do
+not inherit an interactive shell's `PATH`. Without them, driver auto-discovery can
+fall back to a different installed browser helper and reject retained scopes that are
+affine to cmux.
+
+## Load and verify
+
+Validate and load both agents:
+
+```bash
+plutil -lint ~/Library/LaunchAgents/com.omo.gpt2omo.bridge.plist
+plutil -lint ~/Library/LaunchAgents/com.omo.gpt2omo.relay.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.omo.gpt2omo.bridge.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.omo.gpt2omo.relay.plist
+curl -fsS http://127.0.0.1:18800/healthz
+launchctl print "gui/$(id -u)/com.omo.gpt2omo.bridge"
+launchctl print "gui/$(id -u)/com.omo.gpt2omo.relay"
+```
+
+`KeepAlive` restarts a bridge process that exits or receives a signal. Validate that
+behavior only with zero active and reserved workers:
+
+```bash
+launchctl kill SIGTERM "gui/$(id -u)/com.omo.gpt2omo.bridge"
+curl -fsS http://127.0.0.1:18800/healthz
+```
+
+Inspect the persistent logs when a service does not start:
+
+```bash
+tail -n 100 ~/.omo/bridge/gpt2omo.launchd.err.log
+tail -n 100 ~/.omo/bridge/gpt2omo-relay.launchd.err.log
+```
+
+## Upgrade and recovery
+
+Rebuild first, then restart an agent only after confirming that no Web workers are
+active or reserved:
+
+```bash
+cargo build --bin gpt2omo --bin gpt2omo-relay
+launchctl kickstart -k "gui/$(id -u)/com.omo.gpt2omo.bridge"
+launchctl kickstart -k "gui/$(id -u)/com.omo.gpt2omo.relay"
+```
+
+Do not remove `~/.omo/bridge/scopes-18800`, delete a retained scope, or close a
+browser tab as part of service recovery. The relay's normal expiry checks already
+preserve a scope when its browser binding cannot be safely closed.
