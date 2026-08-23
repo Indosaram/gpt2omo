@@ -1256,7 +1256,11 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        fs::write(dir.path().join("Makefile"), "test:\n\t@cat gate > /dev/null\n").unwrap();
+        fs::write(
+            dir.path().join("Makefile"),
+            "test:\n\t@cat gate > /dev/null\n",
+        )
+        .unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         let manager = test_manager();
         let result = manager.run_command(&ws, SCOPE, "make test", 2_000, None);
