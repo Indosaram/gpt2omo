@@ -724,3 +724,59 @@ async fn verification_completion_and_continuation_events_keep_scope() {
         .unwrap()
         .contains(&scope_id));
 }
+
+#[tokio::test]
+async fn completion_check_accepts_result_json_string_fallback_smoke() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _, _, scope_id) = test_app(&dir);
+
+    // Start a delegation lifecycle so a structured result can be recorded.
+    let readiness = rpc(
+        app.clone(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 400,
+            "method": "tools/call",
+            "params": {
+                "name": "task_state",
+                "arguments": {"scope_id": scope_id}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(readiness["result"]["isError"], false);
+
+    let result_json = r#"{"summary":"Flat string transport","changed_files":["src/lib.rs"],"verification":["cargo test"],"blockers":[],"final_message":"All green."}"#;
+    let response = rpc(
+        app,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 401,
+            "method": "tools/call",
+            "params": {
+                "name": "completion_check",
+                "arguments": {
+                    "scope_id": scope_id,
+                    "require_task_plan": false,
+                    "require_verification": false,
+                    "result_json": result_json
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(response["result"]["isError"], false);
+    let nested = nested_tool_result(&response);
+    assert_eq!(nested["success"], true, "unexpected error: {:?}", nested["error"]);
+    let data = &nested["data"];
+    assert_eq!(data["task_result"]["summary"], "Flat string transport");
+    let blockers = data["blockers"].as_array().unwrap();
+    assert!(
+        !blockers
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|blocker| blocker.contains("No structured task_result")),
+        "result_json must satisfy the missing-task_result audit: {blockers:?}"
+    );
+}

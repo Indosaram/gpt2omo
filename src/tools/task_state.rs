@@ -55,6 +55,8 @@ pub struct DelegationLifecycle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_dispatch_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_state: Option<DelegationTerminalState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_ms: Option<u64>,
@@ -866,6 +868,31 @@ pub fn record_readiness_evidence(
     Ok(lifecycle)
 }
 
+pub fn record_actual_dispatch_evidence(
+    ws: &Workspace,
+    scope_id: &str,
+    expected_generation: u64,
+) -> std::result::Result<DelegationLifecycle, String> {
+    let mut lifecycle = load_delegation_lifecycle(ws, scope_id)?
+        .ok_or_else(|| "No active delegation lifecycle exists".to_string())?;
+    if lifecycle.generation != expected_generation {
+        return Err(format!(
+            "Refusing actual dispatch evidence for stale generation {} (current {})",
+            expected_generation, lifecycle.generation
+        ));
+    }
+    if lifecycle.terminal_state.is_some() {
+        return Err("Cannot record actual dispatch evidence after terminal state".to_string());
+    }
+    if lifecycle.actual_dispatch_ms.is_none() {
+        let now = now_ms();
+        lifecycle.actual_dispatch_ms = Some(now);
+        lifecycle.updated_ms = now;
+        save_lifecycle(ws, scope_id, &lifecycle)?;
+    }
+    Ok(lifecycle)
+}
+
 fn new_lifecycle(scope_id: &str, generation: u64) -> DelegationLifecycle {
     let now = now_ms();
     DelegationLifecycle {
@@ -874,6 +901,7 @@ fn new_lifecycle(scope_id: &str, generation: u64) -> DelegationLifecycle {
         generation,
         generation_started_ms: now,
         ready_ms: None,
+        actual_dispatch_ms: None,
         terminal_state: None,
         terminal_ms: None,
         terminal_detail: None,
@@ -1057,6 +1085,23 @@ mod tests {
         assert_eq!(state.goal, "Implement feature");
         assert_eq!(state.items[0].status, TaskStatus::Done);
         assert_eq!(state.items[0].note.as_deref(), Some("inspected"));
+    }
+
+    #[test]
+    fn actual_dispatch_evidence_is_generation_bound_and_idempotent() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        let lifecycle = start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
+
+        let recorded = record_actual_dispatch_evidence(&ws, SCOPE_A, lifecycle.generation).unwrap();
+        assert!(recorded.actual_dispatch_ms.is_some());
+        assert_eq!(
+            record_actual_dispatch_evidence(&ws, SCOPE_A, lifecycle.generation)
+                .unwrap()
+                .actual_dispatch_ms,
+            recorded.actual_dispatch_ms
+        );
+        assert!(record_actual_dispatch_evidence(&ws, SCOPE_A, lifecycle.generation + 1).is_err());
     }
 
     #[test]

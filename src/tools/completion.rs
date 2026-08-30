@@ -156,7 +156,7 @@ fn handle_completion_check_inner(
             }
             Ok(None) => {
                 blockers.push(
-                    "No structured task_result exists for this delegation generation; call completion_check with a result object (summary, changed_files, verification, blockers, final_message)"
+                    "No structured task_result exists for this delegation generation; call completion_check with a result object (summary, changed_files, verification, blockers, final_message). If your client strips nested object arguments, pass the same object serialized as the result_json string argument instead"
                         .into(),
                 );
                 None
