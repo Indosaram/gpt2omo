@@ -10,6 +10,14 @@ use url::Url;
 pub const ACCOUNTS_CONFIG_VERSION: u32 = 1;
 pub const LEGACY_ACCOUNT_ID: &str = "default";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserLaunchMode {
+    #[default]
+    ManagedLocal,
+    AttachOnly,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingStrategy {
@@ -113,6 +121,8 @@ pub struct BrowserInstanceConfig {
     pub user_data_dir: Option<PathBuf>,
     #[serde(default)]
     pub cdp_endpoint: Option<String>,
+    #[serde(default)]
+    pub launch_mode: BrowserLaunchMode,
     #[serde(default = "default_worktree")]
     pub worktree: String,
 }
@@ -120,10 +130,11 @@ pub struct BrowserInstanceConfig {
 impl BrowserInstanceConfig {
     pub fn legacy(worktree: impl Into<String>) -> Self {
         Self {
-            driver: None,
+            driver: Some(BrowserDriverKind::Chrome),
             instance: "legacy".to_string(),
             user_data_dir: None,
-            cdp_endpoint: None,
+            cdp_endpoint: Some("http://127.0.0.1:9222".to_string()),
+            launch_mode: BrowserLaunchMode::ManagedLocal,
             worktree: worktree.into(),
         }
     }
@@ -413,6 +424,11 @@ fn validate_browser(
             "account '{account_id}' browser.worktree must be non-empty"
         )));
     }
+    if browser.launch_mode == BrowserLaunchMode::AttachOnly && browser.user_data_dir.is_some() {
+        return Err(config_error(format!(
+            "account '{account_id}' browser.launch_mode attach_only must not set browser.user_data_dir"
+        )));
+    }
     if enabled && !instances.insert(instance.to_string()) {
         return Err(config_error(format!(
             "account '{account_id}' reuses browser.instance '{instance}'"
@@ -435,6 +451,11 @@ fn validate_browser(
                 "account '{account_id}' reuses browser.cdp_endpoint"
             )));
         }
+    }
+    if browser.launch_mode == BrowserLaunchMode::AttachOnly && browser.cdp_endpoint.is_none() {
+        return Err(config_error(format!(
+            "account '{account_id}' browser.launch_mode attach_only requires browser.cdp_endpoint"
+        )));
     }
     Ok(())
 }
@@ -535,9 +556,9 @@ fn validate_loopback_endpoint(account_id: &str, endpoint: &str) -> Result<String
             "account '{account_id}' browser.cdp_endpoint is invalid: {error}"
         ))
     })?;
-    if !matches!(parsed.scheme(), "http" | "https" | "ws" | "wss") {
+    if !matches!(parsed.scheme(), "http" | "https") {
         return Err(config_error(format!(
-            "account '{account_id}' browser.cdp_endpoint must use http, https, ws, or wss"
+            "account '{account_id}' browser.cdp_endpoint must use http or https"
         )));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -709,6 +730,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("reuses browser.instance"));
+    }
+
+    #[test]
+    fn attach_only_requires_a_loopback_cdp_endpoint() {
+        let (_root, bridge, mount) = roots();
+        let missing_endpoint = r#"{
+          "version":1,
+          "accounts":[{"id":"remote","browser":{"instance":"remote","launch_mode":"attach_only"}}]
+        }"#;
+        assert!(parse_accounts_config(missing_endpoint, &bridge, &mount)
+            .unwrap_err()
+            .to_string()
+            .contains("attach_only requires browser.cdp_endpoint"));
+    }
+
+    #[test]
+    fn chrome_driver_without_a_cdp_endpoint_remains_valid_for_router_only_use() {
+        let (_root, bridge, mount) = roots();
+        let config = r#"{
+          "version":1,
+          "accounts":[{"id":"chrome","browser":{"driver":"chrome","instance":"chrome"}}]
+        }"#;
+        assert!(parse_accounts_config(config, &bridge, &mount).is_ok());
     }
 
     #[test]

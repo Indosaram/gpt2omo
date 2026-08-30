@@ -100,6 +100,7 @@ pub fn prepare_pending_accounts_config(
             "enabled": true,
             "draining": false,
             "browser": {
+                "driver": "chrome",
                 "instance": account.instance,
                 "user_data_dir": account.user_data_dir,
                 "cdp_endpoint": account.cdp_endpoint,
@@ -309,7 +310,7 @@ mod tests {
         assert!(config
             .accounts
             .iter()
-            .all(|account| account.browser.driver.is_none()));
+            .all(|account| account.browser.driver == Some(BrowserDriverKind::Chrome)));
         assert!(!bridge.join("accounts.json").exists());
         assert!(pending_accounts_path(&bridge).exists());
         assert_eq!(

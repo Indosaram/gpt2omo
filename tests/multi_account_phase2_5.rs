@@ -160,8 +160,8 @@ fn draining_transition_preserves_forced_affinity_while_new_work_moves_elsewhere(
         r#"{
           "version":1,
           "accounts":[
-            {"id":"old","enabled":true,"draining":true,"browser":{"instance":"old"}},
-            {"id":"new","enabled":true,"browser":{"instance":"new"}}
+            {"id":"old","enabled":true,"draining":true,"browser":{"driver":"orca","instance":"old"}},
+            {"id":"new","enabled":true,"browser":{"driver":"orca","instance":"new"}}
           ]
         }"#,
     )
@@ -191,8 +191,8 @@ fn multi_account_config_without_real_profile_and_endpoint_is_not_sufficient_for_
         r#"{
           "version":1,
           "accounts":[
-            {"id":"a","browser":{"instance":"a"}},
-            {"id":"b","browser":{"instance":"b"}}
+            {"id":"a","browser":{"driver":"orca","instance":"a"}},
+            {"id":"b","browser":{"driver":"orca","instance":"b"}}
           ]
         }"#,
     )
@@ -207,5 +207,6 @@ fn multi_account_config_without_real_profile_and_endpoint_is_not_sufficient_for_
         .block_on(pool.create_chatgpt_page("a"))
         .unwrap_err()
         .to_string();
-    assert!(error.contains("distinct browser.cdp_endpoint and browser.user_data_dir"));
+    assert!(error.contains("distinct browser.cdp_endpoint"));
+    assert!(error.contains("managed_local ownership"));
 }

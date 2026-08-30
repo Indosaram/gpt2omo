@@ -22,7 +22,8 @@ pub use account_diagnostics::{
 };
 pub use accounts::{
     AccountConfig, AccountDefaults, AccountLimits, AccountsConfig, BrowserInstanceConfig,
-    CooldownConfig, LegacyAccountConfig, RoutingConfig, RoutingStrategy, LEGACY_ACCOUNT_ID,
+    BrowserLaunchMode, CooldownConfig, LegacyAccountConfig, RoutingConfig, RoutingStrategy,
+    LEGACY_ACCOUNT_ID,
 };
 pub use browser_pool::{
     BrowserHealth, BrowserLoginState, BrowserPool, BrowserReachability, BrowserTarget, PageHandle,

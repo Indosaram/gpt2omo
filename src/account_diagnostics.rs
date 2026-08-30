@@ -372,6 +372,7 @@ mod tests {
                 instance: "alpha-browser".into(),
                 user_data_dir: None,
                 cdp_endpoint: None,
+                launch_mode: Default::default(),
                 worktree: "active".into(),
             },
         }

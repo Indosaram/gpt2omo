@@ -202,7 +202,7 @@ impl WorkspaceMux {
             workspace,
             BrowserBinding::new(
                 LEGACY_ACCOUNT_ID,
-                BrowserDriverKind::Orca,
+                BrowserDriverKind::Chrome,
                 "legacy",
                 browser_page_id,
             ),

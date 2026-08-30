@@ -19,6 +19,7 @@ pub const MAX_RESET_AFTER_SECONDS: u64 = 31 * 24 * 60 * 60;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserDriverKind {
+    Chrome,
     Maho,
     Orca,
     Cmux,
@@ -28,13 +29,17 @@ pub enum BrowserDriverKind {
 
 impl BrowserDriverKind {
     pub fn supports_chatgpt_dom_probe(self) -> bool {
-        matches!(self, Self::Orca | Self::Cmux | Self::AgentBrowser)
+        matches!(
+            self,
+            Self::Chrome | Self::Orca | Self::Cmux | Self::AgentBrowser
+        )
     }
 }
 
 impl std::fmt::Display for BrowserDriverKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Chrome => write!(f, "chrome"),
             Self::Maho => write!(f, "maho"),
             Self::Orca => write!(f, "orca"),
             Self::Cmux => write!(f, "cmux"),
@@ -49,13 +54,14 @@ impl std::str::FromStr for BrowserDriverKind {
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().trim() {
+            "chrome" => Ok(Self::Chrome),
             "maho" => Ok(Self::Maho),
             "orca" => Ok(Self::Orca),
             "cmux" => Ok(Self::Cmux),
             "agent-browser" | "agent_browser" => Ok(Self::AgentBrowser),
             "aside" => Ok(Self::Aside),
             other => Err(anyhow!(
-                "unsupported browser driver '{other}'; supported: maho, orca, cmux, agent-browser, aside"
+                "unsupported browser driver '{other}'; supported: chrome, maho, orca, cmux, agent-browser, aside"
             )),
         }
     }
@@ -146,7 +152,7 @@ impl BrowserDriverConfig {
     ) -> Self {
         let bin_str: String = orca_bin.into();
         Self {
-            driver: None,
+            driver: Some(BrowserDriverKind::Chrome),
             binary: if bin_str.is_empty() || bin_str == "orca" {
                 None
             } else {
@@ -194,6 +200,7 @@ impl BrowserDriverConfig {
                 return Ok((*kind, bin.clone()));
             }
             let default_bin = match kind {
+                BrowserDriverKind::Chrome => PathBuf::from("google-chrome"),
                 BrowserDriverKind::Maho => {
                     resolve_maho_bin().unwrap_or_else(|| PathBuf::from("maho"))
                 }
@@ -223,6 +230,7 @@ impl BrowserDriverConfig {
 
 fn automatic_browser_driver_priority() -> &'static [(BrowserDriverKind, &'static str)] {
     &[
+        (BrowserDriverKind::Chrome, "google-chrome"),
         (BrowserDriverKind::Cmux, "cmux"),
         (BrowserDriverKind::Orca, "orca"),
         (BrowserDriverKind::Maho, "maho"),
@@ -433,6 +441,9 @@ fn classify_chatgpt_ui_snapshot(value: &Value) -> ChatgptUiCondition {
 pub async fn create_chatgpt_tab(config: &BrowserDriverConfig) -> Result<String> {
     let (kind, bin) = config.detect().await?;
     match kind {
+        BrowserDriverKind::Chrome => Err(anyhow!(
+            "the chrome driver requires browser.cdp_endpoint for direct CDP control"
+        )),
         BrowserDriverKind::Maho => create_chatgpt_tab_maho(&bin, config).await,
         BrowserDriverKind::Orca => create_chatgpt_tab_orca(&bin, config).await,
         BrowserDriverKind::Cmux => create_chatgpt_tab_cmux(&bin, config).await,
@@ -586,6 +597,9 @@ async fn create_chatgpt_tab_aside(bin: &PathBuf) -> Result<String> {
 pub async fn close_browser_page(config: &BrowserDriverConfig, page: &str) -> Result<()> {
     let (kind, bin) = config.detect().await?;
     match kind {
+        BrowserDriverKind::Chrome => Err(anyhow!(
+            "the chrome driver requires browser.cdp_endpoint for direct CDP control"
+        )),
         BrowserDriverKind::Maho => {
             let _ = run_command_json(&bin, &["tab", "close", page, "--json"]).await;
             Ok(())
@@ -769,6 +783,9 @@ fn validate_chatgpt_page_probe(value: &Value) -> Result<ChatgptPageProbe> {
 async fn eval_json(config: &BrowserDriverConfig, page: &str, expression: &str) -> Result<Value> {
     let (kind, bin) = config.detect().await?;
     match kind {
+        BrowserDriverKind::Chrome => Err(anyhow!(
+            "the chrome driver requires browser.cdp_endpoint for direct CDP control"
+        )),
         BrowserDriverKind::Orca => {
             let result = run_command_json(
                 &bin,
@@ -1143,10 +1160,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn automatic_driver_priority_prefers_cmux_then_orca() {
+    fn automatic_driver_priority_includes_chrome_before_cli_drivers() {
         assert_eq!(
             automatic_browser_driver_priority(),
             [
+                (BrowserDriverKind::Chrome, "google-chrome"),
                 (BrowserDriverKind::Cmux, "cmux"),
                 (BrowserDriverKind::Orca, "orca"),
                 (BrowserDriverKind::Maho, "maho"),
@@ -1158,6 +1176,10 @@ mod tests {
 
     #[test]
     fn parses_browser_driver_kinds() {
+        assert_eq!(
+            "chrome".parse::<BrowserDriverKind>().unwrap(),
+            BrowserDriverKind::Chrome
+        );
         assert_eq!(
             "maho".parse::<BrowserDriverKind>().unwrap(),
             BrowserDriverKind::Maho
@@ -1178,6 +1200,13 @@ mod tests {
             "cmux".parse::<BrowserDriverKind>().unwrap(),
             BrowserDriverKind::Cmux
         );
+    }
+
+    #[test]
+    fn new_browser_config_defaults_to_chrome() {
+        let config = BrowserDriverConfig::new("active", None, "orca");
+
+        assert_eq!(config.driver, Some(BrowserDriverKind::Chrome));
     }
 
     #[tokio::test]

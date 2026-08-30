@@ -1,5 +1,6 @@
 use crate::accounts::{
-    load_accounts_config, load_accounts_config_from_path, AccountConfig, LegacyAccountConfig,
+    load_accounts_config, load_accounts_config_from_path, AccountConfig, BrowserLaunchMode,
+    LegacyAccountConfig,
 };
 use crate::error::{BridgeError, Result as BridgeResult};
 use crate::orca::{
@@ -41,6 +42,7 @@ pub struct BrowserTarget {
     pub user_data_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cdp_endpoint: Option<String>,
+    pub launch_mode: BrowserLaunchMode,
     pub worktree: String,
 }
 
@@ -216,14 +218,20 @@ impl BrowserPool {
     async fn target_from_account(&self, account: &AccountConfig) -> Result<BrowserTarget> {
         let driver = match account.browser.driver {
             Some(driver) => driver,
-            None => self.legacy_driver.detect().await?.0,
+            None => BrowserDriverKind::Chrome,
         };
         Ok(BrowserTarget {
             account_id: account.id.clone(),
             instance: account.browser.instance.clone(),
             driver,
-            user_data_dir: account.browser.user_data_dir.clone(),
+            user_data_dir: account.browser.user_data_dir.clone().or_else(|| {
+                (account.id == crate::accounts::LEGACY_ACCOUNT_ID
+                    && driver == BrowserDriverKind::Chrome
+                    && account.browser.launch_mode == BrowserLaunchMode::ManagedLocal)
+                    .then(|| self.bridge_dir.join("browser-profiles/default"))
+            }),
             cdp_endpoint: account.browser.cdp_endpoint.clone(),
+            launch_mode: account.browser.launch_mode,
             worktree: account.browser.worktree.clone(),
         })
     }
@@ -333,11 +341,21 @@ impl BrowserPool {
             .cdp_endpoint
             .as_deref()
             .ok_or_else(|| anyhow!("browser target has no CDP endpoint"))?;
-        self.ensure_profile_lease(target)?;
+        if target.launch_mode == BrowserLaunchMode::ManagedLocal {
+            self.ensure_profile_lease(target)?;
+        }
         if self.ensure_cdp_reachable(endpoint).await.is_ok() {
             return Ok(());
         }
 
+        if target.launch_mode == BrowserLaunchMode::AttachOnly {
+            return Err(anyhow!(
+                "attach_only browser instance '{}' for account '{}' is unreachable at {}; gpt2omo will not start a local Chromium",
+                target.instance,
+                target.account_id,
+                endpoint
+            ));
+        }
         let executable = discover_chromium_executable().ok_or_else(|| {
             anyhow!(
                 "browser instance '{}' for account '{}' is unreachable at {} and no Chromium executable was found; start that profile manually or set OMO_CHROMIUM_BIN",
@@ -394,10 +412,12 @@ impl BrowserPool {
             .filter(|account| account.enabled || account.draining)
             .count();
         if live_instance_count > 1
-            && (target.cdp_endpoint.is_none() || target.user_data_dir.is_none())
+            && (target.cdp_endpoint.is_none()
+                || (target.launch_mode == BrowserLaunchMode::ManagedLocal
+                    && target.user_data_dir.is_none()))
         {
             return Err(anyhow!(
-                "multi-account browser isolation requires every enabled account to configure a distinct browser.cdp_endpoint and browser.user_data_dir; account '{}' is incomplete",
+                "multi-account browser isolation requires every enabled account to configure a distinct browser.cdp_endpoint plus browser.user_data_dir for managed_local ownership; account '{}' is incomplete",
                 target.account_id
             ));
         }
@@ -655,8 +675,7 @@ impl BrowserPool {
                     page_id
                 )
             })?;
-        validate_loopback_ws(&target.web_socket_debugger_url)?;
-        Ok(target.web_socket_debugger_url)
+        rebase_cdp_websocket_url(&target.web_socket_debugger_url, endpoint)
     }
 
     async fn cdp_eval(
@@ -974,6 +993,41 @@ fn validate_loopback_ws(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn rebase_cdp_websocket_url(debugger_url: &str, endpoint: &str) -> Result<String> {
+    validate_loopback_ws(debugger_url)?;
+    let target = Url::parse(debugger_url).context("invalid CDP websocket URL")?;
+    let configured = Url::parse(endpoint).context("invalid configured CDP endpoint")?;
+    if !matches!(configured.scheme(), "http" | "https") {
+        return Err(anyhow!(
+            "direct CDP browser backend requires an http(s) endpoint, got '{}'",
+            configured.scheme()
+        ));
+    }
+    let host = configured
+        .host_str()
+        .ok_or_else(|| anyhow!("configured CDP endpoint has no host"))?;
+    let mut rebased = target;
+    rebased
+        .set_host(Some(host))
+        .context("configured CDP endpoint has an invalid host")?;
+    rebased
+        .set_port(configured.port_or_known_default())
+        .map_err(|()| anyhow!("configured CDP endpoint has an invalid port"))?;
+    let websocket_scheme = match configured.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        scheme => {
+            return Err(anyhow!(
+                "direct CDP browser backend requires an http(s) endpoint, got '{scheme}'"
+            ));
+        }
+    };
+    rebased
+        .set_scheme(websocket_scheme)
+        .map_err(|()| anyhow!("configured CDP endpoint has an invalid scheme"))?;
+    Ok(rebased.to_string())
+}
+
 fn validate_page_id(page_id: &str) -> Result<()> {
     if page_id.is_empty()
         || page_id.len() > 256
@@ -1098,6 +1152,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_accounts_config_defaults_to_a_managed_chrome_profile() {
+        let root = tempdir().unwrap();
+        let bridge = root.path().join("bridge");
+        let mount = root.path().join("mount");
+        fs::create_dir_all(&bridge).unwrap();
+        fs::create_dir_all(&mount).unwrap();
+        let pool = BrowserPool::new(
+            &bridge,
+            &mount,
+            legacy(),
+            BrowserDriverConfig::new("active", None, "orca"),
+        );
+
+        let target = pool.target_for_account("default", false).await.unwrap();
+
+        assert_eq!(target.driver, BrowserDriverKind::Chrome);
+        assert_eq!(
+            target.cdp_endpoint.as_deref(),
+            Some("http://127.0.0.1:9222")
+        );
+        assert_eq!(
+            target.user_data_dir.as_deref(),
+            Some(bridge.join("browser-profiles/default").as_path())
+        );
+    }
+
+    #[tokio::test]
     async fn draining_account_is_unavailable_for_fresh_browser_work_but_binding_resolves() {
         let (_root, pool) = pool_with_config(
             r#"{"version":1,"accounts":[{"id":"a","enabled":true,"draining":true,"browser":{"driver":"orca","instance":"ia"}}]}"#,
@@ -1125,7 +1206,8 @@ mod tests {
             .validate_creation_isolation(&target)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("distinct browser.cdp_endpoint and browser.user_data_dir"));
+        assert!(error.contains("distinct browser.cdp_endpoint"));
+        assert!(error.contains("managed_local ownership"));
     }
 
     #[tokio::test]
@@ -1209,6 +1291,7 @@ mod tests {
             driver: BrowserDriverKind::Orca,
             user_data_dir: Some(profile),
             cdp_endpoint: Some("http://127.0.0.1:9223".into()),
+            launch_mode: BrowserLaunchMode::ManagedLocal,
             worktree: "active".into(),
         };
         let first = pool.try_lock_profile(&target).unwrap().unwrap();
@@ -1228,6 +1311,7 @@ mod tests {
             driver: BrowserDriverKind::Orca,
             user_data_dir: Some(profile),
             cdp_endpoint: Some("http://127.0.0.1:9223".into()),
+            launch_mode: BrowserLaunchMode::ManagedLocal,
             worktree: "active".into(),
         };
         let first = BrowserPool::new(
@@ -1257,6 +1341,7 @@ mod tests {
             driver: BrowserDriverKind::Orca,
             user_data_dir: Some(root.path().join("profile-a")),
             cdp_endpoint: Some("http://127.0.0.1:19223".into()),
+            launch_mode: BrowserLaunchMode::ManagedLocal,
             worktree: "active".into(),
         };
         let args = chromium_launch_args(&target).unwrap();
@@ -1279,6 +1364,31 @@ mod tests {
         assert!(validate_loopback_ws("ws://127.0.0.1:9222/devtools/page/abc").is_ok());
         assert!(validate_loopback_ws("ws://[::1]:9222/devtools/page/abc").is_ok());
         assert!(validate_loopback_ws("ws://192.0.2.8:9222/devtools/page/abc").is_err());
+    }
+
+    #[test]
+    fn attach_only_rebases_remote_debugger_websocket_to_local_forward() {
+        let rebased = rebase_cdp_websocket_url(
+            "ws://127.0.0.1:9223/devtools/page/target-1?token=abc",
+            "http://127.0.0.1:19223",
+        )
+        .unwrap();
+
+        assert_eq!(
+            rebased,
+            "ws://127.0.0.1:19223/devtools/page/target-1?token=abc"
+        );
+    }
+
+    #[test]
+    fn attach_only_rebases_secure_debugger_websocket_to_secure_local_forward() {
+        let rebased = rebase_cdp_websocket_url(
+            "ws://127.0.0.1:9223/devtools/page/target-1",
+            "https://127.0.0.1:19223",
+        )
+        .unwrap();
+
+        assert_eq!(rebased, "wss://127.0.0.1:19223/devtools/page/target-1");
     }
 
     #[test]

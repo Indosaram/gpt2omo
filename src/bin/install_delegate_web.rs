@@ -338,7 +338,7 @@ fn render_skill(delegate_bin: &Path) -> String {
         r#"---
 name: delegate-web
 description: Use when delegating coding work to ChatGPT Web, retaining terminal Web conversations for possible follow-up, resuming an exact retained scope, or explicitly closing one. Never uses OMO/Anthropic subagents and preserves OMO ownership of repo/worktree selection.
-compatibility: Requires gpt2omo, gpt2omo-relay, delegate_to_chatgpt_web, and cmux browser access (Orca is an automatic fallback).
+compatibility: Requires gpt2omo, gpt2omo-relay, delegate_to_chatgpt_web, and Chrome CDP access. Legacy cmux and Orca drivers remain opt-in.
 metadata:
   opencode/slash: "false"
 ---

@@ -16,7 +16,64 @@ Architecture and security design for `gpt2omo` Web delegation. This document is 
 
 Run `gpt2omo-account-onboard prepare --account <id> ...` to create the pending configuration, provision isolated profiles, and open the account login pages. After logging in, use `gpt2omo-account-onboard wait --timeout-seconds 600` (or `status` for one check), then `gpt2omo-account-onboard activate --confirm`. The command promotes `accounts.pending.json` to `accounts.json` only when every browser is ready and no active, retained, or unknown legacy scope remains. `docs/accounts.example.json` is a schema reference, not a file to copy over live routing.
 
-Each enabled account must have a unique `browser.instance`, `browser.user_data_dir`, and loopback `browser.cdp_endpoint`. The runtime uses the CDP endpoint to address the exact profile that owns each page; a separate cmux workspace alone does not isolate ChatGPT cookies.
+Each enabled account must have a unique `browser.instance` and loopback `browser.cdp_endpoint`. A `managed_local` account also requires a unique local `browser.user_data_dir`; an `attach_only` account owns its isolated profile on the remote Chrome host. The runtime uses the CDP endpoint to address the exact profile that owns each page; a separate cmux workspace alone does not isolate ChatGPT cookies.
+
+## Remote Chrome through an SSH CDP forward
+
+`gpt2omo` supports an externally supervised Chrome instance on a remote machine through
+an `attach_only` browser configuration. This mode deliberately keeps CDP loopback-only:
+the remote Chrome listens on its own `127.0.0.1` address and an authenticated SSH forward
+exposes it as a different local loopback port to the bridge, relay, and delegation helper.
+Never publish a Chrome CDP port through a tunnel, reverse proxy, LAN firewall rule, or public
+DNS name. CDP can execute JavaScript in the logged-in browser session.
+
+On the remote browser host, run a dedicated Chrome profile under a persistent service manager:
+
+```bash
+google-chrome \
+  --user-data-dir="$HOME/.local/share/gpt2omo/chatgpt-primary" \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9223 \
+  --no-first-run \
+  --no-default-browser-check \
+  about:blank
+```
+
+On the gpt2omo host, supervise an SSH local forward. Bind it only to local loopback and use
+keepalives so a failed forward exits rather than silently routing to a different browser:
+
+```bash
+ssh -N \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=3 \
+  -L 127.0.0.1:19223:127.0.0.1:9223 \
+  browser-host
+```
+
+Configure the account without a local profile path:
+
+```json
+{
+  "id": "chatgpt-remote",
+  "browser": {
+    "driver": "chrome",
+    "instance": "chatgpt-remote",
+    "launch_mode": "attach_only",
+    "cdp_endpoint": "http://127.0.0.1:19223",
+    "worktree": "active"
+  }
+}
+```
+
+`attach_only` requires a loopback HTTP(S) discovery `cdp_endpoint` and rejects `user_data_dir`: the
+remote service owns its profile, login, lock, and Chrome lifecycle. If the forward is down,
+gpt2omo reports the browser unavailable and **never starts a local Chrome**. CDP target
+WebSocket URLs are rebased to the configured local forward while preserving their target path,
+so the local and remote CDP ports may differ. Each remote account still needs a unique logical
+`browser.instance` and local forwarded `cdp_endpoint`; keep the instance stable for retained
+sessions. Existing `managed_local` accounts remain unchanged and require a local private
+`user_data_dir` for profile ownership.
 
 Before enabling the file:
 
@@ -24,7 +81,10 @@ Before enabling the file:
 2. Run the bridge with a mount root narrower than `/` and containing every delegated repository, for example `/Users/example/code/project`. Profile paths must remain outside that mount root, so the current `--mount-root /` development launch intentionally cannot accept isolated profile configuration.
 3. Run `gpt2omo-account-onboard status`; only after it reports every account ready may `gpt2omo-account-onboard activate --confirm` promote routing. The activation itself rejects active or retained legacy scopes. Restart the bridge and relay only after activation and after active delegations have completed, then run `gpt2omo-account-status --mount-root <mount-root>` to verify both accounts are reachable and have the expected login state.
 
-Leave `browser.driver` unset when the intended policy is automatic **cmux first, then Orca fallback**. Set it only to deliberately pin a specific driver for an account.
+Chrome/CDP is the default browser policy. New managed-local accounts start Chrome with an isolated
+profile; remote accounts use the same CDP backend through `attach_only`. Pin `browser.driver`
+to `orca`, `cmux`, `maho`, `agent-browser`, or `aside` only when deliberately retaining one of
+those legacy CLI backends. Existing retained scopes remain affine to their stored driver.
 
 Fresh work is scheduled account-by-account. Retained scopes stay bound to the account and browser instance that created them; disabling an account prevents new work but does not silently migrate retained scopes.
 
@@ -178,7 +238,7 @@ Example:
         "max_active_workers": 3
       },
       "browser": {
-        "driver": "orca",
+        "driver": "chrome",
         "instance": "chatgpt-web-a",
         "user_data_dir": "/Users/example/.omo/bridge/browser-profiles/web-a",
         "cdp_endpoint": "http://127.0.0.1:9223",
@@ -189,7 +249,7 @@ Example:
       "id": "web-b",
       "enabled": true,
       "browser": {
-        "driver": "orca",
+        "driver": "chrome",
         "instance": "chatgpt-web-b",
         "user_data_dir": "/Users/example/.omo/bridge/browser-profiles/web-b",
         "cdp_endpoint": "http://127.0.0.1:9224",

@@ -22,6 +22,7 @@
       "enabled": true,
       "draining": false,
       "browser": {
+        "driver": "chrome",
         "instance": "chatgpt-primary",
         "user_data_dir": "/Users/example/.omo/bridge/browser-profiles/chatgpt-primary",
         "cdp_endpoint": "http://127.0.0.1:9223",
@@ -33,9 +34,22 @@
       "enabled": true,
       "draining": false,
       "browser": {
+        "driver": "chrome",
         "instance": "chatgpt-secondary",
         "user_data_dir": "/Users/example/.omo/bridge/browser-profiles/chatgpt-secondary",
         "cdp_endpoint": "http://127.0.0.1:9224",
+        "worktree": "active"
+      }
+    },
+    {
+      "id": "chatgpt-remote",
+      "enabled": false,
+      "draining": false,
+      "browser": {
+        "driver": "chrome",
+        "instance": "chatgpt-remote",
+        "launch_mode": "attach_only",
+        "cdp_endpoint": "http://127.0.0.1:19225",
         "worktree": "active"
       }
     }
