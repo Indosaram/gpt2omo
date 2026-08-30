@@ -215,6 +215,32 @@ fn accepted_scope_can_be_closed_explicitly_after_final_approval() {
 }
 
 #[test]
+fn account_pin_is_appended_to_fresh_invocations_only() {
+    let pinned_cfg = config().with_account("remote-chrome-1");
+    let task = WebTask::new("core", "Inspect, implement, and verify the core change.")
+        .with_workspace("/workspace/project");
+
+    let single = pinned_cfg.single(&task).unwrap();
+    assert!(single
+        .args
+        .windows(2)
+        .any(|pair| pair == ["--account", "remote-chrome-1"]));
+
+    let parallel_task_b = WebTask::new("frontend", "Frontend changes.");
+    let batch = pinned_cfg.batch(&[task.clone(), parallel_task_b]).unwrap();
+    assert!(batch
+        .args
+        .windows(2)
+        .any(|pair| pair == ["--account", "remote-chrome-1"]));
+
+    let resume = pinned_cfg.resume("scope-123", "follow up").unwrap();
+    assert!(!resume.args.iter().any(|arg| arg == "--account"));
+
+    let close = pinned_cfg.close_scope("scope-123").unwrap();
+    assert!(!close.args.iter().any(|arg| arg == "--account"));
+}
+
+#[test]
 fn js_python_and_docs_preserve_the_same_workflow_contract() {
     let js = include_str!("../examples/mass_ulw_web.mjs");
     let python = include_str!("../examples/mass_ulw_web.py");

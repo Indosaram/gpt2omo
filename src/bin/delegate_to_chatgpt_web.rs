@@ -14,9 +14,10 @@ use gpt2omo::telemetry::{
 };
 use gpt2omo::tools::task_state::{
     clear_delegation_lifecycle, load_delegation_lifecycle, load_task_result,
-    record_terminal_evidence, record_terminal_evidence_if_active, release_session_retention,
-    retain_session_with_lease, retained_session_expired, start_fresh_delegation_lifecycle,
-    start_next_delegation_generation, DelegationLifecycle, DelegationTerminalState, TaskResult,
+    record_actual_dispatch_evidence, record_terminal_evidence, record_terminal_evidence_if_active,
+    release_session_retention, retain_session_with_lease, retained_session_expired,
+    start_fresh_delegation_lifecycle, start_next_delegation_generation, DelegationLifecycle,
+    DelegationTerminalState, TaskResult,
 };
 use gpt2omo::web_session::cleanup_expired_retained_sessions;
 use gpt2omo::{
@@ -49,6 +50,9 @@ const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const OBSERVE_SCOPE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const UI_PROBE_INTERVAL: Duration = Duration::from_millis(1_500);
 const DEFAULT_SESSION_TTL_MINUTES: u64 = 120;
+const STALE_BOOTSTRAP_RECOVERY_MS: u64 = 60_000;
+const STALE_BOOTSTRAP_RECOVERY_DETAIL: &str =
+    "bootstrap readiness was never recorded before the helper exited; recovered stale active scope without dispatching the task";
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -99,6 +103,10 @@ struct Cli {
     #[arg(long)]
     observe_scope: Option<String>,
 
+    /// Terminalize one stale bootstrap scope without creating or resuming a Web worker.
+    #[arg(long)]
+    recover_stale_scope: Option<String>,
+
     /// Backward-compatible no-op: sessions are now retained by default after terminal work.
     #[arg(long, hide = true)]
     keep_session: bool,
@@ -139,6 +147,10 @@ struct Cli {
     /// Legacy terminal selector retained for compatibility. Browser-scoped delegations do not use it.
     #[arg(long, env = "OMO_RELAY_TERMINAL")]
     terminal: Option<String>,
+
+    /// Force fresh worker dispatch to target a specific configured account ID.
+    #[arg(long, env = "OMO_DELEGATE_ACCOUNT")]
+    account: Option<String>,
 
     /// Browser CLI executable for the configured legacy driver.
     #[arg(long, default_value = "orca", env = "OMO_BROWSER_BIN")]
@@ -349,6 +361,23 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_scope_dir(port));
     let mux = WorkspaceMux::new(&cli.mount_root, &scope_dir)?;
+    if let Some(scope_id) = cli.recover_stale_scope.as_deref() {
+        let orca = legacy_browser_config(&cli);
+        let browser_pool = BrowserPool::new(
+            default_bridge_base_dir(),
+            cli.mount_root.clone(),
+            legacy_account_config(&cli),
+            orca,
+        );
+        let recovered =
+            recover_stale_bootstrap_scope(&mux, &browser_pool, scope_id, epoch_ms()).await?;
+        if cli.json {
+            println!("{}", serde_json::to_string(&recovered)?);
+        } else {
+            println!("Recovered stale bootstrap scope {scope_id}");
+        }
+        return Ok(());
+    }
     if let Some(scope_id) = cli.report_scope.as_deref() {
         let (staged, terminal, session) = report_terminal_scope(&mux, scope_id)?;
         emit_terminal_progress(&cli, bridge_url, 0, &staged, &terminal);
@@ -402,6 +431,9 @@ async fn main() -> Result<()> {
         orca.clone(),
     );
     browser_pool.provision_profiles()?;
+    if !cli.dry_run && cli.resume_scope.is_none() && cli.close_scope.is_none() {
+        recover_stale_bootstrap_scopes(&mux, &browser_pool, epoch_ms()).await?;
+    }
     if !cli.dry_run {
         recover_stale_account_health(&account_router, &browser_pool, epoch_ms()).await?;
     }
@@ -477,6 +509,7 @@ async fn main() -> Result<()> {
                         &account_router,
                         &tasks,
                         claims,
+                        cli.account.as_deref(),
                     )
                     .await?
                 }
@@ -575,6 +608,7 @@ fn validate_control_mode(cli: &Cli) -> Result<()> {
             || cli.stdin
             || cli.resume_scope.is_some()
             || cli.close_scope.is_some()
+            || cli.recover_stale_scope.is_some()
             || cli.workspace.is_some()
             || cli.keep_session
             || cli.close_on_terminal
@@ -591,6 +625,7 @@ fn validate_control_mode(cli: &Cli) -> Result<()> {
             || cli.resume_scope.is_some()
             || cli.close_scope.is_some()
             || cli.report_scope.is_some()
+            || cli.recover_stale_scope.is_some()
             || cli.workspace.is_some()
             || cli.keep_session
             || cli.close_on_terminal
@@ -598,6 +633,23 @@ fn validate_control_mode(cli: &Cli) -> Result<()> {
     {
         return Err(anyhow!(
             "--observe-scope cannot be combined with a task, workspace, session control, stdin, or --dry-run"
+        ));
+    }
+    if cli.recover_stale_scope.is_some()
+        && (!cli.task.is_empty()
+            || cli.batch_stdin
+            || cli.stdin
+            || cli.resume_scope.is_some()
+            || cli.close_scope.is_some()
+            || cli.report_scope.is_some()
+            || cli.observe_scope.is_some()
+            || cli.workspace.is_some()
+            || cli.keep_session
+            || cli.close_on_terminal
+            || cli.dry_run)
+    {
+        return Err(anyhow!(
+            "--recover-stale-scope cannot be combined with a task, workspace, session control, stdin, or --dry-run"
         ));
     }
     if cli.resume_scope.is_some() {
@@ -830,6 +882,123 @@ fn fresh_claim_has_active_scope(mux: &WorkspaceMux, scope_ids: &[String]) -> gpt
         }
     }
     Ok(false)
+}
+
+async fn recover_stale_bootstrap_scopes(
+    mux: &WorkspaceMux,
+    browsers: &BrowserPool,
+    now_ms: u64,
+) -> Result<()> {
+    for scope in mux.list_scopes()? {
+        let Some(binding) = scope.browser.as_ref() else {
+            continue;
+        };
+        let Some(scope_lock) = mux.try_lock_scope(&scope.scope_id)? else {
+            continue;
+        };
+        let workspace = match mux.resolve(&scope.scope_id) {
+            Ok(workspace) => workspace,
+            Err(_) => continue,
+        };
+        let lifecycle =
+            load_delegation_lifecycle(&workspace, &scope.scope_id).map_err(anyhow::Error::msg)?;
+        let Some(lifecycle) = lifecycle else {
+            continue;
+        };
+        if lifecycle.terminal_state.is_some()
+            || lifecycle.ready_ms.is_some()
+            || lifecycle.actual_dispatch_ms.is_some()
+            || now_ms.saturating_sub(lifecycle.generation_started_ms) < STALE_BOOTSTRAP_RECOVERY_MS
+        {
+            continue;
+        }
+        if load_task_result(&workspace, &scope.scope_id, lifecycle.generation)
+            .map_err(anyhow::Error::msg)?
+            .is_some()
+        {
+            continue;
+        }
+
+        record_terminal_evidence_if_active(
+            &workspace,
+            &scope.scope_id,
+            lifecycle.generation,
+            DelegationTerminalState::Failed,
+            Some(STALE_BOOTSTRAP_RECOVERY_DETAIL),
+        )
+        .map_err(anyhow::Error::msg)?;
+        drop(scope_lock);
+        match browsers.close(binding).await {
+            Ok(()) => mux.remove(&scope.scope_id)?,
+            Err(error) => tracing::warn!(
+                scope_id = %scope.scope_id,
+                error = %error,
+                "recovered stale bootstrap scope but could not close its browser page; terminal scope retained for safe cleanup"
+            ),
+        }
+    }
+    Ok(())
+}
+
+async fn recover_stale_bootstrap_scope(
+    mux: &WorkspaceMux,
+    browsers: &BrowserPool,
+    scope_id: &str,
+    now_ms: u64,
+) -> Result<Value> {
+    let scope = mux.lookup(scope_id)?;
+    let Some(binding) = scope.browser.as_ref() else {
+        return Err(anyhow!("scope {scope_id} has no browser binding"));
+    };
+    let Some(scope_lock) = mux.try_lock_scope(scope_id)? else {
+        return Err(anyhow!(
+            "scope {scope_id} is actively locked and cannot be recovered"
+        ));
+    };
+    let workspace = mux.resolve(scope_id)?;
+    let lifecycle = load_delegation_lifecycle(&workspace, scope_id)
+        .map_err(anyhow::Error::msg)?
+        .ok_or_else(|| anyhow!("scope {scope_id} has no delegation lifecycle"))?;
+    let result_exists = load_task_result(&workspace, scope_id, lifecycle.generation)
+        .map_err(anyhow::Error::msg)?
+        .is_some();
+    let already_recovered = lifecycle.terminal_state == Some(DelegationTerminalState::Failed)
+        && lifecycle.terminal_detail.as_deref() == Some(STALE_BOOTSTRAP_RECOVERY_DETAIL)
+        && lifecycle.actual_dispatch_ms.is_none()
+        && !result_exists;
+    let unreconciled_bootstrap = lifecycle.terminal_state.is_none()
+        && lifecycle.actual_dispatch_ms.is_none()
+        && !result_exists
+        && now_ms.saturating_sub(lifecycle.generation_started_ms) >= STALE_BOOTSTRAP_RECOVERY_MS;
+    if !already_recovered && !unreconciled_bootstrap {
+        return Err(anyhow!(
+            "scope {scope_id} is not an unreconciled stale bootstrap generation"
+        ));
+    }
+    if !already_recovered {
+        record_terminal_evidence_if_active(
+            &workspace,
+            scope_id,
+            lifecycle.generation,
+            DelegationTerminalState::Failed,
+            Some(STALE_BOOTSTRAP_RECOVERY_DETAIL),
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
+    drop(scope_lock);
+    let close_error = browsers
+        .close(binding)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    mux.remove(scope_id)?;
+    Ok(serde_json::json!({
+        "scope_id": scope_id,
+        "terminal_state": "FAILED",
+        "detail": STALE_BOOTSTRAP_RECOVERY_DETAIL,
+        "scope_removed": true,
+        "browser_close_error": close_error,
+    }))
 }
 
 fn duplicate_dispatch_value(
@@ -1323,6 +1492,7 @@ async fn stage_browser_delegations(
     router: &AccountRouter,
     tasks: &[PreparedTask],
     mut claims: Vec<FreshDispatchClaimGuard>,
+    account_pin: Option<&str>,
 ) -> Result<(Vec<StagedDelegation>, Vec<WorkspaceScopeLock>)> {
     if claims.len() != tasks.len() {
         return Err(anyhow!(
@@ -1332,9 +1502,26 @@ async fn stage_browser_delegations(
     let _activation_lock = router
         .lock_account_activation()
         .map_err(|error| anyhow!(error.to_string()))?;
-    let reservations = router
-        .reserve_batch_for_mux(mux, tasks.len(), epoch_ms())
-        .map_err(|error| anyhow!(error.to_string()))?;
+    let reservations = match account_pin {
+        Some(id) => {
+            let mut reservations = Vec::with_capacity(tasks.len());
+            for _ in 0..tasks.len() {
+                match router.reserve_for_account_for_mux(mux, id, epoch_ms()) {
+                    Ok(reservation) => reservations.push(reservation),
+                    Err(error) => {
+                        for reserved in &reservations {
+                            let _ = router.release(reserved, epoch_ms());
+                        }
+                        return Err(anyhow!(error.to_string()));
+                    }
+                }
+            }
+            reservations
+        }
+        None => router
+            .reserve_batch_for_mux(mux, tasks.len(), epoch_ms())
+            .map_err(|error| anyhow!(error.to_string()))?,
+    };
 
     let mut staged = Vec::with_capacity(tasks.len());
     let mut scope_locks = Vec::with_capacity(tasks.len());
@@ -1975,7 +2162,12 @@ async fn dispatch_actual_tasks(
     let futures = staged
         .iter()
         .zip(plan.iter())
-        .map(|(item, (_page, prompt))| send_item_prompt(orca, item, prompt));
+        .map(|(item, (_page, prompt))| async {
+            let workspace = mux.resolve(&item.scope_id)?;
+            record_actual_dispatch_evidence(&workspace, &item.scope_id, item.generation)
+                .map_err(anyhow::Error::msg)?;
+            send_item_prompt(orca, item, prompt).await
+        });
     let results = join_all(futures).await;
     let mut sent = vec![false; staged.len()];
     for (index, result) in results.into_iter().enumerate() {
@@ -2247,7 +2439,7 @@ fn emit_telemetry(
             .browser_binding
             .as_ref()
             .map(|binding| binding.driver)
-            .unwrap_or(BrowserDriverKind::Orca),
+            .unwrap_or(BrowserDriverKind::Chrome),
         model_hint: TelemetryModelHint::Unknown,
         event_type,
         reset_after_seconds,
@@ -2777,7 +2969,8 @@ mod tests {
     use gpt2omo::tools::completion::handle_completion_check;
     use gpt2omo::tools::task_state::{
         handle_task_plan, handle_task_result, handle_task_state, handle_task_update,
-        record_terminal_evidence, retain_session_with_lease, start_fresh_delegation_lifecycle,
+        record_readiness_evidence, record_terminal_evidence, retain_session_with_lease,
+        start_fresh_delegation_lifecycle,
     };
     use tempfile::tempdir;
 
@@ -2931,6 +3124,122 @@ mod tests {
         assert!(value["delegations"][0]["lifecycle"]["terminal_state"].is_null());
     }
 
+    #[tokio::test]
+    async fn stale_bootstrap_scope_is_terminalized_and_releases_the_duplicate_gate() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        let scope_dir = mount.path().join("scopes");
+        let bridge_dir = mount.path().join("bridge");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&bridge_dir).unwrap();
+        let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
+        let claims = FreshDispatchClaims::new(&bridge_dir);
+        let task = PreparedTask {
+            task: "Recover an interrupted bootstrap".into(),
+            workspace: dunce::canonicalize(&project).unwrap(),
+            label: Some("stale-bootstrap".into()),
+        };
+        let key = fresh_dispatch_domain_key(&scope_dir, &task).unwrap();
+        let scope = mux
+            .register_browser_binding(
+                &project,
+                BrowserBinding::new("default", BrowserDriverKind::Chrome, "legacy", "missing"),
+            )
+            .unwrap();
+        let mut guard = match claims
+            .claim(&key, 1, |scope_ids| {
+                fresh_claim_has_active_scope(&mux, scope_ids)
+            })
+            .unwrap()
+        {
+            FreshDispatchDecision::Acquired(guard) => guard,
+            FreshDispatchDecision::Duplicate(_) => panic!("fresh stale-bootstrap claim duplicated"),
+        };
+        guard.register_scope(&scope.scope_id, 2).unwrap();
+        drop(guard);
+        let workspace = mux.resolve(&scope.scope_id).unwrap();
+        let lifecycle = start_fresh_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
+        let pool = BrowserPool::new(
+            &bridge_dir,
+            mount.path(),
+            LegacyAccountConfig::default(),
+            OrcaConfig::new("active", None, "orca"),
+        );
+
+        recover_stale_bootstrap_scopes(
+            &mux,
+            &pool,
+            lifecycle.generation_started_ms + STALE_BOOTSTRAP_RECOVERY_MS,
+        )
+        .await
+        .unwrap();
+
+        assert!(mux.lookup(&scope.scope_id).is_ok());
+        let lifecycle = load_delegation_lifecycle(&workspace, &scope.scope_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lifecycle.terminal_state,
+            Some(DelegationTerminalState::Failed)
+        );
+        assert!(matches!(
+            claims
+                .claim(
+                    &key,
+                    lifecycle.generation_started_ms + STALE_BOOTSTRAP_RECOVERY_MS + 1,
+                    |scope_ids| { fresh_claim_has_active_scope(&mux, scope_ids) }
+                )
+                .unwrap(),
+            FreshDispatchDecision::Acquired(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_recovery_removes_ready_only_stale_scope_after_browser_close_failure() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        let scope_dir = mount.path().join("scopes");
+        let bridge_dir = mount.path().join("bridge");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&bridge_dir).unwrap();
+        let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
+        let scope = mux
+            .register_browser_binding(
+                &project,
+                BrowserBinding::new("default", BrowserDriverKind::Chrome, "legacy", "missing"),
+            )
+            .unwrap();
+        let workspace = mux.resolve(&scope.scope_id).unwrap();
+        let lifecycle = start_fresh_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
+        record_readiness_evidence(&workspace, &scope.scope_id).unwrap();
+        let pool = BrowserPool::new(
+            &bridge_dir,
+            mount.path(),
+            LegacyAccountConfig::default(),
+            OrcaConfig::new("active", None, "orca"),
+        );
+
+        let recovered = recover_stale_bootstrap_scope(
+            &mux,
+            &pool,
+            &scope.scope_id,
+            lifecycle.generation_started_ms + STALE_BOOTSTRAP_RECOVERY_MS,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recovered["scope_removed"], true);
+        assert!(recovered["browser_close_error"].is_string());
+        assert!(mux.lookup(&scope.scope_id).is_err());
+        assert_eq!(
+            load_delegation_lifecycle(&workspace, &scope.scope_id)
+                .unwrap()
+                .unwrap()
+                .terminal_state,
+            Some(DelegationTerminalState::Failed)
+        );
+    }
+
     #[test]
     fn concurrent_same_domain_requests_have_one_owner_and_one_duplicate() {
         let root = tempdir().unwrap();
@@ -3071,6 +3380,34 @@ mod tests {
         assert_eq!(cli.orca_bin, "orca");
     }
 
+    #[test]
+    fn stale_recovery_control_mode_rejects_new_work_inputs() {
+        let cli = Cli::try_parse_from([
+            "delegate_to_chatgpt_web",
+            "--recover-stale-scope",
+            "11111111-1111-4111-8111-111111111111",
+            "must-not-dispatch",
+        ])
+        .expect("recovery CLI should parse before control-mode validation");
+
+        assert!(validate_control_mode(&cli)
+            .unwrap_err()
+            .to_string()
+            .contains("--recover-stale-scope cannot be combined with a task"));
+    }
+
+    #[test]
+    fn account_pin_clap_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "delegate_to_chatgpt_web",
+            "--account",
+            "remote-chrome-2",
+            "test task",
+        ])
+        .expect("CLI should parse with --account");
+        assert_eq!(cli.account.as_deref(), Some("remote-chrome-2"));
+    }
+
     fn cli_for_test() -> Cli {
         Cli {
             task: Vec::new(),
@@ -3081,10 +3418,12 @@ mod tests {
             close_scope: None,
             report_scope: None,
             observe_scope: None,
+            recover_stale_scope: None,
             keep_session: false,
             close_on_terminal: false,
             session_ttl_minutes: DEFAULT_SESSION_TTL_MINUTES,
             workspace: None,
+            account: None,
             mount_root: PathBuf::from("."),
             bridge_url: "http://127.0.0.1:18800".into(),
             scope_dir: None,

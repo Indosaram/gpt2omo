@@ -113,6 +113,7 @@ impl DelegateWebInvocation {
 pub struct DelegateWebConfig {
     binary: PathBuf,
     bridge_url: Option<String>,
+    account: Option<String>,
 }
 
 impl Default for DelegateWebConfig {
@@ -120,6 +121,7 @@ impl Default for DelegateWebConfig {
         Self {
             binary: PathBuf::from(DEFAULT_DELEGATE_WEB_BINARY),
             bridge_url: None,
+            account: None,
         }
     }
 }
@@ -129,6 +131,7 @@ impl DelegateWebConfig {
         Self {
             binary: binary.into(),
             bridge_url: None,
+            account: None,
         }
     }
 
@@ -138,10 +141,20 @@ impl DelegateWebConfig {
         self
     }
 
+    pub fn with_account(mut self, account: impl Into<String>) -> Self {
+        let account = account.into();
+        self.account = (!account.trim().is_empty()).then_some(account);
+        self
+    }
+
     /// Build one fresh retained-session delegation.
     pub fn single(&self, item: &WebTask) -> Result<DelegateWebInvocation> {
         item.validate()?;
         let mut args = self.common_args();
+        if let Some(account) = self.account.as_deref() {
+            args.push("--account".into());
+            args.push(account.into());
+        }
         if let Some(workspace) = item.workspace.as_deref() {
             args.push("--workspace".into());
             args.push(workspace.to_string_lossy().into_owned());
@@ -171,6 +184,10 @@ impl DelegateWebConfig {
         }
 
         let mut args = self.common_args();
+        if let Some(account) = self.account.as_deref() {
+            args.push("--account".into());
+            args.push(account.into());
+        }
         args.extend(["--batch-stdin".into(), "--json".into()]);
         let stdin = serde_json::to_string(&BatchManifest { tasks: items })?;
         Ok(DelegateWebInvocation {
