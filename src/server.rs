@@ -461,6 +461,30 @@ fn tool_definition(name: &str, description: &str, properties: Value, required: &
     })
 }
 
+/// MCP tool annotations for the ChatGPT connector's tool-call safety scanner.
+/// Unannotated tools have no safety signal and may be blocked client-side
+/// ("This tool call was blocked by OpenAI's safety checks") before reaching
+/// the bridge; read-only queries declare an explicit non-destructive hint.
+fn tool_annotations(name: &str) -> Option<Value> {
+    const READ_ONLY: &[&str] = &[
+        "read_file",
+        "list_files",
+        "search_text",
+        "ast_grep",
+        "lsp_diagnostics",
+        "lsp_definition",
+        "lsp_references",
+        "lsp_symbols",
+        "poll_command",
+        "list_commands",
+        "git_status_diff",
+        "task_state",
+    ];
+    READ_ONLY
+        .contains(&name)
+        .then(|| serde_json::json!({ "readOnlyHint": true, "idempotentHint": true }))
+}
+
 fn tool_definitions(subagent_enabled: bool, read_only: bool) -> Vec<Value> {
     let mut tools = vec![
         tool_definition(
@@ -695,6 +719,11 @@ fn tool_definitions(subagent_enabled: bool, read_only: bool) -> Vec<Value> {
             {
                 required.push(serde_json::json!("scope_id"));
             }
+        }
+    }
+    for tool in &mut tools {
+        if let Some(annotations) = tool_annotations(tool["name"].as_str().unwrap_or_default()) {
+            tool["annotations"] = annotations;
         }
     }
     tools
@@ -1212,6 +1241,39 @@ impl IntoResponse for BridgeError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_only_tools_declare_readonly_annotations_for_connector_safety_scanners() {
+        let tools = tool_definitions(false, false);
+        let find = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("tool {name} missing"))
+        };
+        for name in [
+            "read_file",
+            "list_files",
+            "search_text",
+            "ast_grep",
+            "task_state",
+            "git_status_diff",
+        ] {
+            let tool = find(name);
+            assert_eq!(
+                tool["annotations"]["readOnlyHint"],
+                serde_json::json!(true),
+                "{name} must declare readOnlyHint for the connector safety classifier"
+            );
+        }
+        for name in ["patch_file", "run_command", "completion_check"] {
+            let tool = find(name);
+            assert!(
+                tool.get("annotations").is_none(),
+                "{name} must stay unannotated (potentially destructive by default)"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
