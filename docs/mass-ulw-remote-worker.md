@@ -186,7 +186,21 @@ printf '%s' 'Implement the feature and complete via completion_check.' | \
 
 Verify browser availability and bridge health before scheduling production DAG runs.
 
-### Step 1: Direct CDP version probe
+### Step 1: Dedicated Chrome instance (Chrome 136+ requirement)
+
+Chrome 136+ refuses DevTools control on the default user data directory: `/json/*` discovery endpoints respond, but page-session commands (`Runtime.evaluate`, navigation over WebSocket) hang or fail, so prompt readiness never succeeds. Run a dedicated instance with its own profile and log into chatgpt.com once in that window:
+
+```bash
+mkdir -p ~/.omo/bridge/browser-profiles/remote-chrome-cdp
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9333 \
+  --user-data-dir="$HOME/.omo/bridge/browser-profiles/remote-chrome-cdp" \
+  --no-first-run --no-default-browser-check
+```
+
+This instance is the remote Chrome; it must stay running for delegations. The daily browser can still be used normally (separate data directory, no conflict). The `attach_only` account only points at the CDP endpoint — the bridge never owns or launches this profile.
+
+### Step 1b: Direct CDP version probe
 
 Check that the remote Chrome process or SSH port forward responds on loopback:
 
