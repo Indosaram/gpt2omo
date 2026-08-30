@@ -314,10 +314,10 @@ Add a final verification node that depends on every producer, and close scopes o
 after that verifier accepts their results. A resume node must carry the exact retained
 `scope_id` it is allowed to continue.
 
-The default browser policy is **cmux first, then Orca fallback**. Leave
-`--browser-driver` unset to use that policy. An explicit CLI driver or an account
-`browser.driver` setting overrides it. Fresh cmux ChatGPT surfaces are focused when
-created so the browser tab is visible. See
+The default browser policy is **Chrome through CDP**. Managed-local accounts start Chrome in a
+dedicated profile; remote Chrome uses a loopback SSH CDP forward with `launch_mode: "attach_only"`.
+Set `--browser-driver` or account `browser.driver` only to deliberately use a legacy CLI driver
+such as cmux or Orca. See
 [`docs/multi-account-and-shared-safety.md`](docs/multi-account-and-shared-safety.md)
 for isolated multi-account onboarding, profile/CDP requirements, and activation safety.
 For a local bridge that must survive terminal, agent, and login-session handoffs, use

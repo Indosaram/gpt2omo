@@ -39,7 +39,7 @@ The examples use these local paths:
 ```text
 repository: /Users/YOU/code/project/omo-bridge
 scope directory: /Users/YOU/.omo/bridge/scopes-18800
-cmux binary directory: /Applications/cmux.app/Contents/Resources/bin
+Chrome binary: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 ```
 
 Replace `YOU` with your macOS account name. `launchd` does not expand `~` inside a
@@ -71,7 +71,7 @@ Create `~/Library/LaunchAgents/com.omo.gpt2omo.bridge.plist`:
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/Users/YOU/.cargo/bin:/Applications/cmux.app/Contents/Resources/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/Users/YOU/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key>
     <string>/Users/YOU</string>
     <key>CARGO_HOME</key>
@@ -129,15 +129,13 @@ Create `~/Library/LaunchAgents/com.omo.gpt2omo.relay.plist`:
     <string>/Users/YOU/.omo/bridge/scopes-18800</string>
     <string>--events-url</string>
     <string>http://127.0.0.1:18800/events</string>
-    <string>--browser-driver</string>
-    <string>cmux</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/YOU/code/project/omo-bridge</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/Applications/cmux.app/Contents/Resources/bin:/Users/YOU/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/Users/YOU/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -153,10 +151,11 @@ Create `~/Library/LaunchAgents/com.omo.gpt2omo.relay.plist`:
 </plist>
 ```
 
-The explicit `cmux` selection and GUI-app binary path matter: user LaunchAgents do
-not inherit an interactive shell's `PATH`. Without them, driver auto-discovery can
-fall back to a different installed browser helper and reject retained scopes that are
-affine to cmux.
+The relay intentionally leaves `--browser-driver` unset so it uses Chrome/CDP by
+default. Do not pin cmux or Orca here: retained browser scopes are affine to their
+stored driver, and the direct-CDP path resolves Chrome bindings from `accounts.json`.
+If a legacy CLI browser driver is deliberately used, pin it in that account's
+`browser.driver` configuration rather than in the shared relay service.
 
 ## Load and verify
 
