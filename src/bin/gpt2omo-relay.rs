@@ -6,7 +6,7 @@ use gpt2omo::orca::{
     BrowserDriverKind, OrcaConfig,
 };
 use gpt2omo::server::sanitize_continuation_prompt;
-use gpt2omo::web_session::cleanup_expired_retained_sessions;
+use gpt2omo::web_session::{cleanup_expired_retained_sessions, recover_dead_browser_scopes};
 use gpt2omo::{
     default_bridge_base_dir, default_scope_dir, BrowserInstanceConfig, BrowserPool,
     LegacyAccountConfig, WorkspaceMux,
@@ -243,6 +243,11 @@ fn spawn_session_janitor(
 }
 
 async fn run_session_gc(mux: &WorkspaceMux, browsers: &BrowserPool, ttl_ms: u64) {
+    if let Ok(dead) = recover_dead_browser_scopes(mux, browsers).await {
+        for scope_id in dead {
+            info!(scope_id = %scope_id, "reaped dead active scope whose browser tab was closed");
+        }
+    }
     match cleanup_expired_retained_sessions(mux, browsers, epoch_ms(), ttl_ms, None).await {
         Ok(cleaned) => {
             for session in cleaned {

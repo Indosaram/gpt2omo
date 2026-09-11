@@ -1,8 +1,8 @@
-use crate::browser_pool::BrowserPool;
+use crate::browser_pool::{browser_verify_failure_is_definitive, BrowserPool};
 use crate::security::BrowserBinding;
 use crate::tools::task_state::{
-    load_delegation_lifecycle, release_session_retention, retain_session_with_lease,
-    retained_session_expired,
+    load_delegation_lifecycle, record_terminal_evidence, release_session_retention,
+    retain_session_with_lease, retained_session_expired, DelegationTerminalState,
 };
 use crate::{Result, WorkspaceMux, WorkspaceScope};
 use serde::Serialize;
@@ -99,6 +99,56 @@ pub async fn cleanup_expired_retained_sessions(
     }
 
     Ok(cleaned)
+}
+
+pub async fn recover_dead_browser_scopes(
+    mux: &WorkspaceMux,
+    browsers: &BrowserPool,
+) -> Result<Vec<String>> {
+    let scopes = mux.list_scopes()?;
+    let mut recovered = Vec::new();
+
+    for scope in scopes {
+        let Some(binding) = scope.browser.as_ref() else {
+            continue;
+        };
+        let Some(scope_lock) = mux.try_lock_scope(&scope.scope_id)? else {
+            continue;
+        };
+        let Ok(workspace) = mux.resolve(&scope.scope_id) else {
+            continue;
+        };
+        let Ok(Some(lifecycle)) = load_delegation_lifecycle(&workspace, &scope.scope_id) else {
+            continue;
+        };
+        if lifecycle.terminal_state.is_some() {
+            continue;
+        }
+
+        // Scope has no live process holding the lock and is marked nonterminal.
+        // Check if the bound browser page still exists on the browser instance.
+        let verify_result = browsers.verify(binding).await;
+        if let Err(error) = verify_result {
+            if browser_verify_failure_is_definitive(&error) {
+                let detail = format!(
+                    "bound browser tab {} was closed or does not exist: {}",
+                    binding.page_id, error
+                );
+                let _ = record_terminal_evidence(
+                    &workspace,
+                    &scope.scope_id,
+                    DelegationTerminalState::Failed,
+                    Some(&detail),
+                );
+                let _ = release_session_retention(&workspace, &scope.scope_id);
+                let _ = mux.remove(&scope.scope_id);
+                recovered.push(scope.scope_id);
+            }
+        }
+        drop(scope_lock);
+    }
+
+    Ok(recovered)
 }
 
 fn claim_expired_retained_scope(

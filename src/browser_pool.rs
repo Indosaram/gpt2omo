@@ -63,6 +63,25 @@ impl PageHandle {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageInspection {
+    pub url: String,
+    pub title: String,
+    pub condition: ChatgptUiCondition,
+    pub generating: bool,
+    pub composer_visible: bool,
+    pub composer_disabled: bool,
+    pub turn_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alerts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_reason: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserReachability {
@@ -446,6 +465,66 @@ impl BrowserPool {
         probe_chatgpt_ui_condition(&self.driver_config(&target), &binding.page_id).await
     }
 
+    pub async fn inspect(&self, binding: &BrowserBinding) -> Result<PageInspection> {
+        let target = self.target_for_binding(binding).await?;
+        if target.cdp_endpoint.is_some() {
+            self.ensure_profile_lease(&target)?;
+            return self.cdp_inspect(&target, &binding.page_id).await;
+        }
+        let probe = verify_chatgpt_page(&self.driver_config(&target), &binding.page_id).await?;
+        let condition =
+            probe_chatgpt_ui_condition(&self.driver_config(&target), &binding.page_id).await;
+        Ok(PageInspection {
+            url: probe.url,
+            title: probe.title,
+            condition,
+            generating: probe.generating,
+            composer_visible: !probe.generating,
+            composer_disabled: false,
+            turn_count: 0,
+            last_turn_role: None,
+            last_turn_text: None,
+            alerts: Vec::new(),
+            rate_limit_reason: None,
+        })
+    }
+
+    pub async fn inspect_account(&self, account_id: &str) -> Result<PageInspection> {
+        let target = self.target_for_account(account_id, true).await?;
+        if let Some(endpoint) = target.cdp_endpoint.as_deref() {
+            self.ensure_profile_lease(&target)?;
+            let targets = self.cdp_list_targets(endpoint).await?;
+            let page = targets
+                .iter()
+                .find(|t| t.target_type == "page" && t.url.contains("chatgpt.com"))
+                .or_else(|| targets.iter().find(|t| t.target_type == "page"))
+                .or_else(|| targets.first())
+                .ok_or_else(|| anyhow!("no browser target found for account '{}'", account_id))?;
+            return self.cdp_inspect(&target, &page.id).await;
+        }
+        let condition = self
+            .probe(&BrowserBinding::new(
+                target.account_id.clone(),
+                target.driver,
+                target.instance.clone(),
+                "active",
+            ))
+            .await;
+        Ok(PageInspection {
+            url: CHATGPT_URL.to_string(),
+            title: "ChatGPT".to_string(),
+            condition,
+            generating: false,
+            composer_visible: true,
+            composer_disabled: false,
+            turn_count: 0,
+            last_turn_role: None,
+            last_turn_text: None,
+            alerts: Vec::new(),
+            rate_limit_reason: None,
+        })
+    }
+
     pub async fn send(&self, binding: &BrowserBinding, prompt: &str) -> Result<()> {
         let target = self.target_for_binding(binding).await?;
         if target.cdp_endpoint.is_some() {
@@ -811,22 +890,188 @@ impl BrowserPool {
     async fn cdp_probe(&self, target: &BrowserTarget, page_id: &str) -> ChatgptUiCondition {
         let expression = r#"(() => {
   const MSG='[data-message-author-role], article, [data-testid^=\"conversation-turn\"], [data-message-id]';
-  const SYS='[data-testid*=\"rate-limit\"], [data-testid*=\"modal\"], [role=\"alert\"], [role=\"dialog\"], [data-sonner-toast], [data-testid*=\"toast\"], [data-testid*=\"notification\"]';
+  const SYS='[data-testid*=\"rate-limit\"], [data-testid*=\"modal\"], [role=\"alert\"], [role=\"dialog\"], [data-sonner-toast], [data-testid*=\"toast\"], [data-testid*=\"notification\"], [class*=\"banner\"], [class*=\"alert\"], [class*=\"notice\"], [data-testid*=\"error\"]';
   const visible=(el)=>{if(!el)return false;const s=getComputedStyle(el),r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)!==0&&r.width>0&&r.height>0};
-  const texts=Array.from(document.querySelectorAll(SYS)).filter(el=>visible(el)&&!el.closest(MSG)&&!el.querySelector(MSG)).map(el=>(el.innerText||el.textContent||'').trim().toLowerCase()).filter(Boolean);
-  const composer=document.querySelector('#prompt-textarea, [data-testid=\"composer-text-input\"], textarea[placeholder]');
+  const isMsg=(el)=>!!el.closest(MSG)||!!el.querySelector(MSG);
+  const sysEls=Array.from(document.querySelectorAll(SYS)).filter(el=>visible(el)&&!isMsg(el));
+  const leafEls=Array.from(document.querySelectorAll('div, p, span')).filter(el=>el.children.length===0&&visible(el)&&!isMsg(el)&&/\blimit\b|\brate\b|\btoo many\b/i.test(el.textContent||''));
+  const texts=Array.from(new Set([...sysEls, ...leafEls])).map(el=>(el.innerText||el.textContent||'').trim().toLowerCase()).filter(Boolean);
+  const composer=Array.from(document.querySelectorAll('#prompt-textarea, [data-testid=\"composer-text-input\"], textarea[placeholder], [contenteditable=\"true\"]')).find(visible);
   const stop=document.querySelector('button[data-testid=\"stop-button\"], button[aria-label=\"Stop generating\"], button[aria-label=\"Stop answering\"]');
-  const rate=(t)=>/too many (requests|messages)|rate limit|making requests too quickly/.test(t)?'too_many_requests':/(at|over) capacity|capacity limit/.test(t)?'capacity':/(model|gpt)[^.\n]{0,80}(usage )?limit/.test(t)?'model_quota':/usage limit|limit reached|reached the .*limit/.test(t)?'usage_limit':null;
+  const rate=(t)=>/too many (requests|messages)|rate limit|making requests too quickly|wait a few minutes/.test(t)?'too_many_requests':/(at|over) capacity|capacity limit/.test(t)?'capacity':/(model|gpt)[^.\n]{0,80}(usage )?limit/.test(t)?'model_quota':/(?:you(?:'ve| have)? )?(?:reached|hit) (?:the |your )?(?:current )?(?:usage |message )?limit|usage limit|limit reached|hit your limit/.test(t)?'usage_limit':null;
   const reset=(t)=>{const m=t.match(/(?:try again|reset(?:s)?|available again|wait)[^0-9]{0,48}(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)/i);if(!m)return null;const n=Number(m[1]),u=m[2].toLowerCase(),k=u.startsWith('min')?60:(u.startsWith('hour')||u.startsWith('hr'))?3600:u.startsWith('day')?86400:1,s=Math.ceil(n*k);return Number.isSafeInteger(s)&&s>=1&&s<=2678400?s:null};
   let rr=null,rs=null; for(const t of texts){rr=rate(t);if(rr){rs=reset(t);break}}
   const auth=texts.some(t=>/\b(log in|login|sign in|authentication required|session expired|please authenticate)\b/.test(t));
   const delivery=texts.find(t=>/\b(something went wrong|error generating|network error|failed to send|message failed|unable to load conversation|delivery failed)\b/.test(t))||null;
-  return {ready:!!composer&&visible(composer),generating:!!stop&&visible(stop),rate_limited:rr!==null,rate_limit_reason:rr,reset_after_seconds:rs,delivery_error:delivery!==null,delivery_recoverable:!!delivery&&/retry|try again|network|temporary/.test(delivery),authentication_required:auth};
+  return {ready:!!composer,generating:!!stop&&visible(stop),rate_limited:rr!==null,rate_limit_reason:rr,reset_after_seconds:rs,delivery_error:delivery!==null,delivery_recoverable:!!delivery&&/retry|try again|network|temporary/.test(delivery),authentication_required:auth};
 })()"#;
         match self.cdp_eval(target, page_id, expression).await {
             Ok(value) => classify_ui(&value),
             Err(_) => ChatgptUiCondition::Unknown,
         }
+    }
+
+    async fn cdp_inspect(&self, target: &BrowserTarget, page_id: &str) -> Result<PageInspection> {
+        let expression = r#"(() => {
+  const visible = (el) => {
+    if (!el) return false;
+    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+    return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) !== 0 && r.width > 0 && r.height > 0;
+  };
+
+  const url = location.href;
+  const title = document.title;
+
+  const composerEl = Array.from(document.querySelectorAll('#prompt-textarea, [data-testid="composer-text-input"], textarea[placeholder], [contenteditable="true"]')).find(visible);
+  const composer_visible = !!composerEl;
+  const composer_disabled = composerEl ? (composerEl.hasAttribute('disabled') || composerEl.getAttribute('contenteditable') === 'false') : false;
+
+  const stopBtn = Array.from(document.querySelectorAll('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop answering"]')).find(visible);
+  const generating = !!stopBtn;
+
+  const turns = Array.from(document.querySelectorAll('[data-message-author-role], [data-testid^="conversation-turn"]'));
+  const turn_count = turns.length;
+  let last_turn_role = null;
+  let last_turn_text = null;
+  if (turns.length > 0) {
+    const last = turns[turns.length - 1];
+    last_turn_role = last.getAttribute('data-message-author-role') || (last.querySelector('[data-message-author-role]')?.getAttribute('data-message-author-role')) || 'unknown';
+    last_turn_text = (last.innerText || '').slice(-4000);
+  }
+
+  const alertEls = Array.from(document.querySelectorAll('[role="alert"], [data-testid*="rate-limit"], [role="dialog"], [data-sonner-toast], [data-testid*="toast"], [data-testid*="notification"], [class*="banner"], [class*="alert"], [data-testid*="error"]')).filter(visible);
+  const alerts = alertEls.map(el => (el.innerText || '').trim()).filter(t => t.length > 0 && t.length < 500);
+
+  const texts = [last_turn_text || '', ...alerts].join(' ').toLowerCase();
+  let rate_limit_reason = null;
+  let reset_after_seconds = null;
+  if (/too many (requests|messages)|rate limit|making requests too quickly|wait a few minutes/.test(texts)) {
+    rate_limit_reason = 'too_many_requests';
+  } else if (/(at|over) capacity|capacity limit/.test(texts)) {
+    rate_limit_reason = 'capacity';
+  } else if (/(model|gpt)[^.\n]{0,80}(usage )?limit/.test(texts)) {
+    rate_limit_reason = 'model_quota';
+  } else if (/(?:you(?:'ve| have)? )?(?:reached|hit) (?:the |your )?(?:current )?(?:usage |message )?limit|usage limit|limit reached|hit your limit/.test(texts)) {
+    rate_limit_reason = 'usage_limit';
+  }
+
+  const m = texts.match(/try again in (?:(\d+) hours? )?(?:(\d+) minutes? )?(?:(\d+) seconds?|(\d+)s|(\d+)m)/);
+  if (m) {
+    reset_after_seconds = (Number(m[1]||0)*3600) + (Number(m[2]||0)*60) + Number(m[3]||m[4]||0) + (Number(m[5]||0)*60);
+  }
+
+  const auth = /sign in|log in|session expired|authentication required/.test(texts);
+  const delivery = /(something went wrong|error generating|network error|failed to send|unable to load conversation)/.test(texts);
+
+  return {
+    url,
+    title,
+    generating,
+    composer_visible,
+    composer_disabled,
+    turn_count,
+    last_turn_role,
+    last_turn_text,
+    alerts: alerts.slice(0, 5),
+    rate_limit_reason,
+    reset_after_seconds,
+    authentication_required: auth,
+    delivery_error: delivery
+  };
+})()"#;
+
+        let val = self.cdp_eval(target, page_id, expression).await?;
+        let url = val
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let title = val
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let generating = val
+            .get("generating")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let composer_visible = val
+            .get("composer_visible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let composer_disabled = val
+            .get("composer_disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let turn_count = val.get("turn_count").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let last_turn_role = val
+            .get("last_turn_role")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let last_turn_text = val
+            .get("last_turn_text")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let alerts = val
+            .get("alerts")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rate_limit_reason = val
+            .get("rate_limit_reason")
+            .and_then(Value::as_str)
+            .map(String::from);
+
+        let condition = if let Some(ref r) = rate_limit_reason {
+            let reason = match r.as_str() {
+                "too_many_requests" => ChatgptRateLimitReason::TooManyRequests,
+                "capacity" => ChatgptRateLimitReason::Capacity,
+                "model_quota" => ChatgptRateLimitReason::ModelQuota,
+                "usage_limit" => ChatgptRateLimitReason::UsageLimit,
+                _ => ChatgptRateLimitReason::UsageLimit,
+            };
+            ChatgptUiCondition::RateLimited {
+                reason,
+                reset_after_seconds: val.get("reset_after_seconds").and_then(Value::as_u64),
+            }
+        } else if val
+            .get("authentication_required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            ChatgptUiCondition::AuthenticationRequired
+        } else if val
+            .get("delivery_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            ChatgptUiCondition::DeliveryError { recoverable: true }
+        } else if generating {
+            ChatgptUiCondition::Generating
+        } else if composer_visible {
+            ChatgptUiCondition::Healthy
+        } else {
+            ChatgptUiCondition::Unknown
+        };
+
+        Ok(PageInspection {
+            url,
+            title,
+            condition,
+            generating,
+            composer_visible,
+            composer_disabled,
+            turn_count,
+            last_turn_role,
+            last_turn_text,
+            alerts,
+            rate_limit_reason,
+        })
     }
 
     async fn cdp_send(&self, target: &BrowserTarget, page_id: &str, prompt: &str) -> Result<()> {
@@ -957,6 +1202,8 @@ struct CdpTarget {
     id: String,
     #[serde(default)]
     url: String,
+    #[serde(rename = "type", default)]
+    target_type: String,
     #[serde(rename = "webSocketDebuggerUrl")]
     web_socket_debugger_url: String,
 }
@@ -1112,6 +1359,14 @@ fn classify_ui(value: &Value) -> ChatgptUiCondition {
 
 pub fn browser_account_unavailable(error: impl Into<String>) -> BridgeError {
     BridgeError::Precondition(format!("BROWSER_ACCOUNT_UNAVAILABLE: {}", error.into()))
+}
+
+pub fn browser_verify_failure_is_definitive(error: &anyhow::Error) -> bool {
+    let detail = error.to_string().to_ascii_lowercase();
+    detail.contains("does not exist on configured browser instance")
+        || detail.contains("browser page is not on https://chatgpt.com")
+        || detail.contains("no such target")
+        || detail.contains("target closed")
 }
 
 #[cfg(test)]

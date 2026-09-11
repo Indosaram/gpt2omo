@@ -30,24 +30,33 @@ pub struct AccountDiagnostic {
     pub account_id: String,
     pub enabled: bool,
     pub draining: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<crate::accounts::AccountPlanTier>,
     pub routing_state: AccountRoutingState,
     pub scheduler_health: AccountHealth,
     pub active_workers: usize,
     pub reserved_workers: usize,
     pub dispatches_in_window: usize,
     pub reserved_dispatches: usize,
+    pub remaining_dispatches: usize,
     pub max_active_workers: usize,
     pub max_dispatches: usize,
     pub window_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_resets_in_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_slot_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_until_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_remaining_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_reason: Option<String>,
     pub browser_instance: String,
     pub browser_reachability: BrowserReachability,
     pub browser_login_state: BrowserLoginState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_page: Option<crate::browser_pool::PageInspection>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -133,6 +142,16 @@ pub async fn collect_account_diagnostics(
     mux: &WorkspaceMux,
     now_ms: u64,
 ) -> Result<AccountDiagnosticsReport> {
+    collect_account_diagnostics_opt(router, browsers, mux, now_ms, false).await
+}
+
+pub async fn collect_account_diagnostics_opt(
+    router: &AccountRouter,
+    browsers: &BrowserPool,
+    mux: &WorkspaceMux,
+    now_ms: u64,
+    inspect: bool,
+) -> Result<AccountDiagnosticsReport> {
     let config = router
         .load_config()
         .context("failed to load account routing configuration")?;
@@ -155,13 +174,27 @@ pub async fn collect_account_diagnostics(
     )
     .await;
 
+    let mut live_pages = Vec::with_capacity(config.accounts.len());
+    if inspect {
+        for (account, h) in config.accounts.iter().zip(health.iter()) {
+            if h.reachability == BrowserReachability::Reachable {
+                live_pages.push(browsers.inspect_account(&account.id).await.ok());
+            } else {
+                live_pages.push(None);
+            }
+        }
+    } else {
+        live_pages.resize(config.accounts.len(), None);
+    }
+
     let accounts = config
         .accounts
         .iter()
         .zip(states.iter())
         .zip(health.iter())
-        .map(|((account, state), browser)| {
-            build_account_diagnostic(account, state, browser, &live, now_ms)
+        .zip(live_pages.into_iter())
+        .map(|(((account, state), browser), live_page)| {
+            build_account_diagnostic(account, state, browser, &live, live_page, now_ms)
         })
         .collect();
 
@@ -212,6 +245,7 @@ fn build_account_diagnostic(
     state: &AccountRuntimeState,
     browser: &BrowserHealth,
     live: &LiveWorkers,
+    live_page: Option<crate::browser_pool::PageInspection>,
     now_ms: u64,
 ) -> AccountDiagnostic {
     let active_workers = live.counts.get(&account.id).copied().unwrap_or(0);
@@ -261,25 +295,49 @@ fn build_account_diagnostic(
         routing_state,
     );
 
+    let remaining_dispatches = account
+        .limits
+        .max_dispatches
+        .saturating_sub(dispatches_in_window);
+    let cooldown_remaining_seconds =
+        cooldown.map(|until| (until.saturating_sub(now_ms) + 999) / 1000);
+    let window_resets_in_seconds = if dispatches_in_window > 0 {
+        state.dispatches_ms.first().and_then(|oldest| {
+            let expire_at = oldest.saturating_add(account.limits.window_ms());
+            if expire_at > now_ms {
+                Some((expire_at - now_ms + 999) / 1000)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
     AccountDiagnostic {
         account_id: account.id.clone(),
         enabled: account.enabled,
         draining: account.draining,
+        plan: account.plan,
         routing_state,
         scheduler_health: state.health,
         active_workers,
         reserved_workers,
         dispatches_in_window,
         reserved_dispatches,
+        remaining_dispatches,
         max_active_workers: account.limits.max_active_workers,
         max_dispatches: account.limits.max_dispatches,
         window_seconds: account.limits.window_seconds,
+        window_resets_in_seconds,
         next_slot_ms,
         cooldown_until_ms: cooldown,
+        cooldown_remaining_seconds,
         cooldown_reason: cooldown.and(state.cooldown_reason.clone()),
         browser_instance: browser.instance.clone(),
         browser_reachability: browser.reachability,
         browser_login_state: browser.login_state,
+        live_page,
     }
 }
 
@@ -362,6 +420,7 @@ mod tests {
             id: "alpha".into(),
             enabled: true,
             draining: false,
+            plan: None,
             limits: AccountLimits {
                 window_seconds: 10,
                 max_dispatches: 2,
@@ -432,7 +491,8 @@ mod tests {
         live.counts.insert("alpha".into(), 1);
         live.scope_ids.insert("scope-secret".into());
 
-        let diagnostic = build_account_diagnostic(&account(), &state, &browser(), &live, 2_500);
+        let diagnostic =
+            build_account_diagnostic(&account(), &state, &browser(), &live, None, 2_500);
         assert_eq!(diagnostic.active_workers, 1);
         assert_eq!(diagnostic.reserved_workers, 0);
         assert_eq!(diagnostic.reserved_dispatches, 1);
@@ -464,6 +524,7 @@ mod tests {
             &state,
             &browser(),
             &LiveWorkers::default(),
+            None,
             5_000,
         );
         assert_eq!(diagnostic.routing_state, AccountRoutingState::Cooldown);
@@ -480,6 +541,7 @@ mod tests {
             &AccountRuntimeState::new("alpha"),
             &browser(),
             &live,
+            None,
             1_000,
         );
         assert_eq!(

@@ -144,11 +144,73 @@ fn default_worktree() -> String {
     "active".to_string()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountPlanTier {
+    Pro,
+    Plus,
+    #[serde(rename = "prolite", alias = "pro_lite", alias = "go")]
+    ProLite,
+    Free,
+    Custom,
+}
+
+impl AccountPlanTier {
+    pub fn default_limits(&self) -> AccountLimits {
+        match self {
+            AccountPlanTier::Pro => AccountLimits {
+                window_seconds: 10_800, // 3 hours
+                max_dispatches: 60,     // High capacity
+                max_active_workers: 6,  // Concurrently run up to 6 workers
+            },
+            AccountPlanTier::Plus => AccountLimits {
+                window_seconds: 10_800, // 3 hours
+                max_dispatches: 25,
+                max_active_workers: 3,
+            },
+            AccountPlanTier::ProLite => AccountLimits {
+                window_seconds: 18_000, // 5 hours
+                max_dispatches: 10,     // Thinking cap is ~10 / 5h
+                max_active_workers: 2,
+            },
+            AccountPlanTier::Free => AccountLimits {
+                window_seconds: 18_000, // 5 hours
+                max_dispatches: 5,
+                max_active_workers: 1,
+            },
+            AccountPlanTier::Custom => AccountLimits::default(),
+        }
+    }
+
+    pub fn default_unknown_rate_limit_seconds(&self) -> u64 {
+        match self {
+            AccountPlanTier::Pro => 3_600,       // 1 hour
+            AccountPlanTier::Plus => 10_800,     // 3 hours
+            AccountPlanTier::ProLite => 18_000,  // 5 hours
+            AccountPlanTier::Free => 18_000,     // 5 hours
+            AccountPlanTier::Custom => 900,
+        }
+    }
+}
+
+impl std::fmt::Display for AccountPlanTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pro => write!(f, "pro"),
+            Self::Plus => write!(f, "plus"),
+            Self::ProLite => write!(f, "prolite"),
+            Self::Free => write!(f, "free"),
+            Self::Custom => write!(f, "custom"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountConfig {
     pub id: String,
     pub enabled: bool,
     pub draining: bool,
+    pub plan: Option<AccountPlanTier>,
     pub limits: AccountLimits,
     pub browser: BrowserInstanceConfig,
 }
@@ -179,6 +241,7 @@ impl AccountsConfig {
                 id: LEGACY_ACCOUNT_ID.to_string(),
                 enabled: true,
                 draining: false,
+                plan: None,
                 limits: legacy.limits,
                 browser: legacy.browser,
             }],
@@ -225,6 +288,8 @@ struct RawAccountConfig {
     enabled: bool,
     #[serde(default)]
     draining: bool,
+    #[serde(default)]
+    plan: Option<AccountPlanTier>,
     #[serde(default)]
     limits: PartialAccountLimits,
     browser: BrowserInstanceConfig,
@@ -299,7 +364,11 @@ pub fn parse_accounts_config(
             )));
         }
 
-        let limits = raw_account.limits.resolve(&raw.defaults.limits);
+        let base_limits = match raw_account.plan {
+            Some(tier) => tier.default_limits(),
+            None => raw.defaults.limits.clone(),
+        };
+        let limits = raw_account.limits.resolve(&base_limits);
         validate_limits(&format!("accounts[{}].limits", raw_account.id), &limits)?;
         validate_browser(
             &raw_account.id,
@@ -315,6 +384,7 @@ pub fn parse_accounts_config(
             id: raw_account.id,
             enabled: raw_account.enabled,
             draining: raw_account.draining,
+            plan: raw_account.plan,
             limits,
             browser: raw_account.browser,
         });

@@ -17,16 +17,17 @@ pub mod tools;
 pub mod web_session;
 
 pub use account_diagnostics::{
-    collect_account_diagnostics, recover_stale_account_health, AccountDiagnostic,
-    AccountDiagnosticsReport, AccountRoutingState, ACCOUNT_DIAGNOSTICS_VERSION,
+    collect_account_diagnostics, collect_account_diagnostics_opt, recover_stale_account_health,
+    AccountDiagnostic, AccountDiagnosticsReport, AccountRoutingState, ACCOUNT_DIAGNOSTICS_VERSION,
 };
 pub use accounts::{
-    AccountConfig, AccountDefaults, AccountLimits, AccountsConfig, BrowserInstanceConfig,
-    BrowserLaunchMode, CooldownConfig, LegacyAccountConfig, RoutingConfig, RoutingStrategy,
-    LEGACY_ACCOUNT_ID,
+    AccountConfig, AccountDefaults, AccountLimits, AccountPlanTier, AccountsConfig,
+    BrowserInstanceConfig, BrowserLaunchMode, CooldownConfig, LegacyAccountConfig, RoutingConfig,
+    RoutingStrategy, LEGACY_ACCOUNT_ID,
 };
 pub use browser_pool::{
-    BrowserHealth, BrowserLoginState, BrowserPool, BrowserReachability, BrowserTarget, PageHandle,
+    browser_verify_failure_is_definitive, BrowserHealth, BrowserLoginState, BrowserPool,
+    BrowserReachability, BrowserTarget, PageHandle, PageInspection,
 };
 pub use cli::Cli;
 pub use error::{BridgeError, Result};
@@ -42,6 +43,7 @@ pub use security::{
     WorkspaceScope, WorkspaceScopeLock,
 };
 pub use server::{create_router, AppState};
+pub use web_session::{cleanup_expired_retained_sessions, recover_dead_browser_scopes};
 
 pub fn load_dotenv_if_present() {
     if let Ok(content) = std::fs::read_to_string(std::path::Path::new(".env")) {

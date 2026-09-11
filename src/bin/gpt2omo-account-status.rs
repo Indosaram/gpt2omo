@@ -3,7 +3,7 @@ use clap::Parser;
 use gpt2omo::cli::default_mount_root;
 use gpt2omo::orca::OrcaConfig;
 use gpt2omo::{
-    collect_account_diagnostics, default_bridge_base_dir, default_scope_dir,
+    collect_account_diagnostics_opt, default_bridge_base_dir, default_scope_dir,
     recover_stale_account_health, AccountRouter, BrowserInstanceConfig, BrowserPool,
     LegacyAccountConfig, WorkspaceMux,
 };
@@ -45,6 +45,10 @@ struct Cli {
     #[arg(long)]
     recover_stale_health: bool,
 
+    /// Include live browser page inspection (active URL, title, turns, alerts) for reachable accounts.
+    #[arg(long, short = 'i')]
+    inspect: bool,
+
     /// Emit compact JSON instead of pretty-printed JSON.
     #[arg(long)]
     compact: bool,
@@ -68,7 +72,8 @@ async fn main() -> Result<()> {
     if cli.recover_stale_health {
         recover_stale_account_health(&router, &browsers, now_ms).await?;
     }
-    let report = collect_account_diagnostics(&router, &browsers, &mux, now_ms).await?;
+    let report =
+        collect_account_diagnostics_opt(&router, &browsers, &mux, now_ms, cli.inspect).await?;
 
     if cli.compact {
         println!("{}", serde_json::to_string(&report)?);

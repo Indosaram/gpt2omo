@@ -233,6 +233,11 @@ Run `gpt2omo-account-status` to inspect account reachability, capacity limits, a
 
 ```bash
 gpt2omo-account-status --port 18800 --compact
+
+# Live browser inspection (active conversation, turn count, alerts, rate limits):
+gpt2omo-account-status --inspect
+delegate_to_chatgpt_web --inspect-account remote-chrome
+delegate_to_chatgpt_web --inspect-scope <SCOPE_ID>
 ```
 
 Verify that `remote-chrome` reports reachability as `reachable` and login state as `ready`.

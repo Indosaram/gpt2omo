@@ -310,7 +310,7 @@ const CHATGPT_UI_PROBE_EXPRESSION: &str = r#"(() => {
     if (/\btoo many (?:requests|messages)\b|\brate limit(?:ed| reached)?\b|\bmaking requests too quickly\b|\btemporarily limited access\b|\blimited access to your conversations\b|\bwait a few minutes before trying again\b/.test(text)) return 'too_many_requests';
     if (/\b(?:at|over) capacity\b|\bcapacity (?:limit|reached)\b/.test(text)) return 'capacity';
     if (/\b(?:model|gpt[-\w]*)[^.\n]{0,80}\b(?:usage )?limit\b|\blimit[^.\n]{0,80}\b(?:model|gpt[-\w]*)\b/.test(text)) return 'model_quota';
-    if (/\b(?:you(?:'ve| have)? )?(?:reached|hit) (?:the )?(?:current )?(?:usage |message )?limit\b|\busage limit\b|\blimit reached\b/.test(text)) return 'usage_limit';
+    if (/\b(?:you(?:'ve| have)? )?(?:reached|hit) (?:the |your )?(?:current )?(?:usage |message )?limit\b|\busage limit\b|\blimit reached\b|\bhit your limit\b/.test(text)) return 'usage_limit';
     return null;
   };
   const resetSeconds = (text) => {

@@ -223,3 +223,5 @@ bridge and relay:
   exclusive to gpt2omo.
 - The Chrome window must stay visible (not minimized) for CDP-created tabs to
   load — same desktop-window contract as the orca/cmux drivers.
+- Inspect live browser state, message turns, alerts, and rate limits non-destructively:
+  `gpt2omo-account-status --inspect` or `delegate_to_chatgpt_web --inspect-account <ACCOUNT_ID>`.

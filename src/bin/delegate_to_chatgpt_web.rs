@@ -19,11 +19,11 @@ use gpt2omo::tools::task_state::{
     start_fresh_delegation_lifecycle, start_next_delegation_generation, DelegationLifecycle,
     DelegationTerminalState, TaskResult,
 };
-use gpt2omo::web_session::cleanup_expired_retained_sessions;
+use gpt2omo::web_session::{cleanup_expired_retained_sessions, recover_dead_browser_scopes};
 use gpt2omo::{
     default_bridge_base_dir, default_scope_dir, recover_stale_account_health, AccountLimits,
     AccountRouter, BrowserBinding, BrowserInstanceConfig, BrowserPool, LegacyAccountConfig,
-    RouteReservation, Workspace, WorkspaceMux, WorkspaceScope, WorkspaceScopeLock,
+    PageInspection, RouteReservation, Workspace, WorkspaceMux, WorkspaceScope, WorkspaceScopeLock,
 };
 use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize};
@@ -99,6 +99,14 @@ struct Cli {
     #[arg(long)]
     report_scope: Option<String>,
 
+    /// Inspect live browser state, message turns, alerts, and lifecycle for a scope.
+    #[arg(long, value_name = "SCOPE_ID")]
+    inspect_scope: Option<String>,
+
+    /// Inspect live browser state and active conversation for a configured account.
+    #[arg(long, value_name = "ACCOUNT_ID")]
+    inspect_account: Option<String>,
+
     /// Attach to an existing scope and wait for its persisted terminal result without browser interaction.
     #[arg(long)]
     observe_scope: Option<String>,
@@ -129,7 +137,7 @@ struct Cli {
     workspace: Option<PathBuf>,
 
     /// Broad mount root used by the running bridge daemon.
-    #[arg(long, default_value = ".")]
+    #[arg(long, default_value = "/", env = "OMO_MOUNT_ROOT")]
     mount_root: PathBuf,
 
     /// gpt2omo base URL.
@@ -431,7 +439,16 @@ async fn main() -> Result<()> {
         orca.clone(),
     );
     browser_pool.provision_profiles()?;
+    if let Some(scope_id) = cli.inspect_scope.as_deref() {
+        inspect_scope_command(&cli, &mux, &browser_pool, scope_id).await?;
+        return Ok(());
+    }
+    if let Some(account_id) = cli.inspect_account.as_deref() {
+        inspect_account_command(&cli, &browser_pool, account_id).await?;
+        return Ok(());
+    }
     if !cli.dry_run && cli.resume_scope.is_none() && cli.close_scope.is_none() {
+        recover_dead_browser_scopes(&mux, &browser_pool).await?;
         recover_stale_bootstrap_scopes(&mux, &browser_pool, epoch_ms()).await?;
     }
     if !cli.dry_run {
@@ -1113,6 +1130,231 @@ fn dispatched_progress_event<'a>(
     })
 }
 
+#[derive(Serialize)]
+struct ScopeInspectionReport {
+    scope_id: String,
+    workspace: Option<String>,
+    lifecycle: Option<DelegationLifecycle>,
+    browser_binding: Option<BrowserBinding>,
+    live_page: Option<PageInspection>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AccountInspectionReport {
+    account_id: String,
+    live_page: Option<PageInspection>,
+    error: Option<String>,
+}
+
+async fn inspect_scope_command(
+    cli: &Cli,
+    mux: &WorkspaceMux,
+    browser_pool: &BrowserPool,
+    scope_id: &str,
+) -> Result<()> {
+    let mut report = ScopeInspectionReport {
+        scope_id: scope_id.to_string(),
+        workspace: None,
+        lifecycle: None,
+        browser_binding: None,
+        live_page: None,
+        error: None,
+    };
+
+    let scope_lookup = mux.lookup(scope_id);
+    let workspace_path = if let Ok(ref scope) = scope_lookup {
+        report.workspace = Some(scope.workspace.clone());
+        report.browser_binding = scope.browser.clone();
+        Some(PathBuf::from(&scope.workspace))
+    } else {
+        match mux.resolve(scope_id) {
+            Ok(ws) => {
+                report.workspace = Some(ws.root().display().to_string());
+                Some(ws.root().to_path_buf())
+            }
+            Err(_) => None,
+        }
+    };
+
+    if let Some(ref ws_path) = workspace_path {
+        if let Ok(ws) = Workspace::open(ws_path) {
+            if let Ok(Some(lifecycle)) = load_delegation_lifecycle(&ws, scope_id) {
+                report.lifecycle = Some(lifecycle);
+            }
+        }
+    }
+
+    if report.lifecycle.is_none() {
+        let lifecycle_dir = default_bridge_base_dir().join("delegation-lifecycle");
+        if let Ok(entries) = std::fs::read_dir(lifecycle_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        if let Ok(lc) = serde_json::from_slice::<DelegationLifecycle>(&bytes) {
+                            if lc.scope_id == scope_id {
+                                report.lifecycle = Some(lc);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(ref binding) = report.browser_binding {
+        match browser_pool.inspect(binding).await {
+            Ok(inspection) => {
+                report.live_page = Some(inspection);
+            }
+            Err(e) => {
+                report.error = Some(format!("failed to inspect browser page: {e}"));
+            }
+        }
+    } else if scope_lookup.is_err() {
+        report.error =
+            Some("scope does not exist or has already been closed and cleaned up".to_string());
+    } else {
+        report.error = Some("scope has no active browser binding".to_string());
+    }
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_scope_inspection(&report);
+    }
+    Ok(())
+}
+
+fn print_scope_inspection(report: &ScopeInspectionReport) {
+    println!("=== gpt2omo Scope Inspection: {} ===", report.scope_id);
+    if let Some(ref ws) = report.workspace {
+        println!("Workspace: {}", ws);
+    }
+    if let Some(ref lc) = report.lifecycle {
+        let state = lc
+            .terminal_state
+            .map(|s| format!("{:?}", s))
+            .unwrap_or_else(|| "IN_FLIGHT (nonterminal)".to_string());
+        let detail = lc.terminal_detail.as_deref().unwrap_or("none");
+        println!(
+            "Lifecycle: {} (generation: {}, detail: {})",
+            state, lc.generation, detail
+        );
+    }
+    if let Some(ref b) = report.browser_binding {
+        println!(
+            "Browser Binding: account={}, instance={}, driver={:?}, page={}",
+            b.account_id, b.instance, b.driver, b.page_id
+        );
+    }
+    if let Some(ref page) = report.live_page {
+        println!("\n[Live Browser Tab]");
+        println!("  URL: {}", page.url);
+        println!("  Title: {}", page.title);
+        println!("  Condition: {:?}", page.condition);
+        println!("  Generating: {}", page.generating);
+        println!(
+            "  Composer: visible={}, disabled={}",
+            page.composer_visible, page.composer_disabled
+        );
+        println!("  Turns: {} message turns", page.turn_count);
+        if let Some(ref role) = page.last_turn_role {
+            println!("  Last Turn Role: {}", role);
+        }
+        if let Some(ref text) = page.last_turn_text {
+            let preview = if text.len() > 300 {
+                format!("{}...", &text[..300].trim())
+            } else {
+                text.trim().to_string()
+            };
+            println!(
+                "  Last Turn Preview:\n    {}",
+                preview.replace('\n', "\n    ")
+            );
+        }
+        if !page.alerts.is_empty() {
+            println!("  Alerts:");
+            for a in &page.alerts {
+                println!("    - {}", a);
+            }
+        }
+        if let Some(ref reason) = page.rate_limit_reason {
+            println!("  Rate Limit Detected: {}", reason);
+        }
+    } else if let Some(ref err) = report.error {
+        println!("\n[Live Browser Tab Unavailable]");
+        println!("  Reason: {}", err);
+    }
+}
+
+async fn inspect_account_command(
+    cli: &Cli,
+    browser_pool: &BrowserPool,
+    account_id: &str,
+) -> Result<()> {
+    let mut report = AccountInspectionReport {
+        account_id: account_id.to_string(),
+        live_page: None,
+        error: None,
+    };
+
+    match browser_pool.inspect_account(account_id).await {
+        Ok(inspection) => {
+            report.live_page = Some(inspection);
+        }
+        Err(e) => {
+            report.error = Some(format!("failed to inspect account '{}': {e}", account_id));
+        }
+    }
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("=== gpt2omo Account Inspection: {} ===", report.account_id);
+        if let Some(ref page) = report.live_page {
+            println!("\n[Live Browser Tab]");
+            println!("  URL: {}", page.url);
+            println!("  Title: {}", page.title);
+            println!("  Condition: {:?}", page.condition);
+            println!("  Generating: {}", page.generating);
+            println!(
+                "  Composer: visible={}, disabled={}",
+                page.composer_visible, page.composer_disabled
+            );
+            println!("  Turns: {} message turns", page.turn_count);
+            if let Some(ref role) = page.last_turn_role {
+                println!("  Last Turn Role: {}", role);
+            }
+            if let Some(ref text) = page.last_turn_text {
+                let preview = if text.len() > 300 {
+                    format!("{}...", &text[..300].trim())
+                } else {
+                    text.trim().to_string()
+                };
+                println!(
+                    "  Last Turn Preview:\n    {}",
+                    preview.replace('\n', "\n    ")
+                );
+            }
+            if !page.alerts.is_empty() {
+                println!("  Alerts:");
+                for a in &page.alerts {
+                    println!("    - {}", a);
+                }
+            }
+            if let Some(ref reason) = page.rate_limit_reason {
+                println!("  Rate Limit Detected: {}", reason);
+            }
+        } else if let Some(ref err) = report.error {
+            println!("  Error: {}", err);
+        }
+    }
+    Ok(())
+}
+
 fn emit_terminal_progress(
     cli: &Cli,
     bridge_url: &str,
@@ -1327,6 +1569,47 @@ fn load_bridge_runtime_policy_uncached() -> BridgeRuntimePolicy {
         60u64,
         12usize,
     );
+
+    let accounts_path = default_bridge_base_dir().join("accounts.json");
+    if let Ok(content) = std::fs::read_to_string(&accounts_path) {
+        if let Ok(val) = serde_json::from_str::<Value>(&content) {
+            if let Some(accounts) = val.get("accounts").and_then(Value::as_array) {
+                let active_accounts: Vec<&Value> = accounts
+                    .iter()
+                    .filter(|a| {
+                        a.get("enabled").and_then(Value::as_bool).unwrap_or(true)
+                            && !a.get("draining").and_then(Value::as_bool).unwrap_or(false)
+                    })
+                    .collect();
+                if !active_accounts.is_empty() {
+                    let total_workers: usize = active_accounts
+                        .iter()
+                        .map(|a| {
+                            if let Some(w) = a
+                                .pointer("/limits/max_active_workers")
+                                .and_then(Value::as_u64)
+                            {
+                                w as usize
+                            } else if let Some(plan) = a.get("plan").and_then(Value::as_str) {
+                                match plan {
+                                    "pro" => 6,
+                                    "plus" => 3,
+                                    "prolite" | "pro_lite" | "go" => 2,
+                                    _ => 3,
+                                }
+                            } else {
+                                3
+                            }
+                        })
+                        .sum();
+                    max_concurrent = max_concurrent.max(total_workers);
+                    max_new = max_new
+                        .max(active_accounts.len() * 2)
+                        .max(total_workers.min(4));
+                }
+            }
+        }
+    }
 
     if let Ok(content) = std::fs::read_to_string(&config_path) {
         if let Ok(val) = serde_json::from_str::<Value>(&content) {
@@ -2044,6 +2327,9 @@ async fn wait_for_all_ready(
         if Instant::now() >= deadline {
             for index in &pending {
                 let item = &staged[*index];
+                if let Some(router) = item.account_router.as_ref() {
+                    let _ = router.apply_delivery_failure(&item.account_id, epoch_ms());
+                }
                 emit_telemetry(
                     item,
                     TelemetryEventType::ReadinessHandshakeFailed,
@@ -2657,37 +2943,60 @@ async fn close_retained_scope(
     scope_id: &str,
 ) -> Result<Value> {
     let scope_lock = mux.lock_scope(scope_id)?;
-    let (scope, workspace, lifecycle) = load_resumable_scope(mux, scope_id)?;
+    let scope = mux.lookup(scope_id)?;
+    let workspace = mux.resolve(scope_id)?;
+    let lifecycle = load_delegation_lifecycle(&workspace, scope_id)
+        .ok()
+        .flatten();
+    let generation = lifecycle.as_ref().map(|l| l.generation).unwrap_or(1);
+    let session_retained = lifecycle
+        .as_ref()
+        .map(|l| l.session_retained)
+        .unwrap_or(false);
     let page = scope
-        .browser_page_id
-        .clone()
-        .ok_or_else(|| anyhow!("retained scope has no browser_page_id"))?;
+        .page_id()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("scope has no browser_page_id"))?;
     let close_error = if let Some(binding) = scope.browser.as_ref() {
         browsers.close(binding).await.err()
     } else {
         close_browser_page(orca, &page).await.err()
     };
-    if let Some(error) = close_error {
-        return Ok(serde_json::json!({
-            "ok": false,
-            "closed_scope": scope_id,
-            "browser_page_id": page,
-            "generation": lifecycle.generation,
-            "scope_removed": false,
-            "session_state": "RETAINED_CLOSE_FAILED",
-            "session_retained": true,
-            "session_closed": false,
-            "session_error": error.to_string(),
-        }));
+    if let Some(error) = close_error.as_ref() {
+        if !browser_verify_failure_is_definitive(error) {
+            return Ok(serde_json::json!({
+                "ok": false,
+                "closed_scope": scope_id,
+                "browser_page_id": page,
+                "generation": generation,
+                "scope_removed": false,
+                "session_state": "RETAINED_CLOSE_FAILED",
+                "session_retained": session_retained,
+                "session_closed": false,
+                "session_error": error.to_string(),
+            }));
+        }
     }
-    release_session_retention(&workspace, scope_id).map_err(anyhow::Error::msg)?;
+    if lifecycle
+        .as_ref()
+        .map(|l| l.terminal_state.is_none())
+        .unwrap_or(true)
+    {
+        let _ = record_terminal_evidence(
+            &workspace,
+            scope_id,
+            DelegationTerminalState::Failed,
+            Some("explicitly closed via --close-scope"),
+        );
+    }
+    let _ = release_session_retention(&workspace, scope_id);
     mux.remove(scope_id)?;
     drop(scope_lock);
     Ok(serde_json::json!({
         "ok": true,
         "closed_scope": scope_id,
         "browser_page_id": page,
-        "generation": lifecycle.generation,
+        "generation": generation,
         "scope_removed": true,
         "session_state": "CLOSED",
         "session_retained": false,
@@ -3417,6 +3726,8 @@ mod tests {
             resume_scope: None,
             close_scope: None,
             report_scope: None,
+            inspect_scope: None,
+            inspect_account: None,
             observe_scope: None,
             recover_stale_scope: None,
             keep_session: false,
@@ -3737,9 +4048,10 @@ mod tests {
 
     #[test]
     fn rejects_more_than_max_parallel_tasks() {
-        assert!(validate_parallel_count(2).is_ok());
-        let error = validate_parallel_count(3).unwrap_err().to_string();
-        assert!(error.contains("limited to 2 newly spawned workers"));
+        let max = max_new_dispatch_workers();
+        assert!(validate_parallel_count(max).is_ok());
+        let error = validate_parallel_count(max + 1).unwrap_err().to_string();
+        assert!(error.contains(&format!("limited to {} newly spawned workers", max)));
     }
 
     #[test]
