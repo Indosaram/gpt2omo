@@ -200,3 +200,26 @@ launchctl kickstart -k "gui/$(id -u)/com.omo.gpt2omo.relay"
 Do not remove `~/.omo/bridge/scopes-18800`, delete a retained scope, or close a
 browser tab as part of service recovery. The relay's normal expiry checks already
 preserve a scope when its browser binding cannot be safely closed.
+
+## Dedicated Chrome supervision agents (2026-09-11)
+
+The two `attach_only` ChatGPT accounts bind to dedicated Chrome instances that
+were previously launched manually. After a bulk quit left them down, dispatches
+failed at the transport layer, so they are now supervised the same way as the
+bridge and relay:
+
+| Label | CDP port | Profile |
+|---|---|---|
+| `com.omo.gpt2omo.chrome.remote-chrome` | 9353 | `~/.omo/bridge/browser-profiles/remote-chrome-cdp` |
+| `com.omo.gpt2omo.chrome.account2` | 9354 | `~/.omo/bridge/browser-profiles/account2-aside-cdp` |
+
+- `RunAtLoad` + `KeepAlive` (restart on any exit, `ThrottleInterval` 15s); logs
+  `~/Library/Logs/gpt2omo-chrome-*.log`.
+- Ports moved 9333→9353 and 9334→9354: the old ports are contested. A
+  Discord-automation Chrome from the hermes side binds 9333 on its own schedule,
+  and an `attach_only` account trusts the CDP port as account identity, so a
+  foreign browser on that port passes the reachability check and only fails at
+  the auth check (`unauth` bootstrap failure, 2026-09-11). Keep these ports
+  exclusive to gpt2omo.
+- The Chrome window must stay visible (not minimized) for CDP-created tabs to
+  load — same desktop-window contract as the orca/cmux drivers.

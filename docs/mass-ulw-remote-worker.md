@@ -8,7 +8,7 @@ Configure the bridge with an `accounts.json` file inside the bridge directory (d
 
 ### Standalone attach-only account snippet
 
-For a dedicated remote Chrome instance running at `http://127.0.0.1:9333`, configure the `browser` block with `launch_mode: "attach_only"`, specify `cdp_endpoint`, and omit `user_data_dir`:
+For a dedicated remote Chrome instance running at `http://127.0.0.1:9353`, configure the `browser` block with `launch_mode: "attach_only"`, specify `cdp_endpoint`, and omit `user_data_dir`:
 
 ```json
 {
@@ -38,7 +38,7 @@ For a dedicated remote Chrome instance running at `http://127.0.0.1:9333`, confi
         "driver": "chrome",
         "instance": "remote-chrome",
         "launch_mode": "attach_only",
-        "cdp_endpoint": "http://127.0.0.1:9333",
+        "cdp_endpoint": "http://127.0.0.1:9353",
         "worktree": "active"
       }
     }
@@ -94,7 +94,7 @@ To transition safely without breaking in-flight or retained scopes, include a `"
         "driver": "chrome",
         "instance": "remote-chrome",
         "launch_mode": "attach_only",
-        "cdp_endpoint": "http://127.0.0.1:9333",
+        "cdp_endpoint": "http://127.0.0.1:9353",
         "worktree": "active"
       }
     }
@@ -193,19 +193,21 @@ Chrome 136+ refuses DevTools control on the default user data directory: `/json/
 ```bash
 mkdir -p ~/.omo/bridge/browser-profiles/remote-chrome-cdp
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --remote-debugging-port=9333 \
+  --remote-debugging-port=9353 \
   --user-data-dir="$HOME/.omo/bridge/browser-profiles/remote-chrome-cdp" \
   --no-first-run --no-default-browser-check
 ```
 
-This instance is the remote Chrome; it must stay running for delegations. The daily browser can still be used normally (separate data directory, no conflict). The `attach_only` account only points at the CDP endpoint — the bridge never owns or launches this profile.
+This instance is the remote Chrome; it must stay running for delegations. In production it runs under the `com.omo.gpt2omo.chrome.remote-chrome` launchd agent (KeepAlive; see `docs/local-bridge-supervision.md`). The daily browser can still be used normally (separate data directory, no conflict). The `attach_only` account only points at the CDP endpoint — the bridge never owns or launches this profile.
+
+Do not share this CDP port with other tooling: a foreign Chrome on the account's port passes the reachability check and is only rejected at the auth check (2026-09-11: a Discord-automation Chrome binding port 9333 caused `unauth` bootstrap failures until the account moved to 9353).
 
 ### Step 1b: Direct CDP version probe
 
 Check that the remote Chrome process or SSH port forward responds on loopback:
 
 ```bash
-curl -s http://127.0.0.1:9333/json/version
+curl -s http://127.0.0.1:9353/json/version
 ```
 
 Expected output includes the Chrome version, user agent, and `webSocketDebuggerUrl`:
@@ -217,7 +219,7 @@ Expected output includes the Chrome version, user agent, and `webSocketDebuggerU
   "User-Agent": "Mozilla/5.0 ...",
   "V8-Version": "13.3.178.20",
   "WebKit-Version": "537.36 ...",
-  "webSocketDebuggerUrl": "ws://127.0.0.1:9333/devtools/browser/..."
+  "webSocketDebuggerUrl": "ws://127.0.0.1:9353/devtools/browser/..."
 }
 ```
 
@@ -237,7 +239,7 @@ Verify that `remote-chrome` reports reachability as `reachable` and login state 
 
 ### Step 4: Remote Chrome probe example
 
-Run the built-in probe example. It attaches to the browser at `http://127.0.0.1:9333`, validates reachability, opens a ChatGPT login page, checks the exact one-page target delta in `/json/list`, and cleans up:
+Run the built-in probe example. It attaches to the browser at `http://127.0.0.1:9353`, validates reachability, opens a ChatGPT login page, checks the exact one-page target delta in `/json/list`, and cleans up:
 
 ```bash
 cargo run --example remote_chrome_probe
@@ -247,7 +249,7 @@ Successful execution ends with:
 
 ```text
 === Remote Chrome Probe ===
-Connecting to CDP endpoint: http://127.0.0.1:9333
+Connecting to CDP endpoint: http://127.0.0.1:9353
 [CDP /json/list before] Total targets: 1
 [BrowserPool Health]
   Account ID: remote-chrome
@@ -288,7 +290,7 @@ cat <<'EOF' > "$QA_BRIDGE/accounts.json"
         "driver": "chrome",
         "instance": "remote-chrome",
         "launch_mode": "attach_only",
-        "cdp_endpoint": "http://127.0.0.1:9333"
+        "cdp_endpoint": "http://127.0.0.1:9353"
       }
     }
   ]
@@ -307,7 +309,7 @@ cargo run --bin delegate_to_chatgpt_web -- \
   "QA validation task"
 
 # 4. Verify fail-closed behavior
-# If the remote CDP port (9333) is stopped, dispatch must report an error
+# If the remote CDP port (9353) is stopped, dispatch must report an error
 # and must never spawn a local Chrome process.
 ```
 
