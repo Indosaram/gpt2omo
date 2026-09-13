@@ -1,13 +1,12 @@
 <div align="center">
 
 ```
- ██████╗ ██████╗ ████████╗ ██████╗  ██████╗ ███╗   ███╗ ██████╗ 
-██╔════╝ ██╔══██╗╚══██╔══╝ ██╔═══██╗ ██╔═══██╗████╗ ████║██╔═══██╗
-██║  ███╗ ██████╔╝   ██║   ╚════██║ ██║   ██║██╔████╔██║██║   ██║
-██║   ██║ ██╔═══╝    ██║        ██║ ██║   ██║██║╚██╔╝██║██║   ██║
-╚██████╔╝ ██║        ██║   ██   ██║ ╚██████╔╝██║ ╚═╝ ██║╚██████╔╝
- ╚═════╝  ╚═╝        ╚═╝    ╚████╔╝  ╚═════╝ ╚═╝     ╚═╝ ╚═════╝ 
-                               ╚═══╝                             
+ ██████╗ ██████╗ ████████╗ ██████╗   ██████╗ ███╗   ███╗ ██████╗
+██╔════╝ ██╔══██╗╚══██╔══╝ ╚════██╗ ██╔═══██╗████╗ ████║██╔═══██╗
+██║  ███╗██████╔╝   ██║     █████╔╝ ██║   ██║██╔████╔██║██║   ██║
+██║   ██║██╔═══╝    ██║    ██╔═══╝  ██║   ██║██║╚██╔╝██║██║   ██║
+╚██████╔╝██║        ██║    ███████╗ ╚██████╔╝██║ ╚═╝ ██║╚██████╔╝
+ ╚═════╝ ╚═╝        ╚═╝    ╚══════╝  ╚═════╝ ╚═╝     ╚═╝ ╚═════╝
 ```
 
 **High-Performance, Capability-Sandboxed MCP Daemon & Web Delegation Harness: ChatGPT Web Workers → OMO Workspaces, in 100% Rust.**
@@ -31,7 +30,7 @@ It acts as a capability-sandboxed I/O, code intelligence, execution, and verific
 
 ---
 
-## ⚡ Why gpt2omo?
+## Why gpt2omo?
 
 Delegating coding tasks to external web-based LLMs presents critical coordination and security challenges:
 
@@ -45,7 +44,7 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -56,17 +55,17 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
                                        │ 1. Fan-out Manifest (1-3 Workers)
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    GPT2OMO CONTROL PLANE & HELPER                        │
+│                    GPT2OMO CONTROL PLANE & HELPER                           │
 │                     (delegate_to_chatgpt_web CLI)                           │
 │                                                                             │
 │  ┌─────────────────────────┐   ┌─────────────────────────────────────────┐  │
 │  │   Scope Multiplexer     │   │      Authoritative Readiness Gate       │  │
-│  │ (UUID per-worker scope) │   │  (Fail-Closed MCP task_state evidence) │  │
+│  │ (UUID per-worker scope) │   │  (Fail-Closed MCP task_state evidence)  │  │
 │  └────────────┬────────────┘   └────────────────────┬────────────────────┘  │
 │               │                                     │                       │
 │               └─────────────────┬───────────────────┘                       │
 │                                 ▼                                           │
-│                    Orca Browser Tab Dispatcher                              │
+│                 Browser Dispatcher (Chrome CDP / Pool)                      │
 └─────────────────────────────────┬───────────────────────────────────────────┘
                                   │
                                   ▼
@@ -78,35 +77,35 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
                                   │ JSON-RPC MCP Calls
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          GPT2OMO DAEMON (Rust)                           │
+│                          GPT2OMO DAEMON (Rust)                              │
 │  18 standard sandboxed tools + optional query_subagent                      │
 │  - File I/O / Search / AST / LSP / Verification / Task lifecycle            │
-│  - Daemon-owned CommandManager with bounded streaming output                 │
-│  - Capability sandboxing and generation/revision-indexed evidence            │
+│  - Daemon-owned CommandManager with bounded streaming output                │
+│  - Capability sandboxing and generation/revision-indexed evidence           │
 │  - Optional bounded OpenAI-compatible advisory call                         │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## ✨ Key Features
+## Key Features
 
-- 🛡️ **Zero-Escape Capability Sandboxing**: Built on `cap-std` capability-based security. Filesystem operations are locked to the scoped workspace directory.
-- 🤝 **Authoritative Readiness Handshake**: Workers must prove operational readiness by successfully calling MCP `task_state(scope_id=...)`. Purely textual "READY" responses are ignored.
-- 🏁 **Revision-Fresh Terminal Verification**: `COMPLETED` comes only from `completion_check.ready=true`, and verification must match the current workspace revision and lifecycle generation.
-- ⚙️ **Daemon-Owned Async Commands**: `run_command` never holds an MCP request longer than 15 seconds. Slow work detaches into the shared `CommandManager` and is recovered with `poll_command` or `list_commands`.
-- 🧹 **Process-Tree Timeout Defense**: On Unix every command gets a process group. Cancellation/timeout sends `SIGTERM`, waits a bounded 1.5-second grace period, then sends `SIGKILL` to remaining descendants.
-- 🔐 **Sanitized Child Environment**: Bridge/subagent credentials are stripped before spawning commands and child `PATH` is normalized.
-- 🧠 **Bounded Output Memory**: stdout/stderr are continuously drained into capped ring buffers; one MCP response exposes at most 64 KiB combined output while retaining bounded recent history.
-- 🔁 **Idempotent Command Retry**: Optional `client_request_id` is scoped to `(scope_id, generation)` and maps retries back to the original `command_id`.
-- 🔄 **Resumable Session Lifecycle**: Terminal sessions can remain `IDLE_RETAINED` for bounded same-conversation follow-up.
-- ⚡ **Strict Concurrency Limits**: Fresh fan-out has a hard maximum of three independent Web workers.
-- 🧩 **18 Standard MCP Tools**: File I/O, structural search, LSP navigation, daemon-owned execution, git inspection, and task lifecycle tools.
-- 🧠 **Optional Pattern B Advisory Tool**: `query_subagent` is advertised only when an endpoint is configured. It is a bounded second opinion, not another coding agent and never completion evidence.
+- **Zero-Escape Capability Sandboxing**: Built on `cap-std` capability-based security. Filesystem operations are strictly confined to the scoped workspace directory.
+- **Authoritative Readiness Handshake**: Workers must prove operational readiness by successfully calling MCP `task_state(scope_id=...)`. Purely textual "READY" responses are rejected.
+- **Revision-Fresh Terminal Verification**: `COMPLETED` status is granted only when `completion_check.ready=true`, and all verification evidence must match the current workspace revision and lifecycle generation.
+- **Daemon-Owned Async Commands**: `run_command` never holds an MCP request longer than 15 seconds. Long-running tasks detach into the shared `CommandManager` and are monitored via `poll_command` or `list_commands`.
+- **Process-Tree Isolation & Cleanup**: On Unix, each command runs in its own process group (`setpgid`). Cancellation and timeouts send `SIGTERM`, wait a bounded 1.5-second grace period, then escalate to `SIGKILL` for all remaining descendants.
+- **Sanitized Child Environment**: Host and bridge credentials are scrubbed before spawning child commands, and child `PATH` is normalized.
+- **Bounded Output Memory**: stdout and stderr are continuously drained into bounded ring buffers; each MCP response returns at most 64 KiB combined output while retaining recent history.
+- **Idempotent Command Retries**: An optional `client_request_id` scoped to `(scope_id, generation)` maps retried calls back to the original `command_id`.
+- **Resumable Session Lifecycles**: Terminal sessions can remain in `IDLE_RETAINED` state for bounded follow-up tasks within the same conversation.
+- **Strict Concurrency Limits**: Fresh worker fan-out enforces a hard ceiling of three independent Web workers.
+- **18 Standard Sandboxed MCP Tools**: Comprehensive suite spanning file I/O, structural search, LSP navigation, daemon execution, git inspection, and task lifecycle management.
+- **Optional Pattern B Advisory Tool**: `query_subagent` is exposed only when an advisory model endpoint is configured. It provides a bounded second opinion, not autonomous execution or completion evidence.
 
 ---
 
-## 🛠️ MCP Tool Suite
+## MCP Tool Suite
 
 | Category | Tool Name | Description |
 |---|---|---|
@@ -119,7 +118,7 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
 | | `lsp_definition` | Go-to-definition symbol resolution. |
 | | `lsp_references` | Project-wide symbol reference search. |
 | | `lsp_symbols` | Document symbol outline. |
-| **Execution** | `run_command` | Spawn a whitelisted daemon-owned command; returns immediately or detaches after 15 seconds. |
+| **Execution** | `run_command` | Spawn an allowlisted daemon-owned command; returns immediately or detaches after 15 seconds. |
 | | `poll_command` | Long-poll up to 15 seconds and consume bounded stdout/stderr deltas plus evidence status. |
 | | `list_commands` | Recover active and recent command IDs/status for the current scope. |
 | | `cancel_command` | Cancel a command and terminate its process group/descendants. |
@@ -170,7 +169,7 @@ A Web worker remains solely responsible for inspecting source, making edits, run
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Build Binaries
 
@@ -184,35 +183,49 @@ Compiled binaries in `target/release/`:
 - `gpt2omo-relay`: The bridge-to-orchestrator SSE event relay.
 - `install_delegate_web`: Automated installer for OMO and OpenCode skills.
 
-### 2. Start the Daemon
+### 2. Keep the Daemon Local and Connect Secure MCP Tunnel
 
 ```bash
-# Local development (default bind is 127.0.0.1:18800 and mount-root is .):
+# Local development only (default bind is 127.0.0.1:18800 and mount-root is .):
 ./target/release/gpt2omo
-
-# Non-loopback bridge-control exposure (--token protects `/events`):
-./target/release/gpt2omo --bind 0.0.0.0:18800 --token "$OMO_BRIDGE_TOKEN"
 ```
 
-Or connect via Cloudflare Tunnel. MCP tool calls authenticate with the per-delegation `scope_id`; do not configure a static Authorization header in the ChatGPT MCP connector. If a local relay subscribes to `/events`, keep its control token configured:
-```bash
-# Start daemon with an optional relay-control token:
-./target/release/gpt2omo --token "$OMO_BRIDGE_TOKEN"
+For shared infrastructure, use the [launchd supervision guide](docs/local-bridge-supervision.md)
+and preserve the bridge/relay's configured local authentication. **Never expose the
+bridge publicly without authentication.** A `scope_id` capability or a token that
+protects only `/events` is not authentication for a public `/mcp` endpoint.
 
-# Forward loopback traffic through tunnel:
-cloudflared tunnel --url http://127.0.0.1:18800
-```
+Follow the [Secure MCP Tunnel operator runbook](docs/secure-mcp-tunnel.md): create a
+Platform tunnel, issue a **Restricted runtime key with only Tunnels Read + Use
+(never Manage)**, and pin the latest official `tunnel-client` release. Initialize an
+HTTP profile targeting `http://127.0.0.1:18800/mcp`, run doctor, and supervise it with
+[`com.omo.gpt2omo.tunnel`](examples/com.omo.gpt2omo.tunnel.plist). Keep credentials
+in 0600 files outside the repository; never commit API keys or tunnel credentials.
+
+Associate the tunnel with **all target ChatGPT workspaces**, including those used
+by `remote-chrome` and `remote-chrome-2`, then create a developer-mode app with
+**Connection = Tunnel** in each workspace. The client long-polls OpenAI over
+outbound HTTPS; no inbound internet ports or public bridge URL are needed. Verify
+the client admin UI, `/healthz`, `/readyz`, and both accounts' tool round-trips before
+cutover. The scope capability remains an additional defense layer.
+
+Cloudflared remains the documented [authenticated rollback](docs/secure-mcp-tunnel.md#10-rollback); preserve its configuration.
+
+The following helper commands run on the bridge host and therefore use its loopback
+URL; ChatGPT uses the selected Tunnel app. Do not replace `--bridge-url` with a
+`tunnel_id` or an OpenAI-hosted tunnel endpoint. The local relay's `/events` path
+remains local, with its existing control authentication.
 
 ### 3. Dispatch a Web Delegation
 
 ```bash
-cat <<'EOF' | ./target/release/delegate_to_chatgpt_web --bridge-url https://code.checka.cc --batch-stdin --json
+cat <<'EOF' | ./target/release/delegate_to_chatgpt_web --bridge-url http://127.0.0.1:18800 --batch-stdin --json
 {
   "tasks": [
     {
       "label": "auth-module",
       "task": "Implement OAuth2 PKCE flow and add integration tests.",
-      "workspace": "/Users/indo/code/project/my-app"
+      "workspace": "<ABSOLUTE_WORKSPACE_PATH>"
     }
   ]
 }
@@ -223,7 +236,7 @@ EOF
 
 ```bash
 echo "Add unit tests for token expiration." | ./target/release/delegate_to_chatgpt_web \
-  --bridge-url https://code.checka.cc \
+  --bridge-url http://127.0.0.1:18800 \
   --resume-scope '<scope-id>' \
   --stdin \
   --json
@@ -257,9 +270,9 @@ Install or refresh the managed `/delegate-web` prompt and skill after building t
 helper:
 
 ```bash
-cargo build --bin delegate_to_chatgpt_web --bin install_delegate_web
-./target/debug/install_delegate_web
-./target/debug/install_delegate_web --check --json
+cargo build --release --bin delegate_to_chatgpt_web --bin install_delegate_web
+./target/release/install_delegate_web
+./target/release/install_delegate_web --check --json
 ```
 
 Then ask OMO to use `/delegate-web` for one focused coding task, a pair of independent
@@ -277,11 +290,11 @@ Fresh work supports one or two ChatGPT Web workers. Every result reports the exa
 
 ```bash
 echo "Now add coverage for the missing-state callback." |
-  ./target/debug/delegate_to_chatgpt_web \
-    --bridge-url https://code.checka.cc \
+  ./target/release/delegate_to_chatgpt_web \
+    --bridge-url http://127.0.0.1:18800 \
     --resume-scope '<exact-scope-id>' --stdin --json
 
-./target/debug/delegate_to_chatgpt_web \
+./target/release/delegate_to_chatgpt_web \
   --close-scope '<exact-scope-id>' --json
 ```
 
@@ -325,7 +338,7 @@ the scope-safe [`launchd` supervision guide](docs/local-bridge-supervision.md).
 
 ---
 
-## 🧪 Verification & Quality Gates
+## Verification & Quality Gates
 
 Run the complete test and verification suite:
 
@@ -339,6 +352,6 @@ git diff --check
 
 ---
 
-## 📜 License
+## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
