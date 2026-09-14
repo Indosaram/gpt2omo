@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Operator template: render placeholders using docs/secure-mcp-tunnel.md.
+       launchd does not expand tilde, shell variables, or command substitutions.
+       Pin the executable to an installed, verified release; never a latest symlink.
+       Secrets must live in a 0600 file outside the repository, never in this plist.
+       CONTROL_PLANE_API_KEY uses the client's native file: secret reference.
+       The runtime key must have only Tunnels Read + Use, never Manage/admin access.
+       The bridge must already be healthy on 127.0.0.1:18800. -->
+  <key>Label</key>
+  <string>com.omo.gpt2omo.tunnel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>&lt;PINNED_TUNNEL_CLIENT_BIN&gt;</string>
+    <string>run</string>
+    <string>--profile</string>
+    <string>&lt;PROFILE_NAME&gt;</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>&lt;TUNNEL_PROFILE_DIR&gt;</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>&lt;HOME&gt;</string>
+    <key>PATH</key>
+    <string>&lt;HOME&gt;/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>TUNNEL_CLIENT_PROFILE_DIR</key>
+    <string>&lt;TUNNEL_PROFILE_DIR&gt;</string>
+    <key>CONTROL_PLANE_API_KEY</key>
+    <string>file:&lt;TUNNEL_API_KEY_FILE&gt;</string>
+    <key>HEALTH_LISTEN_ADDR</key>
+    <string>127.0.0.1:&lt;TUNNEL_ADMIN_PORT&gt;</string>
+    <key>MCP_STARTUP_WAIT_TIMEOUT</key>
+    <string>60s</string>
+    <key>ALLOW_REMOTE_UI</key>
+    <string>false</string>
+    <key>OPEN_WEB_UI</key>
+    <string>false</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>StandardOutPath</key>
+  <string>&lt;HOME&gt;/Library/Logs/gpt2omo-tunnel.log</string>
+  <key>StandardErrorPath</key>
+  <string>&lt;HOME&gt;/Library/Logs/gpt2omo-tunnel.log</string>
+</dict>
+</plist>

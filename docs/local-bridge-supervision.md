@@ -5,14 +5,20 @@ used as shared local infrastructure. Starting either binary from an interactive
 terminal, a tool PTY, or a one-off agent command makes its lifetime depend on that
 session. A turn ending must not make the bridge disappear.
 
-This guide installs two per-user `launchd` agents:
+This guide covers these per-user `launchd` agents:
 
 - `com.omo.gpt2omo.bridge`: owns the loopback MCP/SSE bridge.
 - `com.omo.gpt2omo.relay`: owns continuation-event delivery and retained-session
   reaping.
+- `com.omo.gpt2omo.tunnel`: owns the outbound Secure MCP Tunnel client; depends on
+  the bridge being healthy on `127.0.0.1:18800`.
+- `com.omo.gpt2omo.chrome.remote-chrome`: owns the dedicated `remote-chrome` Chrome
+  instance (CDP port 9353).
+- `com.omo.gpt2omo.chrome.account2`: owns the dedicated second-account Chrome
+  instance (CDP port 9354).
 
-Neither agent deletes scopes. They share the existing scope directory, so a restart
-preserves generation state and retained-session leases.
+These agents do not delete scopes. The bridge and relay share the existing scope
+directory, so a restart preserves generation state and retained-session leases.
 
 Every `delegate_to_chatgpt_web` invocation must use the same broad mount root as the
 bridge. The helper validates a retained scope's stored workspace before it contacts
@@ -64,7 +70,6 @@ Create `~/Library/LaunchAgents/com.omo.gpt2omo.bridge.plist`:
     <string>/</string>
     <string>--scope-dir</string>
     <string>/Users/YOU/.omo/bridge/scopes-18800</string>
-    <string>--insecure-no-auth</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/YOU/code/project/omo-bridge</string>
@@ -93,10 +98,14 @@ Create `~/Library/LaunchAgents/com.omo.gpt2omo.bridge.plist`:
 </plist>
 ```
 
-The `--insecure-no-auth` profile is only for a trusted local account with the bridge
-bound to `127.0.0.1`; scope IDs remain the per-delegation capability. Do not expose
-that profile on a non-loopback interface. Use matching `--token` or `--token-file`
-arguments for the bridge and relay when local control endpoints need bearer auth.
+By default, the bridge resolves its transport Bearer token from `~/.omo/bridge/token`.
+The `--insecure-no-auth` flag exists solely as an explicit bypass for isolated local
+debugging; it removes transport Bearer authentication entirely. Never expose an
+unauthenticated bridge publicly, including through an inbound tunnel pointed at
+loopback. Mutating tools still require both `scope_id` and `capability_secret`, but
+that tool authorization cannot replace transport security. Secure MCP Tunnel removes
+public ingress; it doesn't replace the bridge's local authentication and scope
+isolation.
 
 `run_command` intentionally clears each child environment and rebuilds it from the
 bridge's own PATH. Adding the Rust toolchain directory here is therefore required for
@@ -157,9 +166,40 @@ stored driver, and the direct-CDP path resolves Chrome bindings from `accounts.j
 If a legacy CLI browser driver is deliberately used, pin it in that account's
 `browser.driver` configuration rather than in the shared relay service.
 
+## Install the Secure MCP Tunnel agent
+
+Follow the [Secure MCP Tunnel operator runbook](secure-mcp-tunnel.md) to register
+the tunnel manually, issue a restricted **Tunnels Read + Use** runtime key (never
+Manage), pin the latest official client release, initialize the HTTP MCP profile,
+and run `tunnel-client doctor --profile <PROFILE_NAME> --explain`.
+
+Render [the agent template](../examples/com.omo.gpt2omo.tunnel.plist) to
+`~/Library/LaunchAgents/com.omo.gpt2omo.tunnel.plist` using the runbook. It runs the
+pinned client directly with `run --profile <PROFILE_NAME>` and uses `RunAtLoad`,
+`KeepAlive`, and `ThrottleInterval` 15s, like the dedicated Chrome agents below.
+The HOME and base PATH follow the bridge/relay conventions. Both stdout and stderr
+go to `~/Library/Logs/gpt2omo-tunnel.log`.
+
+The client depends on a healthy bridge at `127.0.0.1:18800` and forwards only to
+`http://127.0.0.1:18800/mcp`. Its startup wait tolerates initial bridge startup, but
+launchd does not guarantee dependency ordering. Keep its `/ui`, `/healthz`, and
+`/readyz` listener on a separate loopback port. Supply only a native `file:` key
+reference in `EnvironmentVariables`; the secret itself must remain in a 0600 file
+outside the repository, never in a committed plist or profile.
+
+The runbook contains installation, health checks, association of all workspaces
+used by `remote-chrome` and `remote-chrome-2`, parallel-verification gates, and an
+authenticated cloudflared rollback. Preserve the old cloudflared configuration;
+do not retire its forwarding until the secure route passes those gates. Never keep
+an unauthenticated public route online for comparison. Service installation,
+cutover, and reboot/login verification are manual operator actions, not actions for
+an active coding worker. Per-user LaunchAgents start after GUI login following a
+reboot; they do not provide pre-login service availability.
+
 ## Load and verify
 
-Validate and load both agents:
+Validate and load the bridge and relay agents (install the tunnel separately after
+the bridge is healthy, as described above):
 
 ```bash
 plutil -lint ~/Library/LaunchAgents/com.omo.gpt2omo.bridge.plist

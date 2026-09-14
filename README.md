@@ -186,14 +186,15 @@ Compiled binaries in `target/release/`:
 ### 2. Keep the Daemon Local and Connect Secure MCP Tunnel
 
 ```bash
-# Local development only (default bind is 127.0.0.1:18800 and mount-root is .):
+# Local development only (default bind is 127.0.0.1:18800; default mount-root resolves the current git worktree root, then HOME, then .):
 ./target/release/gpt2omo
 ```
 
 For shared infrastructure, use the [launchd supervision guide](docs/local-bridge-supervision.md)
-and preserve the bridge/relay's configured local authentication. **Never expose the
-bridge publicly without authentication.** A `scope_id` capability or a token that
-protects only `/events` is not authentication for a public `/mcp` endpoint.
+and keep the bridge's local authentication enabled. **Never expose the bridge publicly
+without authentication.** Transport Bearer token authentication is mandatory across all
+bridge endpoints. Mutating tools further require a valid `scope_id` plus its matching
+`capability_secret`, so network reachability alone won't authorize writes or commands.
 
 Follow the [Secure MCP Tunnel operator runbook](docs/secure-mcp-tunnel.md): create a
 Platform tunnel, issue a **Restricted runtime key with only Tunnels Read + Use
@@ -207,7 +208,7 @@ by `remote-chrome` and `remote-chrome-2`, then create a developer-mode app with
 **Connection = Tunnel** in each workspace. The client long-polls OpenAI over
 outbound HTTPS; no inbound internet ports or public bridge URL are needed. Verify
 the client admin UI, `/healthz`, `/readyz`, and both accounts' tool round-trips before
-cutover. The scope capability remains an additional defense layer.
+cutover. Scope isolation and capability secrets provide an additional layer of defense.
 
 Cloudflared remains the documented [authenticated rollback](docs/secure-mcp-tunnel.md#10-rollback); preserve its configuration.
 
