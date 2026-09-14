@@ -7,8 +7,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+const BRIDGE_MAX_BLOCKING_THREADS: usize = 32;
+
+fn main() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(BRIDGE_MAX_BLOCKING_THREADS)
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     gpt2omo::load_dotenv_if_present();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -18,7 +27,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut cli = Cli::parse();
-    cli.ensure_auth()?;
+    let generated_token_path = cli.ensure_auth()?;
+    if generated_token_path.is_some() {
+        if let Some(token) = cli.token.as_deref() {
+            println!("{token}");
+        }
+    }
     let addr: SocketAddr = cli.bind.parse()?;
     cli.validate_bind_security(&addr)
         .map_err(anyhow::Error::msg)?;
@@ -40,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         );
     } else {
         warn!(
-            "Command execution is daemon-owned but not OS-sandboxed. Treat every holder of a live scope_id in a shared ChatGPT account as one trust principal; writable mode is loopback-only."
+            "Command execution is daemon-owned but not OS-sandboxed. Treat every holder of a live scope_id + capability_secret pairing in a shared ChatGPT account as one trust principal; writable mode is loopback-only."
         );
     }
 

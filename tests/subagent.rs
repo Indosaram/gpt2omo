@@ -104,12 +104,21 @@ fn cli_for(dir: &TempDir, scope_dir: std::path::PathBuf, endpoint: Option<String
     }
 }
 
-fn test_app(dir: &TempDir, endpoint: Option<String>) -> (axum::Router, WorkspaceMux, String) {
-    let scope_dir = dir.path().with_extension("scopes");
-    let mux = WorkspaceMux::new(dir.path(), &scope_dir).unwrap();
+fn test_app(
+    dir: &TempDir,
+    endpoint: Option<String>,
+) -> (axum::Router, WorkspaceMux, String, String) {
+    // Keep the mount root and its scope control dir as siblings INSIDE the TempDir; a sibling
+    // outside the guard is never reclaimed and leaks a *.scopes directory per run (TEST-1).
+    let mount_root = dir.path().join("mount-root");
+    std::fs::create_dir_all(&mount_root).unwrap();
+    let scope_dir = dir.path().join("scopes");
+    let mux = WorkspaceMux::new(&mount_root, &scope_dir).unwrap();
     let scope = mux
-        .register(dir.path(), Some("subagent-test".into()))
+        .register(&mount_root, Some("subagent-test".into()))
         .unwrap();
+    let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
+    let capability_secret = scope.capability_secret.clone().unwrap();
     let cli = cli_for(dir, scope_dir, endpoint);
     let events = Arc::new(EventBus::new(dir.path().to_string_lossy().to_string()));
     let app = create_router(AppState {
@@ -118,7 +127,7 @@ fn test_app(dir: &TempDir, endpoint: Option<String>) -> (axum::Router, Workspace
         events,
         commands: Arc::new(gpt2omo::tools::CommandManager::new()),
     });
-    (app, mux, scope.scope_id)
+    (app, mux, scope.scope_id, capability_secret)
 }
 
 async fn rpc(app: axum::Router, payload: Value) -> Value {
@@ -158,9 +167,16 @@ async fn establish_lifecycle(app: axum::Router, scope_id: &str) {
     assert_eq!(response["result"]["isError"], false);
 }
 
-async fn query(app: axum::Router, scope_id: &str, prompt: Value, timeout: Option<Value>) -> Value {
+async fn query(
+    app: axum::Router,
+    scope_id: &str,
+    capability_secret: &str,
+    prompt: Value,
+    timeout: Option<Value>,
+) -> Value {
     let mut arguments = json!({
         "scope_id": scope_id,
+        "capability_secret": capability_secret,
         "prompt": prompt,
     });
     if let Some(timeout) = timeout {
@@ -184,7 +200,7 @@ async fn query(app: axum::Router, scope_id: &str, prompt: Value, timeout: Option
 #[tokio::test]
 async fn discovery_is_disabled_without_endpoint_and_enabled_with_endpoint() {
     let disabled_dir = tempfile::tempdir().unwrap();
-    let (disabled_app, _, _) = test_app(&disabled_dir, None);
+    let (disabled_app, _, _, _) = test_app(&disabled_dir, None);
     let disabled = rpc(
         disabled_app,
         json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
@@ -201,7 +217,7 @@ async fn discovery_is_disabled_without_endpoint_and_enabled_with_endpoint() {
 
     let (endpoint, _) = spawn_mock(MockMode::Success).await;
     let enabled_dir = tempfile::tempdir().unwrap();
-    let (enabled_app, _, _) = test_app(&enabled_dir, Some(endpoint));
+    let (enabled_app, _, _, _) = test_app(&enabled_dir, Some(endpoint));
     let enabled = rpc(
         enabled_app,
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
@@ -214,19 +230,26 @@ async fn discovery_is_disabled_without_endpoint_and_enabled_with_endpoint() {
         .find(|tool| tool["name"] == "query_subagent")
         .unwrap();
     assert!(subagent["inputSchema"]["properties"]["scope_id"].is_object());
+    assert!(subagent["inputSchema"]["properties"]["capability_secret"].is_object());
     assert!(subagent["inputSchema"]["properties"]["prompt"].is_object());
+    assert!(subagent["inputSchema"]["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value.as_str() == Some("capability_secret")));
 }
 
 #[tokio::test]
 async fn successful_query_parses_advice_usage_latency_and_sends_model_and_auth() {
     let (endpoint, mock) = spawn_mock(MockMode::Success).await;
     let dir = tempfile::tempdir().unwrap();
-    let (app, _, scope_id) = test_app(&dir, Some(endpoint));
+    let (app, _, scope_id, capability_secret) = test_app(&dir, Some(endpoint));
     establish_lifecycle(app.clone(), &scope_id).await;
 
     let response = query(
         app,
         &scope_id,
+        &capability_secret,
         json!("Review this quota design."),
         Some(json!(10)),
     )
@@ -256,9 +279,16 @@ async fn successful_query_parses_advice_usage_latency_and_sends_model_and_auth()
 async fn active_lifecycle_and_input_bounds_are_enforced_before_network_or_quota() {
     let (endpoint, mock) = spawn_mock(MockMode::Success).await;
     let dir = tempfile::tempdir().unwrap();
-    let (app, _, scope_id) = test_app(&dir, Some(endpoint));
+    let (app, _, scope_id, capability_secret) = test_app(&dir, Some(endpoint));
 
-    let no_lifecycle = query(app.clone(), &scope_id, json!("hello"), None).await;
+    let no_lifecycle = query(
+        app.clone(),
+        &scope_id,
+        &capability_secret,
+        json!("hello"),
+        None,
+    )
+    .await;
     let nested = nested_tool_result(&no_lifecycle);
     assert_eq!(nested["success"], false);
     assert!(nested["error"]
@@ -269,13 +299,27 @@ async fn active_lifecycle_and_input_bounds_are_enforced_before_network_or_quota(
 
     establish_lifecycle(app.clone(), &scope_id).await;
     let oversized = "x".repeat(32 * 1024 + 1);
-    let too_large = query(app.clone(), &scope_id, json!(oversized), None).await;
+    let too_large = query(
+        app.clone(),
+        &scope_id,
+        &capability_secret,
+        json!(oversized),
+        None,
+    )
+    .await;
     let nested = nested_tool_result(&too_large);
     assert_eq!(nested["success"], false);
     assert!(nested["error"].as_str().unwrap().contains("32768-byte"));
     assert_eq!(mock.requests.load(Ordering::SeqCst), 0);
 
-    let bad_timeout = query(app.clone(), &scope_id, json!("hello"), Some(json!(1.5))).await;
+    let bad_timeout = query(
+        app.clone(),
+        &scope_id,
+        &capability_secret,
+        json!("hello"),
+        Some(json!(1.5)),
+    )
+    .await;
     let nested = nested_tool_result(&bad_timeout);
     assert_eq!(nested["success"], false);
     assert!(nested["error"]
@@ -284,7 +328,14 @@ async fn active_lifecycle_and_input_bounds_are_enforced_before_network_or_quota(
         .contains("timeout_ms must be an integer"));
     assert_eq!(mock.requests.load(Ordering::SeqCst), 0);
 
-    let valid = query(app, &scope_id, json!("hello"), Some(json!(0))).await;
+    let valid = query(
+        app,
+        &scope_id,
+        &capability_secret,
+        json!("hello"),
+        Some(json!(0)),
+    )
+    .await;
     let nested = nested_tool_result(&valid);
     assert_eq!(nested["success"], true);
     assert_eq!(nested["data"]["quota_call"], 1);
@@ -295,13 +346,14 @@ async fn active_lifecycle_and_input_bounds_are_enforced_before_network_or_quota(
 async fn quota_allows_four_calls_per_generation_and_rejects_the_fifth() {
     let (endpoint, mock) = spawn_mock(MockMode::Success).await;
     let dir = tempfile::tempdir().unwrap();
-    let (app, _, scope_id) = test_app(&dir, Some(endpoint));
+    let (app, _, scope_id, capability_secret) = test_app(&dir, Some(endpoint));
     establish_lifecycle(app.clone(), &scope_id).await;
 
     for expected in 1..=4 {
         let response = query(
             app.clone(),
             &scope_id,
+            &capability_secret,
             json!(format!("call {expected}")),
             None,
         )
@@ -310,7 +362,7 @@ async fn quota_allows_four_calls_per_generation_and_rejects_the_fifth() {
         assert_eq!(nested["success"], true);
         assert_eq!(nested["data"]["quota_call"], expected);
     }
-    let fifth = query(app, &scope_id, json!("call five"), None).await;
+    let fifth = query(app, &scope_id, &capability_secret, json!("call five"), None).await;
     let nested = nested_tool_result(&fifth);
     assert_eq!(nested["success"], false);
     assert!(nested["error"].as_str().unwrap().contains("quota exceeded"));
@@ -321,10 +373,17 @@ async fn quota_allows_four_calls_per_generation_and_rejects_the_fifth() {
 async fn oversized_raw_response_is_rejected_before_json_parsing() {
     let (endpoint, mock) = spawn_mock(MockMode::Oversized).await;
     let dir = tempfile::tempdir().unwrap();
-    let (app, _, scope_id) = test_app(&dir, Some(endpoint));
+    let (app, _, scope_id, capability_secret) = test_app(&dir, Some(endpoint));
     establish_lifecycle(app.clone(), &scope_id).await;
 
-    let response = query(app, &scope_id, json!("large response please"), None).await;
+    let response = query(
+        app,
+        &scope_id,
+        &capability_secret,
+        json!("large response please"),
+        None,
+    )
+    .await;
     let nested = nested_tool_result(&response);
     assert_eq!(nested["success"], false);
     assert!(nested["error"]
@@ -338,10 +397,17 @@ async fn oversized_raw_response_is_rejected_before_json_parsing() {
 async fn upstream_http_errors_are_sanitized() {
     let (endpoint, mock) = spawn_mock(MockMode::Error).await;
     let dir = tempfile::tempdir().unwrap();
-    let (app, _, scope_id) = test_app(&dir, Some(endpoint));
+    let (app, _, scope_id, capability_secret) = test_app(&dir, Some(endpoint));
     establish_lifecycle(app.clone(), &scope_id).await;
 
-    let response = query(app, &scope_id, json!("cause upstream error"), None).await;
+    let response = query(
+        app,
+        &scope_id,
+        &capability_secret,
+        json!("cause upstream error"),
+        None,
+    )
+    .await;
     let nested = nested_tool_result(&response);
     assert_eq!(nested["success"], false);
     let error = nested["error"].as_str().unwrap();

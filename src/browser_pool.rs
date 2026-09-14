@@ -363,7 +363,17 @@ impl BrowserPool {
         if target.launch_mode == BrowserLaunchMode::ManagedLocal {
             self.ensure_profile_lease(target)?;
         }
-        if self.ensure_cdp_reachable(endpoint).await.is_ok() {
+        if let Ok(version) = self.fetch_cdp_version(endpoint).await {
+            // Reachability is not ownership: confirm the live browser is serving THIS account's
+            // profile before adopting it (BP-1).
+            if let Some(profile) = target.user_data_dir.as_deref() {
+                cdp_identity_matches_profile(&version, profile).with_context(|| {
+                    format!(
+                        "browser instance '{}' for account '{}' at {} failed profile identity verification",
+                        target.instance, target.account_id, endpoint
+                    )
+                })?;
+            }
             return Ok(());
         }
 
@@ -667,6 +677,10 @@ impl BrowserPool {
     }
 
     async fn ensure_cdp_reachable(&self, endpoint: &str) -> Result<()> {
+        self.fetch_cdp_version(endpoint).await.map(|_| ())
+    }
+
+    async fn fetch_cdp_version(&self, endpoint: &str) -> Result<Value> {
         let url = cdp_url(endpoint, "json/version")?;
         let response = self
             .http
@@ -681,11 +695,11 @@ impl BrowserPool {
                 response.status()
             ));
         }
-        let _: Value = response
+        let version: Value = response
             .json()
             .await
             .context("browser CDP /json/version returned invalid JSON")?;
-        Ok(())
+        Ok(version)
     }
 
     async fn cdp_create_page(&self, endpoint: &str) -> Result<String> {
@@ -1208,6 +1222,30 @@ struct CdpTarget {
     web_socket_debugger_url: String,
 }
 
+/// Confirms that the browser answering a CDP endpoint is the one configured for this account.
+///
+/// Reachability alone is not ownership: a recycled port, or another account's Chrome that happens
+/// to listen on the configured port, answers `/json/version` just as happily. Accepting that reply
+/// would silently route one account's work into another account's browser profile.
+fn cdp_identity_matches_profile(version: &Value, expected_profile: &Path) -> Result<()> {
+    let Some(reported) = version.get("userDataDir").and_then(Value::as_str) else {
+        return Err(anyhow!(
+            "browser CDP endpoint did not report a userDataDir, so its profile identity cannot be confirmed for {}",
+            expected_profile.display()
+        ));
+    };
+    let reported_path = dunce::simplified(Path::new(reported)).to_path_buf();
+    let expected_path = dunce::simplified(expected_profile).to_path_buf();
+    if reported_path != expected_path {
+        return Err(anyhow!(
+            "browser CDP endpoint is serving profile {} but this account is configured for {}; refusing to use another profile's browser",
+            reported_path.display(),
+            expected_path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn cdp_url(endpoint: &str, path: &str) -> Result<Url> {
     let mut base = Url::parse(endpoint).context("invalid configured CDP endpoint")?;
     if !matches!(base.scheme(), "http" | "https") {
@@ -1585,6 +1623,33 @@ mod tests {
         assert!(second.ensure_profile_lease(&target).is_err());
         drop(first);
         second.ensure_profile_lease(&target).unwrap();
+    }
+
+    #[test]
+    fn cdp_identity_must_match_the_configured_profile() {
+        let profile = std::path::Path::new("/tmp/omo-profile-a");
+
+        // The browser actually answering on the endpoint is running a DIFFERENT profile, which is
+        // exactly what a recycled port or a neighbouring account's Chrome looks like.
+        let foreign = serde_json::json!({
+            "Browser": "Chrome/120.0.0.0",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/browser/abc",
+            "userDataDir": "/tmp/omo-profile-b"
+        });
+        assert!(
+            cdp_identity_matches_profile(&foreign, profile).is_err(),
+            "a CDP endpoint served by a different user-data-dir must be refused, not trusted because it merely answered"
+        );
+
+        let owned = serde_json::json!({
+            "Browser": "Chrome/120.0.0.0",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/browser/abc",
+            "userDataDir": "/tmp/omo-profile-a"
+        });
+        assert!(
+            cdp_identity_matches_profile(&owned, profile).is_ok(),
+            "the configured profile's own browser must still be accepted"
+        );
     }
 
     #[test]

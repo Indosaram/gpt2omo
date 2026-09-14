@@ -104,6 +104,49 @@ impl PathPolicy {
 
         Ok(clean)
     }
+
+    /// Re-applies the dotfile/secret denylist to what a sanitized path actually RESOLVES to.
+    ///
+    /// Name-based sanitization alone is bypassable: an in-workspace symlink with an innocuous
+    /// name (for example `notes.txt -> .env`) passes the spelling check, and the caller then
+    /// follows the link to the denied target. Paths that do not exist yet are left to the
+    /// caller (creation is governed by the sanitized name), and targets that resolve outside
+    /// the workspace are rejected.
+    pub fn ensure_resolved_target_allowed(root: &Path, rel: &Path) -> Result<()> {
+        let resolved = match dunce::canonicalize(root.join(rel)) {
+            Ok(path) => path,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(BridgeError::Path(format!("Failed to resolve path: {}", e))),
+        };
+        let canonical_root = dunce::canonicalize(root)
+            .map_err(|e| BridgeError::Path(format!("Failed to resolve workspace root: {}", e)))?;
+        let inside = resolved.strip_prefix(&canonical_root).map_err(|_| {
+            BridgeError::Security(format!(
+                "Resolved path escapes workspace through a symlink: {}",
+                resolved.display()
+            ))
+        })?;
+
+        for comp in inside.components() {
+            if let Component::Normal(c) = comp {
+                let s = c.to_string_lossy();
+                if s.starts_with('.') && !Self::is_allowed_dot_component(&s) {
+                    return Err(BridgeError::Security(format!(
+                        "Hidden/dotfile access denied: {} (resolved target)",
+                        s
+                    )));
+                }
+                if Self::is_secret_component(&s) {
+                    return Err(BridgeError::Security(format!(
+                        "Secret key file access denied: {} (resolved target)",
+                        s
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -142,5 +185,28 @@ mod tests {
         assert!(PathPolicy::sanitize_relative_path("id_rsa").is_err());
         assert!(PathPolicy::sanitize_relative_path("ID_RSA").is_err());
         assert!(PathPolicy::sanitize_relative_path(".ssh/id_ed25519").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolved_target_policy_follows_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "API_KEY=1").unwrap();
+        std::fs::write(dir.path().join("real.txt"), "ok").unwrap();
+        symlink(".env", dir.path().join("notes.txt")).unwrap();
+        symlink("real.txt", dir.path().join("alias.txt")).unwrap();
+
+        let err = PathPolicy::ensure_resolved_target_allowed(dir.path(), Path::new("notes.txt"))
+            .unwrap_err();
+        assert!(err.to_string().contains("denied"), "got: {}", err);
+        assert!(
+            PathPolicy::ensure_resolved_target_allowed(dir.path(), Path::new("alias.txt")).is_ok()
+        );
+        assert!(
+            PathPolicy::ensure_resolved_target_allowed(dir.path(), Path::new("missing.txt"))
+                .is_ok()
+        );
     }
 }

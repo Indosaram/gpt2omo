@@ -10,11 +10,27 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Workspace {
     root: PathBuf,
+    /// The directory capability taken once, when the root was validated.
+    ///
+    /// Re-deriving it from `root` on each use would reopen the workspace by pathname under ambient
+    /// authority, so a directory swapped in after validation would be served instead (SEC-1/SEC-2).
+    /// Holding the opened capability pins every later operation to the directory that was checked.
+    capability: Arc<Dir>,
+}
+
+impl Clone for Workspace {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            capability: Arc::clone(&self.capability),
+        }
+    }
 }
 
 impl Workspace {
@@ -28,7 +44,13 @@ impl Workspace {
             ));
         }
 
-        Ok(Self { root: canonical })
+        let capability =
+            Dir::open_ambient_dir(&canonical, ambient_authority()).map_err(BridgeError::Io)?;
+
+        Ok(Self {
+            root: canonical,
+            capability: Arc::new(capability),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -36,7 +58,7 @@ impl Workspace {
     }
 
     pub fn cap_dir(&self) -> Result<Dir> {
-        Dir::open_ambient_dir(&self.root, ambient_authority()).map_err(BridgeError::Io)
+        self.capability.try_clone().map_err(BridgeError::Io)
     }
 
     pub fn resolve_relative(&self, rel: &str) -> Result<PathBuf> {
@@ -106,6 +128,8 @@ pub struct WorkspaceScope {
     pub version: u32,
     pub scope_id: String,
     pub workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,6 +264,7 @@ impl WorkspaceMux {
             version: 2,
             scope_id: scope_id.to_string(),
             workspace: workspace.root().to_string_lossy().to_string(),
+            capability_secret: None,
             terminal,
             browser,
             browser_page_id,
@@ -269,6 +294,16 @@ impl WorkspaceMux {
                 "Invalid workspace scope state for {}",
                 scope_id
             )));
+        }
+        if let Some(secret) = scope.capability_secret.as_deref() {
+            let valid =
+                secret.len() == 64 && hex::decode(secret).is_ok_and(|bytes| bytes.len() == 32);
+            if !valid {
+                return Err(BridgeError::Path(format!(
+                    "Invalid capability_secret in workspace scope {}",
+                    scope_id
+                )));
+            }
         }
         match scope.version {
             1 => {
@@ -364,6 +399,14 @@ impl WorkspaceMux {
     pub fn resolve(&self, scope_id: &str) -> Result<Workspace> {
         let scope = self.lookup(scope_id)?;
         Workspace::open(scope.workspace)
+    }
+
+    pub fn refresh_capability_secret(&self, scope_id: &str) -> Result<WorkspaceScope> {
+        let mut scope = self.lookup(scope_id)?;
+        scope.capability_secret = Some(generate_capability_secret());
+        scope.updated_ms = now_ms();
+        self.persist(&scope)?;
+        Ok(scope)
     }
 
     pub fn update_terminal(&self, scope_id: &str, terminal: &str) -> Result<WorkspaceScope> {
@@ -595,6 +638,15 @@ fn validate_browser_binding(binding: &BrowserBinding) -> Result<()> {
     Ok(())
 }
 
+fn generate_capability_secret() -> String {
+    let first = uuid::Uuid::new_v4();
+    let second = uuid::Uuid::new_v4();
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(first.as_bytes());
+    bytes[16..].copy_from_slice(second.as_bytes());
+    hex::encode(bytes)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -616,6 +668,65 @@ mod tests {
         assert!(ws.cap_dir().is_ok());
         assert!(ws.resolve_relative("src/lib.rs").is_ok());
         assert!(ws.resolve_relative("../outside.txt").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_root_is_pinned_by_capability_not_by_pathname() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempdir().unwrap();
+        let real_root = base.path().join("real-root");
+        let attacker_root = base.path().join("attacker-root");
+        fs::create_dir_all(&real_root).unwrap();
+        fs::create_dir_all(&attacker_root).unwrap();
+        fs::write(real_root.join("owned.txt"), "in-scope").unwrap();
+        fs::write(attacker_root.join("owned.txt"), "ATTACKER CONTENT").unwrap();
+
+        // The daemon opens the workspace through a path that is itself a symlink, which is how a
+        // scope root normally reaches us.
+        let entry = base.path().join("scope-root");
+        symlink(&real_root, &entry).unwrap();
+        let ws = Workspace::open(&entry).unwrap();
+
+        // The capability must be taken ONCE, at open time.
+        let pinned = ws
+            .cap_dir()
+            .expect("workspace must hold an opened capability");
+
+        // Now the pathname is repointed at attacker-controlled storage, exactly the check/use window
+        // SEC-1 and SEC-2 describe. Canonicalization at open time already resolved the entry symlink,
+        // so the live window is a swap of the CANONICAL directory itself — what a cooperating local
+        // process can do between validation and use.
+        let canonical_root = ws.root().to_path_buf();
+        let displaced = base.path().join("displaced-root");
+        fs::rename(&canonical_root, &displaced).unwrap();
+        fs::rename(&attacker_root, &canonical_root).unwrap();
+        let _ = &entry;
+
+        let mut through_capability = String::new();
+        use std::io::Read;
+        pinned
+            .open("owned.txt")
+            .expect("retained capability still reaches the original directory")
+            .read_to_string(&mut through_capability)
+            .unwrap();
+        assert_eq!(
+            through_capability, "in-scope",
+            "a retained capability must keep pointing at the directory validated at open time, but the read followed the repointed pathname to attacker storage"
+        );
+
+        let mut after_swap = String::new();
+        ws.cap_dir()
+            .expect("capability remains available after the pathname moved")
+            .open("owned.txt")
+            .expect("capability-based open must not depend on the mutable pathname")
+            .read_to_string(&mut after_swap)
+            .unwrap();
+        assert_eq!(
+            after_swap, "in-scope",
+            "cap_dir() re-derived the directory from the mutable pathname, so it now serves attacker content"
+        );
     }
 
     #[cfg(unix)]
@@ -664,6 +775,34 @@ mod tests {
             Some("page-b")
         );
         assert_eq!(mux.lookup(&b.scope_id).unwrap().account_id(), "default");
+    }
+
+    #[test]
+    fn capability_secret_refresh_persists_and_rotates_private_scope_capability() {
+        let mount = tempdir().unwrap();
+        let project = mount.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let state = tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), state.path()).unwrap();
+        let scope = mux.register(&project, None).unwrap();
+        assert!(scope.capability_secret.is_none());
+
+        let first = mux.refresh_capability_secret(&scope.scope_id).unwrap();
+        let first_secret = first.capability_secret.clone().unwrap();
+        assert_eq!(first_secret.len(), 64);
+        assert_eq!(hex::decode(&first_secret).unwrap().len(), 32);
+        let persisted = mux.lookup(&scope.scope_id).unwrap();
+        assert_eq!(
+            persisted.capability_secret.as_deref(),
+            Some(first_secret.as_str())
+        );
+
+        let second = mux.refresh_capability_secret(&scope.scope_id).unwrap();
+        let second_secret = second.capability_secret.unwrap();
+        assert_ne!(first_secret, second_secret);
+        let raw =
+            fs::read_to_string(state.path().join(format!("{}.json", scope.scope_id))).unwrap();
+        assert!(raw.contains("\"capability_secret\""));
     }
 
     #[test]
@@ -721,6 +860,16 @@ mod tests {
         let loaded = mux.lookup(raw["scope_id"].as_str().unwrap()).unwrap();
         assert_eq!(loaded.account_id(), LEGACY_ACCOUNT_ID);
         assert_eq!(loaded.page_id(), Some("legacy-page"));
+        assert!(loaded.capability_secret.is_none());
+        let refreshed = mux
+            .refresh_capability_secret(raw["scope_id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(refreshed.capability_secret.as_deref().unwrap().len(), 64);
+        assert!(mux
+            .lookup(raw["scope_id"].as_str().unwrap())
+            .unwrap()
+            .capability_secret
+            .is_some());
     }
 
     #[test]

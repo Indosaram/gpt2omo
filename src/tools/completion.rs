@@ -8,7 +8,7 @@ use crate::tools::task_state::{
 use crate::tools::ToolCallResult;
 use serde_json::Value;
 
-pub fn handle_completion_check(
+pub async fn handle_completion_check(
     ws: &Workspace,
     scope_id: &str,
     require_task_plan: Option<bool>,
@@ -23,9 +23,10 @@ pub fn handle_completion_check(
         require_changes,
         None,
     )
+    .await
 }
 
-pub fn handle_completion_check_with_result(
+pub async fn handle_completion_check_with_result(
     ws: &Workspace,
     scope_id: &str,
     require_task_plan: Option<bool>,
@@ -42,9 +43,10 @@ pub fn handle_completion_check_with_result(
         result,
         None,
     )
+    .await
 }
 
-pub fn handle_completion_check_with_manager(
+pub async fn handle_completion_check_with_manager(
     ws: &Workspace,
     scope_id: &str,
     require_task_plan: Option<bool>,
@@ -61,9 +63,10 @@ pub fn handle_completion_check_with_manager(
         None,
         command_manager,
     )
+    .await
 }
 
-pub fn handle_completion_check_with_manager_and_result(
+pub async fn handle_completion_check_with_manager_and_result(
     ws: &Workspace,
     scope_id: &str,
     require_task_plan: Option<bool>,
@@ -72,7 +75,7 @@ pub fn handle_completion_check_with_manager_and_result(
     result: Option<CompletionResultInput>,
     command_manager: &CommandManager,
 ) -> ToolCallResult {
-    command_manager.reconcile_scope(ws, scope_id);
+    command_manager.reconcile_scope(ws, scope_id).await;
     handle_completion_check_inner(
         ws,
         scope_id,
@@ -82,6 +85,7 @@ pub fn handle_completion_check_with_manager_and_result(
         result,
         Some(command_manager),
     )
+    .await
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,7 +97,7 @@ pub struct CompletionResultInput {
     pub final_message: String,
 }
 
-fn handle_completion_check_inner(
+async fn handle_completion_check_inner(
     ws: &Workspace,
     scope_id: &str,
     require_task_plan: Option<bool>,
@@ -107,15 +111,29 @@ fn handle_completion_check_inner(
     let require_changes = require_changes.unwrap_or(false);
 
     if let Some(result) = result {
-        let recorded = handle_task_result(
-            ws,
-            scope_id,
-            &result.summary,
-            result.changed_files,
-            result.verification,
-            result.blockers,
-            &result.final_message,
-        );
+        let ws_owned = ws.clone();
+        let scope_owned = scope_id.to_string();
+        // handle_task_result acquires a blocking lifecycle file lock and performs synchronous file
+        // IO. Awaiting it inline pins a Tokio worker for the whole lock hold, so run it on the
+        // blocking pool instead.
+        let recorded = match tokio::task::spawn_blocking(move || {
+            handle_task_result(
+                &ws_owned,
+                &scope_owned,
+                &result.summary,
+                result.changed_files,
+                result.verification,
+                result.blockers,
+                &result.final_message,
+            )
+        })
+        .await
+        {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                return ToolCallResult::err(format!("Failed to record task result: {error}"))
+            }
+        };
         if !recorded.success {
             return recorded;
         }
@@ -198,11 +216,12 @@ fn handle_completion_check_inner(
 
             if require_verification {
                 if let Some(manager) = command_manager {
-                    verification_evidence = manager.latest_verification_evidence(ws, scope_id);
+                    verification_evidence =
+                        manager.latest_verification_evidence(ws, scope_id).await;
                     if verification_evidence.is_none() {
                         blockers.push(format!(
                             "No successful verification command matches current workspace revision {}",
-                            manager.workspace_revision(scope_id)
+                            manager.workspace_revision(scope_id).await
                         ));
                     }
                 } else {
@@ -233,9 +252,9 @@ fn handle_completion_check_inner(
         }
     }
 
-    let is_git_repo = is_git_worktree(ws);
+    let is_git_repo = is_git_worktree(ws).await;
     let (git_status_text, git_status_ok) = if is_git_repo {
-        match git_output(ws, &["status", "--porcelain"]) {
+        match git_output(ws, &["status", "--porcelain"]).await {
             Ok(text) => (text, true),
             Err(e) => (e, false),
         }
@@ -268,13 +287,19 @@ fn handle_completion_check_inner(
         }
     }
 
+    let workspace_revision = if let Some(manager) = command_manager {
+        Some(manager.workspace_revision(scope_id).await)
+    } else {
+        None
+    };
+
     ToolCallResult::ok(serde_json::json!({
         "ready": ready,
         "blockers": blockers,
         "incomplete_items": incomplete_items,
         "verification_evidence": verification_evidence,
         "task_result": task_result,
-        "workspace_revision": command_manager.map(|manager| manager.workspace_revision(scope_id)),
+        "workspace_revision": workspace_revision,
         "last_mutation_ms": state.as_ref().and_then(|s| s.last_mutation_ms),
         "last_mutation_path": state.as_ref().and_then(|s| s.last_mutation_path.clone()),
         "git": {
@@ -291,8 +316,8 @@ fn handle_completion_check_inner(
     }))
 }
 
-fn git_output(ws: &Workspace, args: &[&str]) -> std::result::Result<String, String> {
-    run_git(ws, args)
+async fn git_output(ws: &Workspace, args: &[&str]) -> std::result::Result<String, String> {
+    run_git(ws, args).await
 }
 
 #[cfg(test)]
@@ -333,8 +358,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_completion_requires_done_plan_and_fresh_verification() {
+    #[tokio::test]
+    async fn test_completion_requires_done_plan_and_fresh_verification() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
@@ -348,7 +373,7 @@ mod tests {
         );
         record_mutation(&ws, SCOPE, "src/lib.rs");
 
-        let before = handle_completion_check(&ws, SCOPE, None, None, None);
+        let before = handle_completion_check(&ws, SCOPE, None, None, None).await;
         assert!(before.success);
         assert!(!before.data.unwrap()["ready"].as_bool().unwrap());
 
@@ -356,7 +381,7 @@ mod tests {
         handle_task_update(&ws, SCOPE, "T2", "done", None);
         record_verification(&ws, SCOPE, "cargo test", true, Some(0), 10);
 
-        let without_result = handle_completion_check(&ws, SCOPE, None, None, None);
+        let without_result = handle_completion_check(&ws, SCOPE, None, None, None).await;
         assert!(without_result.success);
         assert!(!without_result.data.unwrap()["ready"].as_bool().unwrap());
 
@@ -371,7 +396,7 @@ mod tests {
         );
         assert!(task_result.success);
 
-        let after = handle_completion_check(&ws, SCOPE, None, None, None);
+        let after = handle_completion_check(&ws, SCOPE, None, None, None).await;
         assert!(after.success);
         let data = after.data.unwrap();
         assert!(data["ready"].as_bool().unwrap());
@@ -381,8 +406,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn inline_result_is_persisted_before_completion_audit() {
+    #[tokio::test]
+    async fn inline_result_is_persisted_before_completion_audit() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         start_fresh_delegation_lifecycle(&ws, SCOPE).unwrap();
@@ -400,7 +425,8 @@ mod tests {
                 blockers: vec![],
                 final_message: "Inline result persisted and audited.".into(),
             }),
-        );
+        )
+        .await;
 
         assert!(result.success);
         let data = result.data.unwrap();
@@ -408,13 +434,14 @@ mod tests {
         assert_eq!(data["task_result"]["summary"], "Inline result transport");
     }
 
-    #[test]
-    fn missing_task_result_blocker_teaches_submission() {
+    #[tokio::test]
+    async fn missing_task_result_blocker_teaches_submission() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         start_fresh_delegation_lifecycle(&ws, SCOPE).unwrap();
 
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        let result =
+            handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false)).await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["ready"], false);
@@ -430,8 +457,8 @@ mod tests {
         assert!(missing.contains("final_message"));
     }
 
-    #[test]
-    fn structured_result_blockers_prevent_ready() {
+    #[tokio::test]
+    async fn structured_result_blockers_prevent_ready() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         start_fresh_delegation_lifecycle(&ws, SCOPE).unwrap();
@@ -448,7 +475,8 @@ mod tests {
             .success
         );
 
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        let result =
+            handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false)).await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["ready"], false);
@@ -459,8 +487,8 @@ mod tests {
             .any(|item| item.as_str().unwrap().contains("task_result contains")));
     }
 
-    #[test]
-    fn manager_backed_completion_rejects_stale_revision_evidence() {
+    #[tokio::test]
+    async fn manager_backed_completion_rejects_stale_revision_evidence() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         fs::write(dir.path().join("Makefile"), "test:\n\t@true\n").unwrap();
@@ -470,13 +498,16 @@ mod tests {
         record_result_for_completion(&ws);
         assert!(handle_task_plan(&ws, SCOPE, "Implement", vec!["Verify".into()]).success);
         assert!(handle_task_update(&ws, SCOPE, "T1", "done", None).success);
-        let first = manager.run_command(&ws, SCOPE, "make test", 2_000, None);
+        let first = manager
+            .run_command(&ws, SCOPE, "make test", 2_000, None)
+            .await;
         assert!(first.success);
         assert_eq!(first.data.unwrap()["command_success"], true);
 
         record_mutation(&ws, SCOPE, "src/lib.rs");
-        manager.note_workspace_mutation(SCOPE);
-        let stale = handle_completion_check_with_manager(&ws, SCOPE, None, None, None, &manager);
+        manager.note_workspace_mutation(SCOPE).await;
+        let stale =
+            handle_completion_check_with_manager(&ws, SCOPE, None, None, None, &manager).await;
         assert!(stale.success);
         let stale_data = stale.data.unwrap();
         assert_eq!(stale_data["ready"], false);
@@ -486,7 +517,9 @@ mod tests {
             .iter()
             .any(|item| item.as_str().unwrap().contains("workspace revision 1")));
 
-        let second = manager.run_command(&ws, SCOPE, "make test", 2_000, None);
+        let second = manager
+            .run_command(&ws, SCOPE, "make test", 2_000, None)
+            .await;
         assert!(second.success);
         let refreshed_result = handle_task_result(
             &ws,
@@ -498,20 +531,22 @@ mod tests {
             "Fresh result after mutation.",
         );
         assert!(refreshed_result.success);
-        let fresh = handle_completion_check_with_manager(&ws, SCOPE, None, None, None, &manager);
+        let fresh =
+            handle_completion_check_with_manager(&ws, SCOPE, None, None, None, &manager).await;
         assert!(fresh.success);
         assert_eq!(fresh.data.unwrap()["ready"], true);
     }
 
-    #[test]
-    fn ready_completion_records_authoritative_completed_terminal_state() {
+    #[tokio::test]
+    async fn ready_completion_records_authoritative_completed_terminal_state() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
         clear_delegation_lifecycle(&ws, SCOPE).unwrap();
 
         record_result_for_completion(&ws);
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        let result =
+            handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false)).await;
         assert!(result.success);
         assert!(result.data.unwrap()["ready"].as_bool().unwrap());
         let lifecycle = load_delegation_lifecycle(&ws, SCOPE).unwrap().unwrap();
@@ -525,34 +560,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_completion_can_be_used_without_plan_for_simple_read_only_work() {
+    #[tokio::test]
+    async fn test_completion_can_be_used_without_plan_for_simple_read_only_work() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
         record_result_for_completion(&ws);
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        let result =
+            handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false)).await;
         assert!(result.success);
         assert!(result.data.unwrap()["ready"].as_bool().unwrap());
     }
 
-    #[test]
-    fn test_completion_allows_non_git_read_only_work() {
+    #[tokio::test]
+    async fn test_completion_allows_non_git_read_only_work() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         record_result_for_completion(&ws);
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        let result =
+            handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false)).await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert!(data["ready"].as_bool().unwrap());
         assert_eq!(data["git"]["is_git_repo"], false);
     }
 
-    #[test]
-    fn test_completion_requires_git_when_changes_are_required() {
+    #[tokio::test]
+    async fn test_completion_requires_git_when_changes_are_required() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(true));
+        let result =
+            handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(true)).await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert!(!data["ready"].as_bool().unwrap());
@@ -563,15 +601,16 @@ mod tests {
             .any(|item| item.as_str().unwrap().contains("not a Git repository")));
     }
 
-    #[test]
-    fn untracked_only_changes_satisfy_require_changes() {
+    #[tokio::test]
+    async fn untracked_only_changes_satisfy_require_changes() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
         record_result_for_completion(&ws);
         fs::write(dir.path().join("new-file.txt"), "new\n").unwrap();
 
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(true));
+        let result =
+            handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(true)).await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["ready"], true);
@@ -581,12 +620,13 @@ mod tests {
             .contains("?? new-file.txt"));
     }
 
-    #[test]
-    fn test_completion_without_plan_cannot_claim_verification_evidence() {
+    #[tokio::test]
+    async fn test_completion_without_plan_cannot_claim_verification_evidence() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(true), Some(false));
+        let result =
+            handle_completion_check(&ws, SCOPE, Some(false), Some(true), Some(false)).await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert!(!data["ready"].as_bool().unwrap());
@@ -597,8 +637,8 @@ mod tests {
             .any(|item| item.as_str().unwrap().contains("verification evidence")));
     }
 
-    #[test]
-    fn test_completion_checks_staged_whitespace() {
+    #[tokio::test]
+    async fn test_completion_checks_staged_whitespace() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         fs::write(dir.path().join("bad.txt"), "trailing space \n").unwrap();
@@ -610,7 +650,8 @@ mod tests {
         let ws = Workspace::open(dir.path()).unwrap();
 
         record_result_for_completion(&ws);
-        let result = handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false));
+        let result =
+            handle_completion_check(&ws, SCOPE, Some(false), Some(false), Some(false)).await;
         assert!(result.success);
         let data = result.data.unwrap();
         // Whitespace checks are disabled, so ready should be true

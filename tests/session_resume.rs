@@ -17,6 +17,7 @@ fn retained_completed_scope_resumes_same_browser_page_in_next_generation() {
     let scope = mux
         .register_browser(&project, "same-browser-page".into())
         .unwrap();
+    let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
     let workspace = mux.resolve(&scope.scope_id).unwrap();
 
     let first = start_fresh_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
@@ -57,6 +58,7 @@ fn retained_blocked_scope_reopens_blocked_item_without_losing_context() {
     let scope = mux
         .register_browser(&project, "blocked-browser-page".into())
         .unwrap();
+    let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
     let workspace = mux.resolve(&scope.scope_id).unwrap();
 
     start_fresh_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
@@ -111,6 +113,7 @@ fn dead_retained_page_resume_can_end_new_generation_as_lost() {
     let scope = mux
         .register_browser(&project, "dead-browser-page".into())
         .unwrap();
+    let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
     let workspace = mux.resolve(&scope.scope_id).unwrap();
 
     start_fresh_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();

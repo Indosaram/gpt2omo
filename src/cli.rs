@@ -121,8 +121,7 @@ impl Cli {
     pub fn load_token_file(&mut self) -> std::io::Result<()> {
         if self.token.is_none() {
             if let Some(path) = &self.token_file {
-                let content = std::fs::read_to_string(path)?;
-                self.token = Some(content.trim().to_string());
+                self.token = Some(read_token(path)?);
             }
         }
         Ok(())
@@ -142,6 +141,20 @@ impl Cli {
         &mut self,
         base_dir: &std::path::Path,
     ) -> std::io::Result<Option<PathBuf>> {
+        if let Some(token) = self.token.as_mut() {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "bridge authentication token must not be empty",
+                ));
+            }
+            if trimmed.len() != token.len() {
+                *token = trimmed.to_string();
+            }
+            return Ok(None);
+        }
+
         self.load_token_file()?;
         if self.token.is_some() {
             return Ok(None);
@@ -154,25 +167,88 @@ impl Cli {
             return Ok(None);
         }
 
-        let token = generate_secure_token();
         std::fs::create_dir_all(base_dir)?;
         let token_path = base_dir.join("token");
-        std::fs::write(&token_path, format!("{}\n", token))?;
 
+        let token = generate_secure_token();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&token_path, perms)?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
 
-        tracing::info!(
-            "Authentication token generated and saved to {}",
-            token_path.display()
-        );
-        self.token = Some(token);
-        Ok(Some(token_path))
+        match options.open(&token_path) {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(format!("{}\n", token).as_bytes())?;
+                file.flush()?;
+                set_private_token_file(&token_path)?;
+
+                tracing::info!(
+                    "Authentication token generated and saved to {}",
+                    token_path.display()
+                );
+                self.token = Some(token);
+                Ok(Some(token_path))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = read_token_with_retry(&token_path)?;
+                set_private_token_file(&token_path)?;
+                self.token = Some(existing);
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
+}
+
+fn read_token_with_retry(path: &std::path::Path) -> std::io::Result<String> {
+    let mut last_err = None;
+    for _ in 0..50 {
+        match read_token(path) {
+            Ok(token) => return Ok(token),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                last_err = Some(err);
+                std::thread::yield_now();
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bridge authentication token file is empty: {}",
+                path.display()
+            ),
+        )
+    }))
+}
+
+fn read_token(path: &std::path::Path) -> std::io::Result<String> {
+    let content = std::fs::read_to_string(path)?;
+    let token = content.trim();
+    if token.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bridge authentication token file is empty: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(token.to_string())
+}
+
+fn set_private_token_file(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 pub fn generate_secure_token() -> String {
@@ -340,6 +416,49 @@ mod tests {
     }
 
     #[test]
+    fn ensure_auth_reuses_existing_default_token_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let token_path = temp_dir.path().join("token");
+        std::fs::write(&token_path, "persisted-token\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let mut cli = Cli {
+            insecure_no_auth: false,
+            token: None,
+            token_file: None,
+            ..Cli::default()
+        };
+
+        let generated = cli.ensure_auth_in(temp_dir.path()).unwrap();
+        assert!(generated.is_none());
+        assert_eq!(cli.token.as_deref(), Some("persisted-token"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&token_path).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn ensure_auth_rejects_empty_default_token_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("token"), "  \n").unwrap();
+        let mut cli = Cli {
+            insecure_no_auth: false,
+            token: None,
+            token_file: None,
+            ..Cli::default()
+        };
+        assert!(cli.ensure_auth_in(temp_dir.path()).is_err());
+        assert!(cli.token.is_none());
+    }
+
+    #[test]
     fn ensure_auth_insecure_no_auth_leaves_token_none() {
         let mut cli = Cli {
             insecure_no_auth: true,
@@ -365,5 +484,56 @@ mod tests {
         let token_path = cli.ensure_auth().unwrap();
         assert!(token_path.is_none());
         assert_eq!(cli.token.as_deref(), Some("preconfigured-token"));
+    }
+
+    #[test]
+    fn create_when_file_exists_returns_existing_token_without_truncating() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+
+        for _ in 0..8 {
+            let b = barrier.clone();
+            let dir = temp_dir.path().to_path_buf();
+            handles.push(std::thread::spawn(move || {
+                let mut cli = Cli::default();
+                b.wait();
+                let res = cli.ensure_auth_in(&dir).unwrap();
+                (cli.token.unwrap(), res)
+            }));
+        }
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let token_on_disk = std::fs::read_to_string(temp_dir.path().join("token"))
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let winners = results.iter().filter(|(_, res)| res.is_some()).count();
+        assert_eq!(winners, 1, "exactly one daemon should create the token file");
+
+        for (token, _) in &results {
+            assert_eq!(token, &token_on_disk, "loser must read winner's token without clobbering");
+        }
+    }
+
+    #[test]
+    fn created_token_file_mode_is_0600_via_permissions_ext() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut cli = Cli::default();
+        let token_path = cli
+            .ensure_auth_in(temp_dir.path())
+            .unwrap()
+            .expect("token path should be returned");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&token_path).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = token_path;
+        }
     }
 }

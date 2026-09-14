@@ -1,15 +1,16 @@
 use crate::security::Workspace;
 use crate::tools::ToolCallResult;
 use serde_json::Value;
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::thread;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT_MS: u64 = 20_000;
 const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 
-pub fn handle_ast_grep(
+pub async fn handle_ast_grep(
     ws: &Workspace,
     pattern: &str,
     subpath: Option<&str>,
@@ -34,7 +35,7 @@ pub fn handle_ast_grep(
         _ => ws.root().to_path_buf(),
     };
 
-    let Some(binary) = which_ast_grep() else {
+    let Some(binary) = which_ast_grep().await else {
         return ToolCallResult::err(
             "ast-grep is not installed or not on PATH (expected 'sg' or 'ast-grep')",
         );
@@ -52,43 +53,52 @@ pub fn handle_ast_grep(
     args.push(target.to_string_lossy().to_string());
 
     let started = Instant::now();
-    let mut child = match Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .args(&args)
         .current_dir(ws.root())
+        .kill_on_drop(true)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(e) => return ToolCallResult::err(format!("Failed to start ast-grep: {}", e)),
+        Err(e) => return ToolCallResult::err(format!("Failed to start ast-grep: {e}")),
     };
-
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_reader = thread::spawn(move || read_limited(stdout, MAX_CAPTURE_BYTES));
-    let stderr_reader = thread::spawn(move || read_limited(stderr, 256 * 1024));
-
-    let timeout = Duration::from_millis(DEFAULT_TIMEOUT_MS);
-    let (status, timed_out) = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break (Some(status), false),
-            Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                break (child.wait().ok(), true);
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return ToolCallResult::err(format!("Failed while waiting for ast-grep: {}", e));
-            }
-        }
+    let timeout_duration = Duration::from_millis(DEFAULT_TIMEOUT_MS);
+    let execution = async move {
+        let (status, (stdout_bytes, stdout_truncated), (stderr_bytes, stderr_truncated)) = tokio::join!(
+            child.wait(),
+            read_limited_async(stdout, MAX_CAPTURE_BYTES),
+            read_limited_async(stderr, 256 * 1024),
+        );
+        status
+            .map(|status| {
+                (
+                    status,
+                    stdout_bytes,
+                    stdout_truncated,
+                    stderr_bytes,
+                    stderr_truncated,
+                )
+            })
+            .map_err(|e| format!("Failed while waiting for ast-grep: {e}"))
     };
+    let (status, stdout_bytes, stdout_truncated, stderr_bytes, stderr_truncated, timed_out) =
+        match timeout(timeout_duration, execution).await {
+            Ok(Ok((status, stdout_bytes, stdout_truncated, stderr_bytes, stderr_truncated))) => (
+                Some(status),
+                stdout_bytes,
+                stdout_truncated,
+                stderr_bytes,
+                stderr_truncated,
+                false,
+            ),
+            Ok(Err(error)) => return ToolCallResult::err(error),
+            Err(_) => (None, Vec::new(), false, Vec::new(), false, true),
+        };
 
-    let (stdout_bytes, stdout_truncated) = stdout_reader.join().unwrap_or_default();
-    let (stderr_bytes, stderr_truncated) = stderr_reader.join().unwrap_or_default();
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
     let cap = max_results.unwrap_or(100).clamp(1, 1_000);
@@ -128,7 +138,10 @@ pub fn handle_ast_grep(
     }))
 }
 
-fn read_limited<R: Read>(pipe: Option<R>, limit: usize) -> (Vec<u8>, bool) {
+async fn read_limited_async<R: AsyncRead + Unpin>(
+    pipe: Option<R>,
+    limit: usize,
+) -> (Vec<u8>, bool) {
     let Some(mut pipe) = pipe else {
         return (Vec::new(), false);
     };
@@ -136,7 +149,7 @@ fn read_limited<R: Read>(pipe: Option<R>, limit: usize) -> (Vec<u8>, bool) {
     let mut chunk = [0u8; 8192];
     let mut total_read = 0usize;
     loop {
-        match pipe.read(&mut chunk) {
+        match pipe.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(read) => {
                 total_read = total_read.saturating_add(read);
@@ -150,14 +163,19 @@ fn read_limited<R: Read>(pipe: Option<R>, limit: usize) -> (Vec<u8>, bool) {
     (buffer, total_read > limit)
 }
 
-fn which_ast_grep() -> Option<String> {
+async fn which_ast_grep() -> Option<String> {
     for candidate in ["sg", "ast-grep"] {
-        if Command::new(candidate)
+        let mut command = Command::new(candidate);
+        command
             .arg("--version")
+            .kill_on_drop(true)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+            .stderr(Stdio::null());
+        if timeout(Duration::from_secs(2), command.status())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|status| status.success())
         {
             return Some(candidate.to_string());
         }
@@ -170,19 +188,19 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn rejects_empty_pattern() {
+    #[tokio::test]
+    async fn rejects_empty_pattern() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_ast_grep(&ws, "", None, None, None);
+        let result = handle_ast_grep(&ws, "", None, None, None).await;
         assert!(!result.success);
     }
 
-    #[test]
-    fn rejects_traversal_path() {
+    #[tokio::test]
+    async fn rejects_traversal_path() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_ast_grep(&ws, "$A", Some("../outside"), None, None);
+        let result = handle_ast_grep(&ws, "$A", Some("../outside"), None, None).await;
         assert!(!result.success);
     }
 }

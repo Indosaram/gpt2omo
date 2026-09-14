@@ -15,6 +15,15 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const TELEMETRY_FILE_NAME: &str = "gpt2omo.jsonl";
 
+/// Hard upper bound for an on-disk telemetry log. After a successful append the
+/// file is compacted in place so that it never exceeds this size.
+const TELEMETRY_MAX_BYTES: usize = 1024 * 1024;
+
+/// Bytes of the newest events kept when the cap is hit. Compacting well below
+/// the cap keeps the amortized cost of a write O(1): a rewrite can only happen
+/// once per `TELEMETRY_MAX_BYTES - TELEMETRY_RETAIN_BYTES` bytes appended.
+const TELEMETRY_RETAIN_BYTES: usize = TELEMETRY_MAX_BYTES / 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TelemetryModelHint {
@@ -165,7 +174,7 @@ fn read_recent_events_from_path(
     cutoff: u64,
     now_ms: u64,
 ) -> io::Result<Vec<TelemetryEvent>> {
-    let mut file = File::open(path)?;
+    let mut file = open_private_read(path)?;
     let mut position = file.seek(SeekFrom::End(0))?;
     let mut pending = Vec::new();
     let mut events = Vec::new();
@@ -252,14 +261,28 @@ fn telemetry_candidate_paths() -> Vec<PathBuf> {
                 .join(TELEMETRY_FILE_NAME),
         );
     }
+    // The temp directory can be shared between local users, so the fallback is
+    // namespaced per user id and guarded by `prepare_directory`, which refuses a
+    // directory it does not own or that is reached through a symlink.
     let fallback = std::env::temp_dir()
-        .join("omo")
-        .join("telemetry")
+        .join(temp_fallback_dir_name())
         .join(TELEMETRY_FILE_NAME);
     if !paths.contains(&fallback) {
         paths.push(fallback);
     }
     paths
+}
+
+#[cfg(unix)]
+fn temp_fallback_dir_name() -> String {
+    // SAFETY: `getuid` is always successful and touches no caller memory.
+    let uid = unsafe { libc::getuid() };
+    format!("omo-telemetry-{uid}")
+}
+
+#[cfg(not(unix))]
+fn temp_fallback_dir_name() -> String {
+    "omo-telemetry".to_string()
 }
 
 pub fn append_to_path(path: &Path, event: &TelemetryEvent) -> io::Result<()> {
@@ -291,19 +314,120 @@ where
     let mut options = OpenOptions::new();
     options.create(true).append(true).write(true);
     #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path)?;
+    {
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(reject_symlinked_path)?;
     #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(&serialized)?;
     file.flush()?;
+    let len = file.metadata()?.len();
+    drop(file);
+    if len > TELEMETRY_MAX_BYTES as u64 {
+        compact_to_retain_limit(path, len)?;
+    }
     Ok(())
+}
+
+/// Rewrites `path` with only its trailing `TELEMETRY_RETAIN_BYTES`, dropping the
+/// oldest events and any partial leading line. Must be called with the append
+/// lock held; the swap itself is a rename so concurrent readers never observe a
+/// truncated file.
+fn compact_to_retain_limit(path: &Path, len: u64) -> io::Result<()> {
+    let mut file = open_private_read(path)?;
+    file.seek(SeekFrom::Start(len - TELEMETRY_RETAIN_BYTES as u64))?;
+    let mut tail = Vec::with_capacity(TELEMETRY_RETAIN_BYTES);
+    file.read_to_end(&mut tail)?;
+    drop(file);
+
+    // Start at the first whole line in the window, but never past the start of
+    // the final line, so the newest event survives even a pathologically long row.
+    let first_whole_line = tail
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(tail.len(), |newline| newline + 1);
+    let last_line_start = tail[..tail.len().saturating_sub(1)]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let kept_from = first_whole_line.min(last_line_start);
+
+    let temp_path = path.with_extension("compact");
+    match fs::remove_file(&temp_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut temp = options.open(&temp_path)?;
+    temp.write_all(&tail[kept_from..])?;
+    temp.flush()?;
+    drop(temp);
+    fs::rename(&temp_path, path)
+}
+
+/// Opens a telemetry file for reading, refusing symlinks and files owned by
+/// another local user so a planted file cannot inject events.
+fn open_private_read(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(reject_symlinked_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if file.metadata()?.uid() != unsafe { libc::getuid() } {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "telemetry file is owned by another user",
+            ));
+        }
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn reject_symlinked_path(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return io::Error::new(
+            ErrorKind::PermissionDenied,
+            "refusing to use a telemetry path that is a symbolic link",
+        );
+    }
+    error
+}
+
+#[cfg(not(unix))]
+fn reject_symlinked_path(error: io::Error) -> io::Error {
+    error
 }
 
 fn prepare_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "refusing to use a telemetry directory reached through a symbolic link",
+            ));
+        }
+        if metadata.uid() != unsafe { libc::getuid() } {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "telemetry directory is owned by another user",
+            ));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
     Ok(())
 }
 
@@ -317,8 +441,11 @@ impl AppendLock {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
-        options.mode(0o600);
-        let file = options.open(&lock_path)?;
+        {
+            options.mode(0o600);
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&lock_path).map_err(reject_symlinked_path)?;
         #[cfg(unix)]
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         match file.try_lock() {
@@ -336,8 +463,11 @@ impl AppendLock {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
-        options.mode(0o600);
-        let file = options.open(&lock_path)?;
+        {
+            options.mode(0o600);
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&lock_path).map_err(reject_symlinked_path)?;
         #[cfg(unix)]
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.lock()?;
@@ -541,6 +671,90 @@ mod tests {
         let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_fallback_path_is_per_user() {
+        let paths = telemetry_candidate_paths();
+        let fallback = paths.last().unwrap();
+        let parent = fallback.parent().unwrap();
+        assert!(parent.starts_with(std::env::temp_dir()));
+        assert_eq!(
+            parent.file_name().unwrap().to_str().unwrap(),
+            format!("omo-telemetry-{}", unsafe { libc::getuid() })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_refuses_to_write_through_pre_existing_symlink() {
+        let dir = tempdir().unwrap();
+        let telemetry_dir = dir.path().join("telemetry");
+        prepare_directory(&telemetry_dir).unwrap();
+        let target = dir.path().join("victim.txt");
+        fs::write(&target, "original\n").unwrap();
+        let path = telemetry_dir.join("events.jsonl");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let error = append_to_path(&path, &event()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_directory_refuses_symlinked_directory() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("telemetry");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let error = prepare_directory(&link).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn append_enforces_size_cap_and_keeps_newest_event() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("telemetry").join("events.jsonl");
+        prepare_directory(path.parent().unwrap()).unwrap();
+
+        let oldest = serde_json::to_string(&event_at(1_000)).unwrap();
+        let filler = serde_json::to_string(&event_at(2_000)).unwrap();
+        let mut seed = String::with_capacity(TELEMETRY_MAX_BYTES + 8192);
+        seed.push_str(&oldest);
+        seed.push('\n');
+        while seed.len() < TELEMETRY_MAX_BYTES + 4096 {
+            seed.push_str(&filler);
+            seed.push('\n');
+        }
+        fs::write(&path, &seed).unwrap();
+
+        let newest = event_at(9_999);
+        append_to_path(&path, &newest).unwrap();
+
+        let size = fs::metadata(&path).unwrap().len();
+        assert!(
+            size <= TELEMETRY_MAX_BYTES as u64,
+            "telemetry file is {size} bytes, above the {TELEMETRY_MAX_BYTES} byte cap"
+        );
+
+        let content = fs::read_to_string(&path).unwrap();
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::from_str::<TelemetryEvent>(lines.last().unwrap()).unwrap(),
+            newest
+        );
+        assert!(
+            serde_json::from_str::<TelemetryEvent>(lines.first().unwrap()).is_ok(),
+            "compaction must keep whole lines"
+        );
+        assert!(
+            !content.contains(&oldest),
+            "oldest events must be discarded first"
+        );
     }
 
     #[test]

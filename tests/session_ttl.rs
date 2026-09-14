@@ -15,6 +15,7 @@ fn repeated_generations_consume_and_renew_idle_retention_lease() {
     let scope = mux
         .register_browser(&project, "same-browser-page".into())
         .unwrap();
+    let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
     let workspace = mux.resolve(&scope.scope_id).unwrap();
 
     let first = start_fresh_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();

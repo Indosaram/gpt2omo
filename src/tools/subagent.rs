@@ -118,9 +118,23 @@ pub async fn handle_query_subagent(
         Err(error) => return ToolCallResult::err(error),
     };
 
-    let call_number = match runtime().reserve_call(ws, scope_id, lifecycle.generation) {
-        Ok(call_number) => call_number,
-        Err(error) => return ToolCallResult::err(error),
+    // reserve_call takes a blocking flock and does synchronous file IO; awaiting it inline pins a
+    // Tokio worker for the whole lock hold (EXEC-4).
+    let call_number = {
+        let quota_ws = ws.clone();
+        let quota_scope = scope_id.to_string();
+        let generation = lifecycle.generation;
+        match tokio::task::spawn_blocking(move || {
+            runtime().reserve_call(&quota_ws, &quota_scope, generation)
+        })
+        .await
+        {
+            Ok(Ok(call_number)) => call_number,
+            Ok(Err(error)) => return ToolCallResult::err(error),
+            Err(error) => {
+                return ToolCallResult::err(format!("Subagent quota state is unavailable: {error}"))
+            }
+        }
     };
 
     let mut client_builder = reqwest::Client::builder().redirect(Policy::none());

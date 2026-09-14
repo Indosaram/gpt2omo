@@ -1314,8 +1314,9 @@ mod tests {
         assert_eq!(state.terminal_detail.as_deref(), Some("transport failed"));
     }
 
-    #[test]
-    fn completed_generation_refreshes_stale_result_when_inline_completion_result_is_supplied() {
+    #[tokio::test]
+    async fn completed_generation_refreshes_stale_result_when_inline_completion_result_is_supplied()
+    {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
@@ -1335,6 +1336,7 @@ mod tests {
         );
         assert_eq!(
             handle_completion_check(&ws, SCOPE_A, Some(true), Some(false), Some(false))
+                .await
                 .data
                 .unwrap()["ready"],
             true
@@ -1358,7 +1360,8 @@ mod tests {
                 blockers: vec![],
                 final_message: "Refreshed result.".into(),
             }),
-        );
+        )
+        .await;
 
         assert!(refreshed.success);
         let data = refreshed.data.unwrap();
@@ -1366,8 +1369,8 @@ mod tests {
         assert_eq!(data["task_result"]["summary"], "Refreshed result");
     }
 
-    #[test]
-    fn stale_structured_result_requires_refresh_after_task_state_update() {
+    #[tokio::test]
+    async fn stale_structured_result_requires_refresh_after_task_state_update() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         start_fresh_delegation_lifecycle(&ws, SCOPE_A).unwrap();
@@ -1390,7 +1393,8 @@ mod tests {
         state.updated_ms = state.updated_ms.max(previous.recorded_ms.saturating_add(1));
         save_task_state(&ws, SCOPE_A, &state).unwrap();
 
-        let result = handle_completion_check(&ws, SCOPE_A, Some(true), Some(false), Some(false));
+        let result =
+            handle_completion_check(&ws, SCOPE_A, Some(true), Some(false), Some(false)).await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["ready"], false);

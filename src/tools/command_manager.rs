@@ -9,14 +9,19 @@ use crate::tools::ToolCallResult;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::ffi::OsString;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Component, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 const MAX_RING_BYTES_PER_STREAM: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES_PER_STREAM: usize = 32 * 1024;
@@ -26,8 +31,18 @@ const DEFAULT_SYNC_WAIT_MS: u64 = 15_000;
 const DEFAULT_KILL_GRACE_MS: u64 = 1_500;
 const NORMAL_DESCENDANT_GRACE_MS: u64 = 100;
 const WAIT_TICK_MS: u64 = 20;
+/// Upper bound on draining the child's pipes once the process group has been signalled. A
+/// descendant that escaped the group still holds the write ends, so EOF may never arrive.
+const READER_DRAIN_BOUND_MS: u64 = 500;
+/// How often an abandoned reader rechecks whether it should stop waiting for more output.
+#[cfg(unix)]
+const READER_ABANDON_POLL_MS: i32 = 50;
+const CAPTURE_TRUNCATED_NOTE: &str =
+    "output capture truncated: descendant processes kept the command pipes open after the process \
+     group was signalled";
 const DEFAULT_MAX_ACTIVE_COMMANDS_GLOBAL: usize = 32;
 const DEFAULT_MAX_ACTIVE_COMMANDS_PER_SCOPE: usize = 8;
+const DEFAULT_MAX_CONCURRENT_TOOLS_PER_SCOPE: usize = 64;
 const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 const ALLOWED_CHILD_ENV: &[&str] = &[
@@ -57,19 +72,28 @@ pub struct CommandManager {
 
 struct CommandManagerInner {
     state: Mutex<ManagerState>,
-    changed: Condvar,
+    changed: Notify,
     sync_wait: Duration,
     kill_grace: Duration,
     allow_arbitrary: bool,
     max_active_global: usize,
     max_active_per_scope: usize,
+    tool_semaphores: StdMutex<HashMap<String, Arc<Semaphore>>>,
+    active_waiters: AtomicUsize,
+    waiters_changed: Notify,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IdempotencyEntry {
+    Reserved { command: String },
+    Active(String),
 }
 
 #[derive(Default)]
 struct ManagerState {
     commands: HashMap<String, CommandRecord>,
     order: VecDeque<String>,
-    idempotency: HashMap<IdempotencyKey, String>,
+    idempotency: HashMap<IdempotencyKey, IdempotencyEntry>,
     workspace_revisions: HashMap<String, u64>,
 }
 
@@ -78,6 +102,13 @@ struct IdempotencyKey {
     scope_id: String,
     generation: u64,
     client_request_id: String,
+}
+
+struct PendingVerification {
+    command: String,
+    success: bool,
+    exit_code: Option<i64>,
+    elapsed_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -120,8 +151,8 @@ struct CommandRecord {
     status: CommandStatus,
     exit_code: Option<i64>,
     error: Option<String>,
-    stdout: Arc<Mutex<BoundedRing>>,
-    stderr: Arc<Mutex<BoundedRing>>,
+    stdout: Arc<StdMutex<BoundedRing>>,
+    stderr: Arc<StdMutex<BoundedRing>>,
     stdout_cursor: u64,
     stderr_cursor: u64,
     cancel_requested: Arc<AtomicBool>,
@@ -202,6 +233,50 @@ impl BoundedRing {
     }
 }
 
+struct WaiterGuard<'a> {
+    inner: &'a CommandManagerInner,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.active_waiters.fetch_sub(1, Ordering::SeqCst);
+        self.inner.waiters_changed.notify_waiters();
+    }
+}
+
+struct ReservationGuard {
+    inner: Arc<CommandManagerInner>,
+    key: Option<IdempotencyKey>,
+}
+
+impl ReservationGuard {
+    fn new(inner: Arc<CommandManagerInner>, key: IdempotencyKey) -> Self {
+        Self {
+            inner,
+            key: Some(key),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.key = None;
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            let inner = Arc::clone(&self.inner);
+            tokio::spawn(async move {
+                let mut state = inner.state.lock().await;
+                if matches!(state.idempotency.get(&key), Some(IdempotencyEntry::Reserved { .. })) {
+                    state.idempotency.remove(&key);
+                    inner.changed.notify_waiters();
+                }
+            });
+        }
+    }
+}
+
 impl Default for CommandManager {
     fn default() -> Self {
         Self::new()
@@ -266,18 +341,54 @@ impl CommandManager {
         Self {
             inner: Arc::new(CommandManagerInner {
                 state: Mutex::new(ManagerState::default()),
-                changed: Condvar::new(),
+                changed: Notify::new(),
                 sync_wait,
                 kill_grace,
                 allow_arbitrary,
                 max_active_global: max_active_global.max(1),
                 max_active_per_scope: max_active_per_scope.max(1),
+                tool_semaphores: StdMutex::new(HashMap::new()),
+                active_waiters: AtomicUsize::new(0),
+                waiters_changed: Notify::new(),
             }),
         }
     }
 
-    pub fn workspace_revision(&self, scope_id: &str) -> u64 {
-        let state = lock_unpoisoned(&self.inner.state);
+    pub async fn acquire_tool_permit(&self, scope_id: &str) -> OwnedSemaphorePermit {
+        let semaphore = {
+            let mut semaphores = lock_unpoisoned(&self.inner.tool_semaphores);
+            Arc::clone(semaphores.entry(scope_id.to_string()).or_insert_with(|| {
+                Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_TOOLS_PER_SCOPE))
+            }))
+        };
+        semaphore
+            .acquire_owned()
+            .await
+            .expect("per-scope tool semaphore must remain open")
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_waiter_count_for_tests(
+        &self,
+        minimum: usize,
+        wait: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let notified = self.inner.waiters_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inner.active_waiters.load(Ordering::SeqCst) >= minimum {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    pub async fn workspace_revision(&self, scope_id: &str) -> u64 {
+        let state = self.inner.state.lock().await;
         state
             .workspace_revisions
             .get(scope_id)
@@ -285,18 +396,18 @@ impl CommandManager {
             .unwrap_or(0)
     }
 
-    pub fn note_workspace_mutation(&self, scope_id: &str) -> u64 {
-        let mut state = lock_unpoisoned(&self.inner.state);
+    pub async fn note_workspace_mutation(&self, scope_id: &str) -> u64 {
+        let mut state = self.inner.state.lock().await;
         let revision = state
             .workspace_revisions
             .entry(scope_id.to_string())
             .or_insert(0);
         *revision = revision.saturating_add(1);
-        self.inner.changed.notify_all();
+        self.inner.changed.notify_waiters();
         *revision
     }
 
-    pub fn run_command(
+    pub async fn run_command(
         &self,
         ws: &Workspace,
         scope_id: &str,
@@ -308,7 +419,7 @@ impl CommandManager {
             Ok(prepared) => prepared,
             Err(error) => return ToolCallResult::err(error),
         };
-        let generation = current_generation(ws, scope_id);
+        let generation = current_generation_async(ws, scope_id).await;
         let timeout_ms = timeout_ms.max(1);
         let client_request_id = client_request_id
             .map(str::trim)
@@ -321,35 +432,92 @@ impl CommandManager {
                 generation,
                 client_request_id: request_id.to_string(),
             };
-            let mut state = lock_unpoisoned(&self.inner.state);
-            if let Some(existing_id) = state.idempotency.get(&key).cloned() {
-                let current_revision = state
-                    .workspace_revisions
-                    .get(scope_id)
-                    .copied()
-                    .unwrap_or(0);
-                let Some(existing) = state.commands.get_mut(&existing_id) else {
-                    state.idempotency.remove(&key);
-                    drop(state);
-                    return self.spawn_and_wait(
-                        ws,
-                        scope_id,
-                        generation,
-                        command,
-                        prepared,
-                        timeout_ms,
-                        client_request_id,
-                    );
-                };
-                if existing.command != command {
-                    return ToolCallResult::err(format!(
-                        "client_request_id '{}' is already bound to a different command in this scope generation",
-                        request_id
-                    ));
+
+            let mut reservation_guard = loop {
+                let notified = self.inner.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                enum StepAction {
+                    Wait,
+                    Retry,
+                    Attach(String),
+                    Reserved,
                 }
-                let value = command_snapshot(existing, generation, current_revision, false, true);
-                return ToolCallResult::ok(value);
-            }
+
+                let step = {
+                    let mut state = self.inner.state.lock().await;
+                    match state.idempotency.get(&key) {
+                        Some(IdempotencyEntry::Reserved {
+                            command: existing_command,
+                        }) => {
+                            if existing_command != command {
+                                return ToolCallResult::err(format!(
+                                    "client_request_id '{}' is already bound to a different command in this scope generation",
+                                    request_id
+                                ));
+                            }
+                            StepAction::Wait
+                        }
+                        Some(IdempotencyEntry::Active(existing_id)) => {
+                            let existing_id = existing_id.clone();
+                            match state.commands.get_mut(&existing_id) {
+                                None => {
+                                    state.idempotency.remove(&key);
+                                    StepAction::Retry
+                                }
+                                Some(existing) => {
+                                    if existing.command != command {
+                                        return ToolCallResult::err(format!(
+                                            "client_request_id '{}' is already bound to a different command in this scope generation",
+                                            request_id
+                                        ));
+                                    }
+                                    StepAction::Attach(existing_id)
+                                }
+                            }
+                        }
+                        None => {
+                            state.idempotency.insert(
+                                key.clone(),
+                                IdempotencyEntry::Reserved {
+                                    command: command.to_string(),
+                                },
+                            );
+                            StepAction::Reserved
+                        }
+                    }
+                };
+
+                match step {
+                    StepAction::Wait => {
+                        let _ = tokio::time::timeout(self.inner.sync_wait, notified).await;
+                    }
+                    StepAction::Retry => {}
+                    StepAction::Attach(existing_id) => {
+                        return self
+                            .attach_and_wait(ws, scope_id, generation, &existing_id)
+                            .await;
+                    }
+                    StepAction::Reserved => {
+                        break ReservationGuard::new(Arc::clone(&self.inner), key);
+                    }
+                }
+            };
+
+            let result = self
+                .spawn_and_wait(
+                    ws,
+                    scope_id,
+                    generation,
+                    command,
+                    prepared,
+                    timeout_ms,
+                    client_request_id,
+                )
+                .await;
+            reservation_guard.disarm();
+            return result;
         }
 
         self.spawn_and_wait(
@@ -361,10 +529,11 @@ impl CommandManager {
             timeout_ms,
             client_request_id,
         )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn spawn_and_wait(
+    async fn spawn_and_wait(
         &self,
         ws: &Workspace,
         scope_id: &str,
@@ -375,20 +544,29 @@ impl CommandManager {
         client_request_id: Option<String>,
     ) -> ToolCallResult {
         let command_id = uuid::Uuid::new_v4().to_string();
-        let stdout = Arc::new(Mutex::new(BoundedRing::default()));
-        let stderr = Arc::new(Mutex::new(BoundedRing::default()));
+        let stdout = Arc::new(StdMutex::new(BoundedRing::default()));
+        let stderr = Arc::new(StdMutex::new(BoundedRing::default()));
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let root = ws.root().to_path_buf();
         let revision;
 
         {
-            let mut state = lock_unpoisoned(&self.inner.state);
+            let mut state = self.inner.state.lock().await;
             let global_active = state
                 .commands
                 .values()
                 .filter(|record| record.status == CommandStatus::Running)
                 .count();
             if global_active >= self.inner.max_active_global {
+                if let Some(ref request_id) = client_request_id {
+                    let key = IdempotencyKey {
+                        scope_id: scope_id.to_string(),
+                        generation,
+                        client_request_id: request_id.clone(),
+                    };
+                    state.idempotency.remove(&key);
+                    self.inner.changed.notify_waiters();
+                }
                 return ToolCallResult::err(format!(
                     "command admission limit reached: {} active daemon commands globally (limit {})",
                     global_active, self.inner.max_active_global
@@ -402,6 +580,15 @@ impl CommandManager {
                 })
                 .count();
             if scope_active >= self.inner.max_active_per_scope {
+                if let Some(ref request_id) = client_request_id {
+                    let key = IdempotencyKey {
+                        scope_id: scope_id.to_string(),
+                        generation,
+                        client_request_id: request_id.clone(),
+                    };
+                    state.idempotency.remove(&key);
+                    self.inner.changed.notify_waiters();
+                }
                 return ToolCallResult::err(format!(
                     "command admission limit reached for scope {}: {} active commands (limit {})",
                     scope_id, scope_active, self.inner.max_active_per_scope
@@ -445,8 +632,9 @@ impl CommandManager {
                         generation,
                         client_request_id: request_id,
                     },
-                    command_id.clone(),
+                    IdempotencyEntry::Active(command_id.clone()),
                 );
+                self.inner.changed.notify_waiters();
             }
         }
 
@@ -464,9 +652,11 @@ impl CommandManager {
             );
         });
 
-        let finished = self.wait_for_terminal(&command_id, self.inner.sync_wait);
-        self.reconcile_scope(ws, scope_id);
-        let mut state = lock_unpoisoned(&self.inner.state);
+        let finished = self
+            .wait_for_terminal(&command_id, self.inner.sync_wait)
+            .await;
+        self.reconcile_scope(ws, scope_id).await;
+        let mut state = self.inner.state.lock().await;
         let current_revision = state
             .workspace_revisions
             .get(scope_id)
@@ -482,6 +672,33 @@ impl CommandManager {
         ToolCallResult::ok(value)
     }
 
+    async fn attach_and_wait(
+        &self,
+        ws: &Workspace,
+        scope_id: &str,
+        generation: u64,
+        command_id: &str,
+    ) -> ToolCallResult {
+        let finished = self
+            .wait_for_terminal(command_id, self.inner.sync_wait)
+            .await;
+        self.reconcile_scope(ws, scope_id).await;
+        let mut state = self.inner.state.lock().await;
+        let current_revision = state
+            .workspace_revisions
+            .get(scope_id)
+            .copied()
+            .unwrap_or(0);
+        let Some(record) = state.commands.get_mut(command_id) else {
+            return ToolCallResult::err("Command disappeared from daemon command manager");
+        };
+        let mut value = command_snapshot(record, generation, current_revision, false, true);
+        if !finished && record.status == CommandStatus::Running {
+            value["status"] = Value::String("detached_running".to_string());
+        }
+        ToolCallResult::ok(value)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_worker(
         &self,
@@ -489,8 +706,8 @@ impl CommandManager {
         root: PathBuf,
         prepared: PreparedCommand,
         timeout_ms: u64,
-        stdout_buffer: Arc<Mutex<BoundedRing>>,
-        stderr_buffer: Arc<Mutex<BoundedRing>>,
+        stdout_buffer: Arc<StdMutex<BoundedRing>>,
+        stderr_buffer: Arc<StdMutex<BoundedRing>>,
         cancel_requested: Arc<AtomicBool>,
     ) {
         let mut command = Command::new(&prepared.binary);
@@ -519,14 +736,26 @@ impl CommandManager {
 
         let process_group_id = child.id() as i32;
         {
-            let mut state = lock_unpoisoned(&self.inner.state);
+            let mut state = self.inner.state.blocking_lock();
             if let Some(record) = state.commands.get_mut(&command_id) {
                 record.process_group_id = Some(process_group_id);
             }
         }
 
-        let stdout_reader = spawn_reader(child.stdout.take(), stdout_buffer);
-        let stderr_reader = spawn_reader(child.stderr.take(), stderr_buffer);
+        let readers_abandoned = Arc::new(AtomicBool::new(false));
+        let (readers_done_tx, readers_done) = mpsc::channel::<Infallible>();
+        spawn_reader(
+            child.stdout.take(),
+            stdout_buffer,
+            Arc::clone(&readers_abandoned),
+            readers_done_tx.clone(),
+        );
+        spawn_reader(
+            child.stderr.take(),
+            stderr_buffer,
+            Arc::clone(&readers_abandoned),
+            readers_done_tx,
+        );
         let started = Instant::now();
 
         let (final_status, exit_status, error) = loop {
@@ -558,8 +787,19 @@ impl CommandManager {
             }
         };
 
-        let _ = stdout_reader.join();
-        let _ = stderr_reader.join();
+        let error = if wait_for_readers(&readers_done, Duration::from_millis(READER_DRAIN_BOUND_MS))
+        {
+            error
+        } else {
+            // The readers cannot reach EOF while an escaped descendant holds the pipes. Release
+            // them so the command still reaches a terminal state and frees its admission slot,
+            // keeping whatever output was captured before the bound elapsed.
+            readers_abandoned.store(true, Ordering::SeqCst);
+            Some(match error {
+                Some(existing) => format!("{existing}; {CAPTURE_TRUNCATED_NOTE}"),
+                None => CAPTURE_TRUNCATED_NOTE.to_string(),
+            })
+        };
         let exit_code = exit_status
             .as_ref()
             .and_then(|status| status.code())
@@ -581,7 +821,7 @@ impl CommandManager {
         error: Option<String>,
         process_group_id: Option<i32>,
     ) {
-        let mut state = lock_unpoisoned(&self.inner.state);
+        let mut state = self.inner.state.blocking_lock();
         if let Some(record) = state.commands.get_mut(command_id) {
             record.status = status;
             record.exit_code = exit_code;
@@ -591,47 +831,53 @@ impl CommandManager {
                 record.process_group_id = process_group_id;
             }
         }
-        self.inner.changed.notify_all();
+        self.inner.changed.notify_waiters();
     }
 
-    fn wait_for_terminal(&self, command_id: &str, wait: Duration) -> bool {
-        let deadline = Instant::now() + wait;
-        let mut state = lock_unpoisoned(&self.inner.state);
+    async fn wait_for_terminal(&self, command_id: &str, wait: Duration) -> bool {
+        self.inner.active_waiters.fetch_add(1, Ordering::SeqCst);
+        self.inner.waiters_changed.notify_waiters();
+        let _waiter_guard = WaiterGuard { inner: &self.inner };
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
-            let terminal = state
-                .commands
-                .get(command_id)
-                .is_none_or(|record| record.status.is_terminal());
-            if terminal {
-                return true;
+            let notified = self.inner.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.inner.state.lock().await;
+                let terminal = state
+                    .commands
+                    .get(command_id)
+                    .is_none_or(|record| record.status.is_terminal());
+                if terminal {
+                    return true;
+                }
             }
-            let now = Instant::now();
-            if now >= deadline {
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return false;
             }
-            let remaining = deadline.saturating_duration_since(now);
-            let (guard, _) = wait_timeout_unpoisoned(&self.inner.changed, state, remaining);
-            state = guard;
         }
     }
 
-    pub fn poll_command(
+    pub async fn poll_command(
         &self,
         ws: &Workspace,
         scope_id: &str,
         command_id: &str,
         wait_timeout_ms: Option<u64>,
     ) -> ToolCallResult {
-        if !self.command_belongs_to_scope(scope_id, command_id) {
+        if !self.command_belongs_to_scope(scope_id, command_id).await {
             return ToolCallResult::err("Unknown command_id for this scope");
         }
         let wait_ms = wait_timeout_ms.unwrap_or(0).min(MAX_POLL_WAIT_MS);
         if wait_ms > 0 {
-            let _ = self.wait_for_terminal(command_id, Duration::from_millis(wait_ms));
+            let _ = self
+                .wait_for_terminal(command_id, Duration::from_millis(wait_ms))
+                .await;
         }
-        self.reconcile_scope(ws, scope_id);
-        let generation = current_generation(ws, scope_id);
-        let mut state = lock_unpoisoned(&self.inner.state);
+        self.reconcile_scope(ws, scope_id).await;
+        let generation = current_generation_async(ws, scope_id).await;
+        let mut state = self.inner.state.lock().await;
         let current_revision = state
             .workspace_revisions
             .get(scope_id)
@@ -649,10 +895,10 @@ impl CommandManager {
         ))
     }
 
-    pub fn list_commands(&self, ws: &Workspace, scope_id: &str) -> ToolCallResult {
-        self.reconcile_scope(ws, scope_id);
-        let generation = current_generation(ws, scope_id);
-        let state = lock_unpoisoned(&self.inner.state);
+    pub async fn list_commands(&self, ws: &Workspace, scope_id: &str) -> ToolCallResult {
+        self.reconcile_scope(ws, scope_id).await;
+        let generation = current_generation_async(ws, scope_id).await;
+        let state = self.inner.state.lock().await;
         let current_revision = state
             .workspace_revisions
             .get(scope_id)
@@ -682,14 +928,14 @@ impl CommandManager {
         }))
     }
 
-    pub fn cancel_command(
+    pub async fn cancel_command(
         &self,
         ws: &Workspace,
         scope_id: &str,
         command_id: &str,
     ) -> ToolCallResult {
         {
-            let state = lock_unpoisoned(&self.inner.state);
+            let state = self.inner.state.lock().await;
             let Some(record) = state.commands.get(command_id) else {
                 return ToolCallResult::err("Unknown command_id for this scope");
             };
@@ -698,12 +944,12 @@ impl CommandManager {
             }
             record.cancel_requested.store(true, Ordering::SeqCst);
         }
-        self.inner.changed.notify_all();
+        self.inner.changed.notify_waiters();
         let wait = self.inner.kill_grace + Duration::from_millis(500);
-        let _ = self.wait_for_terminal(command_id, wait);
-        self.reconcile_scope(ws, scope_id);
-        let generation = current_generation(ws, scope_id);
-        let mut state = lock_unpoisoned(&self.inner.state);
+        let _ = self.wait_for_terminal(command_id, wait).await;
+        self.reconcile_scope(ws, scope_id).await;
+        let generation = current_generation_async(ws, scope_id).await;
+        let mut state = self.inner.state.lock().await;
         let current_revision = state
             .workspace_revisions
             .get(scope_id)
@@ -721,46 +967,77 @@ impl CommandManager {
         ))
     }
 
-    pub fn reconcile_scope(&self, ws: &Workspace, scope_id: &str) {
-        let generation = current_generation(ws, scope_id);
-        let mut state = lock_unpoisoned(&self.inner.state);
-        let current_revision = state
-            .workspace_revisions
-            .get(scope_id)
-            .copied()
-            .unwrap_or(0);
-        let ids = state.order.iter().cloned().collect::<Vec<_>>();
-        for command_id in ids {
-            let Some(record) = state.commands.get_mut(&command_id) else {
-                continue;
-            };
-            if record.scope_id != scope_id
-                || !record.status.is_terminal()
-                || record.verification_recorded
-                || !is_verification_command(&record.command)
-            {
-                continue;
+    pub async fn reconcile_scope(&self, ws: &Workspace, scope_id: &str) {
+        let generation = current_generation_async(ws, scope_id).await;
+
+        // Crash-window tradeoff: `record.verification_recorded = true` is marked under the
+        // in-memory lock before persisting to disk so concurrent reconciliation calls never produce
+        // duplicate verification records. In the event of an ungraceful process crash between marking
+        // the in-memory flag and completing disk persistence, the command remains marked-but-unpersisted
+        // rather than duplicated on recovery, preserving exactly-once semantics.
+        let pending: Vec<PendingVerification> = {
+            let mut state = self.inner.state.lock().await;
+            let current_revision = state
+                .workspace_revisions
+                .get(scope_id)
+                .copied()
+                .unwrap_or(0);
+            let ids = state.order.iter().cloned().collect::<Vec<_>>();
+            let mut collected = Vec::new();
+            for command_id in ids {
+                let Some(record) = state.commands.get_mut(&command_id) else {
+                    continue;
+                };
+                if record.scope_id != scope_id
+                    || !record.status.is_terminal()
+                    || record.verification_recorded
+                    || !is_verification_command(&record.command)
+                {
+                    continue;
+                }
+                if record.generation != generation || record.workspace_revision != current_revision {
+                    continue;
+                }
+                let success = command_success(record);
+                let elapsed_ms = record.started_at.elapsed().as_millis() as u64;
+                record.verification_recorded = true;
+                collected.push(PendingVerification {
+                    command: record.command.clone(),
+                    success,
+                    exit_code: record.exit_code,
+                    elapsed_ms,
+                });
             }
-            if record.generation != generation || record.workspace_revision != current_revision {
-                continue;
-            }
-            let success = command_success(record);
-            record_verification(
-                ws,
-                scope_id,
-                &record.command,
-                success,
-                record.exit_code,
-                record.started_at.elapsed().as_millis() as u64,
-            );
-            record.verification_recorded = true;
+            collected
+        };
+
+        if !pending.is_empty() {
+            let ws_clone = ws.clone();
+            let scope_id_owned = scope_id.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                for item in pending {
+                    record_verification(
+                        &ws_clone,
+                        &scope_id_owned,
+                        &item.command,
+                        item.success,
+                        item.exit_code,
+                        item.elapsed_ms,
+                    );
+                }
+            })
+            .await;
         }
     }
 
-    pub fn latest_verification_evidence(&self, ws: &Workspace, scope_id: &str) -> Option<Value> {
-        self.reconcile_scope(ws, scope_id);
-        let generation = current_generation(ws, scope_id);
-        let state = lock_unpoisoned(&self.inner.state);
+    pub async fn latest_verification_evidence(
+        &self,
+        ws: &Workspace,
+        scope_id: &str,
+    ) -> Option<Value> {
+        self.reconcile_scope(ws, scope_id).await;
+        let generation = current_generation_async(ws, scope_id).await;
+        let state = self.inner.state.lock().await;
         let current_revision = state
             .workspace_revisions
             .get(scope_id)
@@ -791,12 +1068,53 @@ impl CommandManager {
             })
     }
 
-    fn command_belongs_to_scope(&self, scope_id: &str, command_id: &str) -> bool {
-        let state = lock_unpoisoned(&self.inner.state);
+    async fn command_belongs_to_scope(&self, scope_id: &str, command_id: &str) -> bool {
+        let state = self.inner.state.lock().await;
         state
             .commands
             .get(command_id)
             .is_some_and(|record| record.scope_id == scope_id)
+    }
+
+    #[cfg(test)]
+    pub async fn seed_pending_verification_for_test(
+        &self,
+        scope_id: &str,
+        generation: u64,
+        command: &str,
+        exit_code: Option<i64>,
+    ) {
+        let mut state = self.inner.state.lock().await;
+        let current_revision = state
+            .workspace_revisions
+            .get(scope_id)
+            .copied()
+            .unwrap_or(0);
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let record = CommandRecord {
+            command_id: command_id.clone(),
+            scope_id: scope_id.to_string(),
+            generation,
+            command: command.to_string(),
+            workspace_revision: current_revision,
+            client_request_id: None,
+            started_at: Instant::now(),
+            started_ms: now_ms(),
+            finished_ms: Some(now_ms()),
+            timeout_ms: 1000,
+            status: CommandStatus::Completed,
+            exit_code,
+            error: None,
+            stdout: Arc::new(StdMutex::new(BoundedRing::default())),
+            stderr: Arc::new(StdMutex::new(BoundedRing::default())),
+            stdout_cursor: 0,
+            stderr_cursor: 0,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            process_group_id: None,
+            verification_recorded: false,
+        };
+        state.order.push_back(command_id.clone());
+        state.commands.insert(command_id, record);
     }
 }
 
@@ -931,6 +1249,14 @@ fn current_generation(ws: &Workspace, scope_id: &str) -> u64 {
         .unwrap_or(1)
 }
 
+async fn current_generation_async(ws: &Workspace, scope_id: &str) -> u64 {
+    let ws_clone = ws.clone();
+    let scope_id_owned = scope_id.to_string();
+    tokio::task::spawn_blocking(move || current_generation(&ws_clone, &scope_id_owned))
+        .await
+        .unwrap_or(1)
+}
+
 fn prune_recent(state: &mut ManagerState) {
     while state.commands.len() >= MAX_RECENT_COMMANDS {
         let removable = state.order.iter().find_map(|command_id| {
@@ -945,15 +1271,75 @@ fn prune_recent(state: &mut ManagerState) {
         };
         state.order.retain(|candidate| candidate != &command_id);
         state.commands.remove(&command_id);
-        state.idempotency.retain(|_, value| value != &command_id);
+        state.idempotency.retain(|_, value| match value {
+            IdempotencyEntry::Active(id) => id != &command_id,
+            IdempotencyEntry::Reserved { .. } => true,
+        });
     }
 }
 
+/// Returns `true` once every reader thread has finished, `false` if `bound` elapsed first.
+/// Readers signal completion by dropping their `Sender`, so the normal EOF case returns as soon
+/// as the last reader exits rather than waiting out the bound.
+fn wait_for_readers(readers_done: &mpsc::Receiver<Infallible>, bound: Duration) -> bool {
+    match readers_done.recv_timeout(bound) {
+        Ok(never) => match never {},
+        Err(RecvTimeoutError::Disconnected) => true,
+        Err(RecvTimeoutError::Timeout) => false,
+    }
+}
+
+#[cfg(unix)]
+fn spawn_reader<R: Read + Send + AsRawFd + 'static>(
+    pipe: Option<R>,
+    buffer: Arc<StdMutex<BoundedRing>>,
+    abandoned: Arc<AtomicBool>,
+    reader_done: mpsc::Sender<Infallible>,
+) {
+    thread::spawn(move || {
+        // Dropped when this thread returns, which is how the worker observes reader completion.
+        let _reader_done = reader_done;
+        let Some(mut pipe) = pipe else {
+            return;
+        };
+        let fd = pipe.as_raw_fd();
+        let mut chunk = [0u8; 8192];
+        loop {
+            if abandoned.load(Ordering::SeqCst) {
+                return;
+            }
+            if !pipe_readable(fd, READER_ABANDON_POLL_MS) {
+                continue;
+            }
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => lock_unpoisoned(&buffer).push(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+fn pipe_readable(fd: RawFd, timeout_ms: i32) -> bool {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) > 0 }
+}
+
+#[cfg(not(unix))]
 fn spawn_reader<R: Read + Send + 'static>(
     pipe: Option<R>,
-    buffer: Arc<Mutex<BoundedRing>>,
-) -> thread::JoinHandle<()> {
+    buffer: Arc<StdMutex<BoundedRing>>,
+    _abandoned: Arc<AtomicBool>,
+    reader_done: mpsc::Sender<Infallible>,
+) {
     thread::spawn(move || {
+        let _reader_done = reader_done;
         let Some(mut pipe) = pipe else {
             return;
         };
@@ -965,7 +1351,7 @@ fn spawn_reader<R: Read + Send + 'static>(
                 Err(_) => break,
             }
         }
-    })
+    });
 }
 
 fn sanitize_child_environment(command: &mut Command) {
@@ -1095,19 +1481,9 @@ fn lossy_bounded(bytes: &[u8], max_bytes: usize) -> String {
     value[..end].to_string()
 }
 
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+fn lock_unpoisoned<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn wait_timeout_unpoisoned<'a, T>(
-    condvar: &Condvar,
-    guard: MutexGuard<'a, T>,
-    duration: Duration,
-) -> (MutexGuard<'a, T>, std::sync::WaitTimeoutResult) {
-    condvar
-        .wait_timeout(guard, duration)
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -1234,12 +1610,14 @@ mod tests {
         assert!(std::env::split_paths(path).all(|entry| entry.is_absolute()));
     }
 
-    #[test]
-    fn quick_command_completes_synchronously() {
+    #[tokio::test]
+    async fn quick_command_completes_synchronously() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         let manager = test_manager();
-        let result = manager.run_command(&ws, SCOPE, "git --version", 2_000, None);
+        let result = manager
+            .run_command(&ws, SCOPE, "git --version", 2_000, None)
+            .await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["status"], "completed");
@@ -1247,8 +1625,8 @@ mod tests {
         assert!(data["command_id"].as_str().is_some());
     }
 
-    #[test]
-    fn slow_command_auto_detaches_and_long_poll_finishes() {
+    #[tokio::test]
+    async fn slow_command_auto_detaches_and_long_poll_finishes() {
         let dir = tempdir().unwrap();
         let gate = dir.path().join("gate");
         assert!(Command::new("mkfifo")
@@ -1263,7 +1641,9 @@ mod tests {
         .unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         let manager = test_manager();
-        let result = manager.run_command(&ws, SCOPE, "make test", 2_000, None);
+        let result = manager
+            .run_command(&ws, SCOPE, "make test", 2_000, None)
+            .await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["status"], "detached_running");
@@ -1274,7 +1654,9 @@ mod tests {
             let mut gate = fs::OpenOptions::new().write(true).open(gate).unwrap();
             gate.write_all(b"release\n").unwrap();
         });
-        let polled = manager.poll_command(&ws, SCOPE, command_id, Some(2_000));
+        let polled = manager
+            .poll_command(&ws, SCOPE, command_id, Some(2_000))
+            .await;
         gate_writer.join().unwrap();
         assert!(polled.success);
         let data = polled.data.unwrap();
@@ -1282,8 +1664,8 @@ mod tests {
         assert_eq!(data["command_success"], true);
     }
 
-    #[test]
-    fn active_command_limits_reject_scope_and_global_overload() {
+    #[tokio::test]
+    async fn active_command_limits_reject_scope_and_global_overload() {
         let first_scope = uuid::Uuid::new_v4().to_string();
         let second_scope = uuid::Uuid::new_v4().to_string();
         let dir = tempdir().unwrap();
@@ -1296,14 +1678,18 @@ mod tests {
             1,
         );
 
-        let first = manager.run_command(&ws, &first_scope, "make test", 5_000, None);
+        let first = manager
+            .run_command(&ws, &first_scope, "make test", 5_000, None)
+            .await;
         assert!(first.success);
         let first_id = first.data.unwrap()["command_id"]
             .as_str()
             .unwrap()
             .to_string();
 
-        let same_scope = manager.run_command(&ws, &first_scope, "make test", 5_000, None);
+        let same_scope = manager
+            .run_command(&ws, &first_scope, "make test", 5_000, None)
+            .await;
         assert!(!same_scope.success);
         assert!(same_scope
             .error
@@ -1311,7 +1697,9 @@ mod tests {
             .unwrap()
             .contains("admission limit reached for scope"));
 
-        let second = manager.run_command(&ws, &second_scope, "make test", 5_000, None);
+        let second = manager
+            .run_command(&ws, &second_scope, "make test", 5_000, None)
+            .await;
         assert!(second.success);
         let second_id = second.data.unwrap()["command_id"]
             .as_str()
@@ -1319,7 +1707,9 @@ mod tests {
             .to_string();
 
         let third_scope = uuid::Uuid::new_v4().to_string();
-        let global = manager.run_command(&ws, &third_scope, "make test", 5_000, None);
+        let global = manager
+            .run_command(&ws, &third_scope, "make test", 5_000, None)
+            .await;
         assert!(!global.success);
         assert!(global
             .error
@@ -1327,19 +1717,21 @@ mod tests {
             .unwrap()
             .contains("active daemon commands globally"));
 
-        let _ = manager.cancel_command(&ws, &first_scope, &first_id);
-        let _ = manager.cancel_command(&ws, &second_scope, &second_id);
+        let _ = manager.cancel_command(&ws, &first_scope, &first_id).await;
+        let _ = manager.cancel_command(&ws, &second_scope, &second_id).await;
     }
 
-    #[test]
-    fn mutation_marks_inflight_verification_stale_revision() {
+    #[tokio::test]
+    async fn mutation_marks_inflight_verification_stale_revision() {
         let scope_id = uuid::Uuid::new_v4().to_string();
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("Makefile"), "test:\n\t@sleep 0.50\n").unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         let manager = test_manager();
         assert!(handle_task_plan(&ws, &scope_id, "verify", vec!["run".into()]).success);
-        let result = manager.run_command(&ws, &scope_id, "make test", 2_000, None);
+        let result = manager
+            .run_command(&ws, &scope_id, "make test", 2_000, None)
+            .await;
         if !result.success {
             panic!("run_command failed: {:?}", result.error);
         }
@@ -1348,8 +1740,10 @@ mod tests {
             .unwrap()
             .to_string();
         record_mutation(&ws, &scope_id, "src/lib.rs");
-        assert_eq!(manager.note_workspace_mutation(&scope_id), 1);
-        let polled = manager.poll_command(&ws, &scope_id, &command_id, Some(2_000));
+        assert_eq!(manager.note_workspace_mutation(&scope_id).await, 1);
+        let polled = manager
+            .poll_command(&ws, &scope_id, &command_id, Some(2_000))
+            .await;
         let data = polled.data.unwrap();
         assert_eq!(data["status"], "completed");
         assert_eq!(data["evidence_status"], "stale_revision");
@@ -1360,25 +1754,152 @@ mod tests {
             .is_empty());
     }
 
-    #[test]
-    fn duplicate_client_request_id_reuses_command_id() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_client_request_id_barrier_launches_exactly_once() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Makefile"), "test:\n\t@sleep 0.30\n").unwrap();
+        let ws = Arc::new(Workspace::open(dir.path()).unwrap());
+        let manager = test_manager();
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let b = Arc::clone(&barrier);
+            let m = manager.clone();
+            let w = Arc::clone(&ws);
+            handles.push(tokio::spawn(async move {
+                b.wait().await;
+                m.run_command(&w, SCOPE, "make test", 2_000, Some("barrier-shared-req"))
+                    .await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            let res = handle.await.expect("task join succeeded");
+            assert!(res.success, "run_command failed: {:?}", res.error);
+            results.push(res);
+        }
+
+        let command_ids: Vec<String> = results
+            .iter()
+            .map(|r| {
+                r.data
+                    .as_ref()
+                    .unwrap()["command_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+
+        let unique_ids: std::collections::HashSet<_> = command_ids.iter().cloned().collect();
+        assert_eq!(
+            unique_ids.len(),
+            1,
+            "expected exactly 1 distinct command launched across 8 concurrent tasks, got {}: {:?}",
+            unique_ids.len(),
+            command_ids
+        );
+
+        let listed = manager.list_commands(&ws, SCOPE).await;
+        let listed_commands = listed.data.unwrap()["commands"].as_array().unwrap().clone();
+        assert_eq!(
+            listed_commands.len(),
+            1,
+            "expected exactly 1 command launched in manager, found {}",
+            listed_commands.len()
+        );
+
+        let shared_id = unique_ids.into_iter().next().unwrap();
+        assert_eq!(
+            listed_commands[0]["command_id"].as_str().unwrap(),
+            shared_id
+        );
+
+        let _ = manager.cancel_command(&ws, SCOPE, &shared_id).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_client_request_id_mismatched_command_rejected() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Makefile"),
+            "test:\n\t@sleep 0.30\ntest2:\n\t@sleep 0.30\n",
+        )
+        .unwrap();
+        let ws = Arc::new(Workspace::open(dir.path()).unwrap());
+        let manager = test_manager();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let b1 = Arc::clone(&barrier);
+        let m1 = manager.clone();
+        let w1 = Arc::clone(&ws);
+        let h1 = tokio::spawn(async move {
+            b1.wait().await;
+            m1.run_command(&w1, SCOPE, "make test", 2_000, Some("mismatch-req"))
+                .await
+        });
+
+        let b2 = Arc::clone(&barrier);
+        let m2 = manager.clone();
+        let w2 = Arc::clone(&ws);
+        let h2 = tokio::spawn(async move {
+            b2.wait().await;
+            m2.run_command(&w2, SCOPE, "make test2", 2_000, Some("mismatch-req"))
+                .await
+        });
+
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+
+        assert!(
+            r1.success ^ r2.success,
+            "one must succeed and one must fail: r1={:?}, r2={:?}",
+            r1,
+            r2
+        );
+        let err = if !r1.success {
+            r1.error.unwrap()
+        } else {
+            r2.error.unwrap()
+        };
+        assert!(
+            err.contains("already bound to a different command"),
+            "unexpected error message: {}",
+            err
+        );
+
+        let success_id = if r1.success {
+            r1.data.unwrap()["command_id"].as_str().unwrap().to_string()
+        } else {
+            r2.data.unwrap()["command_id"].as_str().unwrap().to_string()
+        };
+        let _ = manager.cancel_command(&ws, SCOPE, &success_id).await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_client_request_id_reuses_command_id() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("Makefile"), "test:\n\t@sleep 0.30\n").unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         let manager = test_manager();
-        let first = manager.run_command(&ws, SCOPE, "make test", 2_000, Some("retry-1"));
+        let first = manager
+            .run_command(&ws, SCOPE, "make test", 2_000, Some("retry-1"))
+            .await;
         let first_data = first.data.unwrap();
         let first_id = first_data["command_id"].as_str().unwrap().to_string();
-        let second = manager.run_command(&ws, SCOPE, "make test", 2_000, Some("retry-1"));
+        let second = manager
+            .run_command(&ws, SCOPE, "make test", 2_000, Some("retry-1"))
+            .await;
         let second_data = second.data.unwrap();
         assert_eq!(second_data["command_id"], first_id);
         assert_eq!(second_data["idempotent_replay"], true);
-        let _ = manager.cancel_command(&ws, SCOPE, &first_id);
+        let _ = manager.cancel_command(&ws, SCOPE, &first_id).await;
     }
 
     #[cfg(unix)]
-    #[test]
-    fn timeout_kills_descendant_process_group() {
+    #[tokio::test]
+    async fn timeout_kills_descendant_process_group() {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("Makefile"),
@@ -1387,12 +1908,16 @@ mod tests {
         .unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         let manager = test_manager();
-        let started = manager.run_command(&ws, SCOPE, "make test", 180, None);
+        let started = manager
+            .run_command(&ws, SCOPE, "make test", 180, None)
+            .await;
         let command_id = started.data.unwrap()["command_id"]
             .as_str()
             .unwrap()
             .to_string();
-        let polled = manager.poll_command(&ws, SCOPE, &command_id, Some(2_000));
+        let polled = manager
+            .poll_command(&ws, SCOPE, &command_id, Some(2_000))
+            .await;
         assert!(polled.success);
         let data = polled.data.unwrap();
         assert_eq!(data["status"], "timed_out");
@@ -1402,25 +1927,93 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn cancellation_kills_descendant_process_group() {
+    fn reap_escaped_grandchild(root: &std::path::Path) {
+        let Ok(raw) = fs::read_to_string(root.join("grandchild.pid")) else {
+            return;
+        };
+        if let Ok(pid) = raw.trim().parse::<i32>() {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// A descendant that leaves the killed process group keeps the child's stdout/stderr write
+    /// ends open, so the pipe readers never observe EOF. The command must still reach a terminal
+    /// state and release its admission slot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escaped_descendant_does_not_pin_command_slot() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Makefile"),
-            "test:\n\t@sh -c '(sleep 0.5; echo survived > survived.txt) & wait'\n",
+            dir.path().join("escape.pl"),
+            "use POSIX qw(setsid);\n\
+             my $pid = fork();\n\
+             die \"fork failed\" unless defined $pid;\n\
+             if ($pid == 0) {\n\
+                 setsid();\n\
+                 open(my $fh, '>', 'grandchild.pid') or exit 1;\n\
+                 print $fh \"$$\";\n\
+                 close $fh;\n\
+                 sleep 10;\n\
+                 exit 0;\n\
+             }\n\
+             sleep 10;\n",
         )
         .unwrap();
+        fs::write(dir.path().join("Makefile"), "test:\n\t@perl escape.pl\n").unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         let manager = test_manager();
-        let started = manager.run_command(&ws, SCOPE, "make test", 5_000, None);
+        let started = manager
+            .run_command(&ws, SCOPE, "make test", 200, None)
+            .await;
+        assert!(started.success, "run_command failed: {:?}", started.error);
         let command_id = started.data.unwrap()["command_id"]
             .as_str()
             .unwrap()
             .to_string();
-        let cancelled = manager.cancel_command(&ws, SCOPE, &command_id);
+
+        let polled = manager
+            .poll_command(&ws, SCOPE, &command_id, Some(3_000))
+            .await;
+        assert!(polled.success);
+        let data = polled.data.unwrap();
+        reap_escaped_grandchild(dir.path());
+
+        assert_eq!(
+            data["status"], "timed_out",
+            "command with an escaped descendant never reached a terminal state; it still occupies \
+             its admission slot (snapshot: {data})"
+        );
+        let error = data["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("output capture truncated"),
+            "terminal record must report that capture was cut short, got {error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_kills_descendant_process_group() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Makefile"),
+            "test:\n\t@sh -c '(sleep 1.0; echo survived > survived.txt) & wait'\n",
+        )
+        .unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+        let manager = test_manager();
+        let started = manager
+            .run_command(&ws, SCOPE, "make test", 5_000, None)
+            .await;
+        let command_id = started.data.unwrap()["command_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cancelled = manager.cancel_command(&ws, SCOPE, &command_id).await;
         assert!(cancelled.success);
         assert_eq!(cancelled.data.unwrap()["status"], "cancelled");
-        thread::sleep(Duration::from_millis(550));
+        thread::sleep(Duration::from_millis(1_050));
         assert!(!dir.path().join("survived.txt").exists());
     }
 }

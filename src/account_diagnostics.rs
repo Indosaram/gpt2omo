@@ -300,12 +300,12 @@ fn build_account_diagnostic(
         .max_dispatches
         .saturating_sub(dispatches_in_window);
     let cooldown_remaining_seconds =
-        cooldown.map(|until| (until.saturating_sub(now_ms) + 999) / 1000);
+        cooldown.map(|until| until.saturating_sub(now_ms).div_ceil(1000));
     let window_resets_in_seconds = if dispatches_in_window > 0 {
         state.dispatches_ms.first().and_then(|oldest| {
             let expire_at = oldest.saturating_add(account.limits.window_ms());
             if expire_at > now_ms {
-                Some((expire_at - now_ms + 999) / 1000)
+                Some((expire_at - now_ms).div_ceil(1000))
             } else {
                 None
             }

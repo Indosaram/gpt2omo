@@ -1,17 +1,17 @@
-use crate::security::Workspace;
+use crate::security::{PathPolicy, Workspace};
 use crate::tools::ToolCallResult;
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::time::timeout;
 
 const MAX_DIFF_CHARS: usize = 30_000;
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_GIT_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_GIT_STDERR_BYTES: usize = 256 * 1024;
 
-pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallResult {
-    if !is_git_worktree(ws) {
+pub async fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallResult {
+    if !is_git_worktree(ws).await {
         return ToolCallResult::ok(serde_json::json!({
             "is_git_repo": false,
             "status": "",
@@ -22,20 +22,45 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
         }));
     }
 
-    let p = target_path
+    let requested = target_path
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != ".");
 
+    // The caller-supplied path must satisfy the same workspace policy as the file
+    // tools before it reaches git: git resolves pathspecs against the enclosing
+    // repository, so an unchecked `..` (or a denied credential name) would read
+    // tracked content from outside the workspace root. The `:(literal)` prefix
+    // additionally disables git's magic pathspec syntax (`:(top)`, globs), which
+    // could otherwise re-widen the scope.
+    let pathspec = match requested {
+        Some(path) => match PathPolicy::sanitize_relative_path(path) {
+            Ok(rel) => Some(format!(
+                ":(literal){}",
+                rel.to_string_lossy().replace('\\', "/")
+            )),
+            Err(e) => return ToolCallResult::err(e.to_string()),
+        },
+        None => None,
+    };
+    let p = pathspec.as_deref();
+
     let status_out = if let Some(path) = p {
-        run_git(ws, &["status", "--porcelain", "--", path]).unwrap_or_default()
+        run_git(ws, &["status", "--porcelain", "--", path])
+            .await
+            .unwrap_or_default()
     } else {
-        run_git(ws, &["status", "--porcelain", "--untracked-files=no"]).unwrap_or_default()
+        run_git(ws, &["status", "--porcelain", "--untracked-files=no"])
+            .await
+            .unwrap_or_default()
     };
 
     let (diff_stat, combined) = if let Some(path) = p {
-        let unstaged_stat = run_git(ws, &["diff", "--stat", "--", path]).unwrap_or_default();
-        let staged_stat =
-            run_git(ws, &["diff", "--cached", "--stat", "--", path]).unwrap_or_default();
+        let unstaged_stat = run_git(ws, &["diff", "--stat", "--", path])
+            .await
+            .unwrap_or_default();
+        let staged_stat = run_git(ws, &["diff", "--cached", "--stat", "--", path])
+            .await
+            .unwrap_or_default();
         let stat = match (unstaged_stat.is_empty(), staged_stat.is_empty()) {
             (true, true) => String::new(),
             (false, true) => unstaged_stat,
@@ -45,8 +70,9 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
                 unstaged_stat, staged_stat
             ),
         };
-        let unstaged =
-            run_git(ws, &["diff", "--no-ext-diff", "--unified=3", "--", path]).unwrap_or_default();
+        let unstaged = run_git(ws, &["diff", "--no-ext-diff", "--unified=3", "--", path])
+            .await
+            .unwrap_or_default();
         let staged = run_git(
             ws,
             &[
@@ -58,6 +84,7 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
                 path,
             ],
         )
+        .await
         .unwrap_or_default();
         let diff_comb = match (unstaged.is_empty(), staged.is_empty()) {
             (true, true) => String::new(),
@@ -70,8 +97,10 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
         };
         (stat, diff_comb)
     } else {
-        let unstaged_stat = run_git(ws, &["diff", "--stat"]).unwrap_or_default();
-        let staged_stat = run_git(ws, &["diff", "--cached", "--stat"]).unwrap_or_default();
+        let unstaged_stat = run_git(ws, &["diff", "--stat"]).await.unwrap_or_default();
+        let staged_stat = run_git(ws, &["diff", "--cached", "--stat"])
+            .await
+            .unwrap_or_default();
         let stat = match (unstaged_stat.is_empty(), staged_stat.is_empty()) {
             (true, true) => String::new(),
             (false, true) => unstaged_stat,
@@ -89,7 +118,7 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
 
     ToolCallResult::ok(serde_json::json!({
         "is_git_repo": true,
-        "path": p.unwrap_or(""),
+        "path": requested.unwrap_or(""),
         "status": status_out,
         "diff_stat": diff_stat,
         "diff": diff,
@@ -98,83 +127,70 @@ pub fn handle_git_status(ws: &Workspace, target_path: Option<&str>) -> ToolCallR
     }))
 }
 
-pub(crate) fn is_git_worktree(ws: &Workspace) -> bool {
+pub(crate) async fn is_git_worktree(ws: &Workspace) -> bool {
     let Ok(output) = run_git_bounded(
         ws,
         &["rev-parse", "--is-inside-work-tree"],
         GIT_TIMEOUT,
         1024,
-    ) else {
+    )
+    .await
+    else {
         return false;
     };
 
     output.trim() == "true"
 }
 
-pub(crate) fn run_git(ws: &Workspace, args: &[&str]) -> std::result::Result<String, String> {
-    run_git_bounded(ws, args, GIT_TIMEOUT, MAX_GIT_OUTPUT_BYTES)
+pub(crate) async fn run_git(ws: &Workspace, args: &[&str]) -> std::result::Result<String, String> {
+    run_git_bounded(ws, args, GIT_TIMEOUT, MAX_GIT_OUTPUT_BYTES).await
 }
 
-pub(crate) fn run_git_bounded(
+pub(crate) async fn run_git_bounded(
     ws: &Workspace,
     args: &[&str],
-    timeout: Duration,
+    timeout_duration: Duration,
     max_stdout_bytes: usize,
 ) -> std::result::Result<String, String> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(ws.root())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to run git {}: {}", args.join(" "), e))?;
-
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_reader = thread::spawn(move || read_limited(stdout, max_stdout_bytes));
-    let stderr_reader = thread::spawn(move || read_limited(stderr, MAX_GIT_STDERR_BYTES));
+    let args_display = args.join(" ");
 
-    let started = Instant::now();
-    let (status, timed_out) = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break (Some(status), false),
-            Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                break (child.wait().ok(), true);
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(format!(
-                    "Failed while waiting for git {}: {}",
-                    args.join(" "),
-                    e
-                ));
-            }
-        }
+    let execution = async move {
+        let stdout_future = read_limited_async(stdout, max_stdout_bytes);
+        let stderr_future = read_limited_async(stderr, MAX_GIT_STDERR_BYTES);
+        let (status, (stdout_bytes, _), (stderr_bytes, _)) =
+            tokio::join!(child.wait(), stdout_future, stderr_future,);
+        let status =
+            status.map_err(|e| format!("Failed while waiting for git {args_display}: {e}"))?;
+        Ok::<_, String>((status, stdout_bytes, stderr_bytes))
     };
 
-    let (stdout_bytes, _) = stdout_reader.join().unwrap_or_default();
-    let (stderr_bytes, _) = stderr_reader.join().unwrap_or_default();
+    let (status, stdout_bytes, stderr_bytes) =
+        timeout(timeout_duration, execution).await.map_err(|_| {
+            format!(
+                "git {} timed out after {}ms",
+                args.join(" "),
+                timeout_duration.as_millis()
+            )
+        })??;
 
-    if timed_out {
-        return Err(format!(
-            "git {} timed out after {}s",
-            args.join(" "),
-            timeout.as_secs()
-        ));
-    }
-
-    let success = status.as_ref().is_some_and(|s| s.success());
-    if !success {
+    if !status.success() {
         let mut text = String::from_utf8_lossy(&stdout_bytes).to_string();
         let err_text = String::from_utf8_lossy(&stderr_bytes);
         if !err_text.trim().is_empty() {
             if !text.is_empty() {
-                text.push('\n');
+                text.push(char::from(10));
             }
             text.push_str(&err_text);
         }
@@ -184,7 +200,10 @@ pub(crate) fn run_git_bounded(
     Ok(String::from_utf8_lossy(&stdout_bytes).to_string())
 }
 
-fn read_limited<R: Read>(pipe: Option<R>, limit: usize) -> (Vec<u8>, bool) {
+async fn read_limited_async<R: AsyncRead + Unpin>(
+    pipe: Option<R>,
+    limit: usize,
+) -> (Vec<u8>, bool) {
     let Some(mut pipe) = pipe else {
         return (Vec::new(), false);
     };
@@ -192,7 +211,7 @@ fn read_limited<R: Read>(pipe: Option<R>, limit: usize) -> (Vec<u8>, bool) {
     let mut chunk = [0u8; 8192];
     let mut total_read = 0usize;
     loop {
-        match pipe.read(&mut chunk) {
+        match pipe.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(read) => {
                 total_read = total_read.saturating_add(read);
@@ -243,37 +262,38 @@ fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command as StdCommand;
     use tempfile::tempdir;
 
     fn init_git(path: &std::path::Path) {
-        Command::new("git")
+        StdCommand::new("git")
             .args(["init", "-q"])
             .current_dir(path)
             .status()
             .unwrap();
-        Command::new("git")
+        StdCommand::new("git")
             .args(["config", "user.email", "test@example.com"])
             .current_dir(path)
             .status()
             .unwrap();
-        Command::new("git")
+        StdCommand::new("git")
             .args(["config", "user.name", "Test"])
             .current_dir(path)
             .status()
             .unwrap();
     }
 
-    #[test]
-    fn test_git_status_includes_diff_for_tracked_change() {
+    #[tokio::test]
+    async fn test_git_status_includes_diff_for_tracked_change() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         fs::write(dir.path().join("a.txt"), "one\n").unwrap();
-        Command::new("git")
+        StdCommand::new("git")
             .args(["add", "a.txt"])
             .current_dir(dir.path())
             .status()
             .unwrap();
-        Command::new("git")
+        StdCommand::new("git")
             .args(["commit", "-qm", "init"])
             .current_dir(dir.path())
             .status()
@@ -281,7 +301,7 @@ mod tests {
         fs::write(dir.path().join("a.txt"), "two\n").unwrap();
 
         let ws = Workspace::open(dir.path()).unwrap();
-        let result = handle_git_status(&ws, Some("a.txt"));
+        let result = handle_git_status(&ws, Some("a.txt")).await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["is_git_repo"], true);
@@ -289,12 +309,12 @@ mod tests {
         assert!(!data["is_clean"].as_bool().unwrap());
     }
 
-    #[test]
-    fn test_git_status_reports_non_git_workspace_without_error() {
+    #[tokio::test]
+    async fn test_git_status_reports_non_git_workspace_without_error() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
 
-        let result = handle_git_status(&ws, None);
+        let result = handle_git_status(&ws, None).await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["is_git_repo"], false);
@@ -327,25 +347,25 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_run_git_bounded_limit() {
+    #[tokio::test]
+    async fn test_run_git_bounded_limit() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         fs::write(dir.path().join("big.txt"), "x".repeat(5000)).unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
-        let res = run_git_bounded(&ws, &["status"], Duration::from_secs(5), 50);
+        let res = run_git_bounded(&ws, &["status"], Duration::from_secs(5), 50).await;
         assert!(res.is_ok());
         let text = res.unwrap();
         assert!(text.len() <= 50);
     }
 
-    #[test]
-    fn test_run_git_timeout() {
+    #[tokio::test]
+    async fn test_run_git_timeout() {
         let dir = tempdir().unwrap();
         init_git(dir.path());
         let ws = Workspace::open(dir.path()).unwrap();
         // git with a very small timeout on a non-instant command or short duration
-        let res = run_git_bounded(&ws, &["status"], Duration::from_millis(0), 1024);
+        let res = run_git_bounded(&ws, &["status"], Duration::from_millis(0), 1024).await;
         // Either finishes immediately or times out; if it times out it should return Err containing "timed out"
         if let Err(e) = res {
             assert!(e.contains("timed out") || e.contains("Failed to run"));

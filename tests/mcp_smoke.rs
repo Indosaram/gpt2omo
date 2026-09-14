@@ -9,12 +9,18 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String) {
-    let scope_dir = dir.path().with_extension("scopes");
-    let mux = WorkspaceMux::new(dir.path(), &scope_dir).unwrap();
-    let scope = mux.register(dir.path(), Some("term-test".into())).unwrap();
+fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String, TempDir) {
+    // The scope control dir must live OUTSIDE the mount root, but a plain sibling of the TempDir
+    // is never reclaimed and leaks a *.scopes directory on every run (TEST-1). A second TempDir
+    // keeps it off the mount root AND under RAII cleanup.
+    let scope_home = tempfile::tempdir().unwrap();
+    let mount_root = dir.path().to_path_buf();
+    let scope_dir = scope_home.path().join("scopes");
+    let mux = WorkspaceMux::new(&mount_root, &scope_dir).unwrap();
+    let scope = mux.register(&mount_root, Some("term-test".into())).unwrap();
+    let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
     let cli = Cli {
-        mount_root: dir.path().to_path_buf(),
+        mount_root: mount_root.clone(),
         scope_dir: Some(scope_dir),
         bind: "127.0.0.1:0".into(),
         token: None,
@@ -36,12 +42,12 @@ fn test_app(dir: &TempDir) -> (axum::Router, Arc<EventBus>, WorkspaceMux, String
         events: events.clone(),
         commands: Arc::new(gpt2omo::tools::CommandManager::new()),
     });
-    (app, events, mux, scope.scope_id)
+    (app, events, mux, scope.scope_id, scope_home)
 }
 
 fn app_for_mux(mount: &TempDir, scope_dir: std::path::PathBuf, mux: &WorkspaceMux) -> axum::Router {
     let cli = Cli {
-        mount_root: mount.path().to_path_buf(),
+        mount_root: mount.path().join("mount-root"),
         scope_dir: Some(scope_dir),
         bind: "127.0.0.1:0".into(),
         token: None,
@@ -78,23 +84,47 @@ async fn rpc(app: axum::Router, payload: Value) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+async fn rpc_with_bearer(app: axum::Router, payload: Value, token: &str) -> Value {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn scope_capability_secret(mux: &WorkspaceMux, scope_id: &str) -> String {
+    mux.lookup(scope_id)
+        .unwrap()
+        .capability_secret
+        .expect("test scope must carry capability_secret")
+}
+
 fn nested_tool_result(response: &Value) -> Value {
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     serde_json::from_str(text).unwrap()
 }
 
 #[tokio::test]
-async fn scope_capability_authenticates_mcp_without_transport_bearer() {
+async fn transport_bearer_and_scope_capability_are_both_enforced() {
     let mount = tempfile::tempdir().unwrap();
-    let project = mount.path().join("project");
+    let project = mount.path().join("mount-root").join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let scope_dir = mount.path().with_extension("scopes");
-    let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
+    let mount_root = mount.path().join("mount-root");
+    std::fs::create_dir_all(&mount_root).unwrap();
+    let scope_dir = mount.path().join("scopes");
+    let mux = WorkspaceMux::new(&mount_root, &scope_dir).unwrap();
     let scope = mux.register_browser(&project, "page-one".into()).unwrap();
+    let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
     let workspace = mux.resolve(&scope.scope_id).unwrap();
     clear_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
     let cli = Cli {
-        mount_root: mount.path().to_path_buf(),
+        mount_root: mount.path().join("mount-root"),
         scope_dir: Some(scope_dir),
         bind: "127.0.0.1:0".into(),
         token: Some("relay-control-token".into()),
@@ -116,7 +146,27 @@ async fn scope_capability_authenticates_mcp_without_transport_bearer() {
         commands: Arc::new(gpt2omo::tools::CommandManager::new()),
     });
 
-    let valid = rpc(
+    let unauthenticated = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 699,
+                "method": "tools/call",
+                "params": {
+                    "name": "task_state",
+                    "arguments": {"scope_id": scope.scope_id}
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let unauthenticated = app.clone().oneshot(unauthenticated).await.unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let valid = rpc_with_bearer(
         app.clone(),
         json!({
             "jsonrpc": "2.0",
@@ -127,16 +177,17 @@ async fn scope_capability_authenticates_mcp_without_transport_bearer() {
                 "arguments": {"scope_id": scope.scope_id}
             }
         }),
+        "relay-control-token",
     )
     .await;
     assert_eq!(valid["result"]["isError"], false);
 
     let lifecycle = load_delegation_lifecycle(&workspace, &scope.scope_id)
         .unwrap()
-        .expect("a valid scope capability must record readiness without a transport bearer");
+        .expect("a valid bearer plus scope capability must record readiness");
     assert!(lifecycle.ready_ms.is_some());
 
-    let invalid = rpc(
+    let invalid = rpc_with_bearer(
         app,
         json!({
             "jsonrpc": "2.0",
@@ -147,6 +198,7 @@ async fn scope_capability_authenticates_mcp_without_transport_bearer() {
                 "arguments": {"scope_id": "77777777-7777-4777-8777-777777777777"}
             }
         }),
+        "relay-control-token",
     )
     .await;
     assert_eq!(invalid["result"]["isError"], true);
@@ -160,7 +212,7 @@ async fn scope_capability_authenticates_mcp_without_transport_bearer() {
 #[tokio::test]
 async fn initialize_and_tools_list_smoke() {
     let dir = tempfile::tempdir().unwrap();
-    let (app, _, _, _) = test_app(&dir);
+    let (app, _, _, _, _scope_home) = test_app(&dir);
 
     let init = rpc(
         app.clone(),
@@ -222,17 +274,37 @@ async fn initialize_and_tools_list_smoke() {
             .unwrap()
             .iter()
             .any(|value| value.as_str() == Some("scope_id")));
+        let name = tool["name"].as_str().unwrap();
+        let mutating = matches!(
+            name,
+            "patch_file"
+                | "run_command"
+                | "cancel_command"
+                | "task_plan"
+                | "task_update"
+                | "completion_check"
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]
+                .get("capability_secret")
+                .is_some(),
+            mutating,
+            "unexpected capability_secret schema for {name}"
+        );
     }
 }
 
 #[tokio::test]
 async fn actual_mcp_one_worker_readiness_smoke() {
     let mount = tempfile::tempdir().unwrap();
-    let project = mount.path().join("project");
+    let project = mount.path().join("mount-root").join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let scope_dir = mount.path().with_extension("scopes");
-    let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
+    let mount_root = mount.path().join("mount-root");
+    std::fs::create_dir_all(&mount_root).unwrap();
+    let scope_dir = mount.path().join("scopes");
+    let mux = WorkspaceMux::new(&mount_root, &scope_dir).unwrap();
     let scope = mux.register_browser(&project, "page-one".into()).unwrap();
+    let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
     let workspace = mux.resolve(&scope.scope_id).unwrap();
     clear_delegation_lifecycle(&workspace, &scope.scope_id).unwrap();
     let app = app_for_mux(&mount, scope_dir, &mux);
@@ -263,14 +335,18 @@ async fn actual_mcp_one_worker_readiness_smoke() {
 #[tokio::test]
 async fn actual_mcp_three_worker_readiness_smoke() {
     let mount = tempfile::tempdir().unwrap();
-    let project = mount.path().join("project");
+    let project = mount.path().join("mount-root").join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let scope_dir = mount.path().with_extension("scopes");
-    let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
+    let mount_root = mount.path().join("mount-root");
+    std::fs::create_dir_all(&mount_root).unwrap();
+    let scope_dir = mount.path().join("scopes");
+    let mux = WorkspaceMux::new(&mount_root, &scope_dir).unwrap();
     let scopes = (1..=3)
         .map(|index| {
-            mux.register_browser(&project, format!("page-{index}"))
-                .unwrap()
+            let scope = mux
+                .register_browser(&project, format!("page-{index}"))
+                .unwrap();
+            mux.refresh_capability_secret(&scope.scope_id).unwrap()
         })
         .collect::<Vec<_>>();
     for scope in &scopes {
@@ -320,7 +396,7 @@ async fn tools_call_dispatches_search_text_smoke() {
         "fn alpha() {}\nfn important_symbol() {}\n",
     )
     .unwrap();
-    let (app, _, _, scope_id) = test_app(&dir);
+    let (app, _, _, scope_id, _scope_home) = test_app(&dir);
 
     let response = rpc(
         app,
@@ -350,7 +426,8 @@ async fn tools_call_dispatches_search_text_smoke() {
 #[tokio::test]
 async fn command_endpoints_share_daemon_state_and_idempotency() {
     let dir = tempfile::tempdir().unwrap();
-    let (app, _, _, scope_id) = test_app(&dir);
+    let (app, _, mux, scope_id, _scope_home) = test_app(&dir);
+    let capability_secret = scope_capability_secret(&mux, &scope_id);
 
     let first = rpc(
         app.clone(),
@@ -362,6 +439,7 @@ async fn command_endpoints_share_daemon_state_and_idempotency() {
                 "name": "run_command",
                 "arguments": {
                     "scope_id": scope_id,
+                    "capability_secret": capability_secret.as_str(),
                     "command": "git --version",
                     "client_request_id": "quick-sync-1"
                 }
@@ -388,6 +466,7 @@ async fn command_endpoints_share_daemon_state_and_idempotency() {
                 "name": "run_command",
                 "arguments": {
                     "scope_id": scope_id,
+                    "capability_secret": capability_secret.as_str(),
                     "command": "git --version",
                     "client_request_id": "quick-sync-1"
                 }
@@ -445,7 +524,7 @@ async fn command_endpoints_share_daemon_state_and_idempotency() {
 #[tokio::test]
 async fn events_endpoint_is_sse() {
     let dir = tempfile::tempdir().unwrap();
-    let (app, _, _, _) = test_app(&dir);
+    let (app, _, _, _, _scope_home) = test_app(&dir);
     let request = Request::builder()
         .method("GET")
         .uri("/events")
@@ -466,7 +545,7 @@ async fn events_endpoint_is_sse() {
 async fn tool_calls_publish_started_and_finished_events_with_scope() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("sample.txt"), "needle\n").unwrap();
-    let (app, events, _, scope_id) = test_app(&dir);
+    let (app, events, _, scope_id, _scope_home) = test_app(&dir);
     let mut receiver = events.subscribe();
 
     let response = rpc(
@@ -497,7 +576,7 @@ async fn tool_calls_publish_started_and_finished_events_with_scope() {
 #[tokio::test]
 async fn tool_calls_require_scope_id() {
     let dir = tempfile::tempdir().unwrap();
-    let (app, _, _, _) = test_app(&dir);
+    let (app, _, _, _, _scope_home) = test_app(&dir);
 
     let response = rpc(
         app,
@@ -521,19 +600,21 @@ async fn tool_calls_require_scope_id() {
 #[tokio::test]
 async fn two_scopes_access_separate_workspaces_without_global_switch() {
     let mount = tempfile::tempdir().unwrap();
-    let first = mount.path().join("first");
-    let second = mount.path().join("second");
+    let first = mount.path().join("mount-root").join("first");
+    let second = mount.path().join("mount-root").join("second");
     std::fs::create_dir_all(&first).unwrap();
     std::fs::create_dir_all(&second).unwrap();
     std::fs::write(first.join("only-first.txt"), "first").unwrap();
     std::fs::write(second.join("only-second.txt"), "second").unwrap();
 
-    let scope_dir = mount.path().with_extension("scopes");
-    let mux = WorkspaceMux::new(mount.path(), &scope_dir).unwrap();
+    let mount_root = mount.path().join("mount-root");
+    std::fs::create_dir_all(&mount_root).unwrap();
+    let scope_dir = mount.path().join("scopes");
+    let mux = WorkspaceMux::new(&mount_root, &scope_dir).unwrap();
     let scope_a = mux.register(&first, Some("term-a".into())).unwrap();
     let scope_b = mux.register(&second, Some("term-b".into())).unwrap();
     let cli = Cli {
-        mount_root: mount.path().to_path_buf(),
+        mount_root: mount.path().join("mount-root"),
         scope_dir: Some(scope_dir),
         bind: "127.0.0.1:0".into(),
         token: None,
@@ -610,7 +691,8 @@ async fn verification_completion_and_continuation_events_keep_scope() {
         .current_dir(dir.path())
         .status()
         .unwrap();
-    let (app, events, _, scope_id) = test_app(&dir);
+    let (app, events, mux, scope_id, _scope_home) = test_app(&dir);
+    let capability_secret = scope_capability_secret(&mux, &scope_id);
     let mut receiver = events.subscribe();
 
     rpc(
@@ -621,7 +703,7 @@ async fn verification_completion_and_continuation_events_keep_scope() {
             "method": "tools/call",
             "params": {
                 "name": "run_command",
-                "arguments": {"scope_id": scope_id, "command": "cargo fmt --check"}
+                "arguments": {"scope_id": scope_id, "capability_secret": capability_secret.as_str(), "command": "cargo fmt --check"}
             }
         }),
     )
@@ -648,6 +730,7 @@ async fn verification_completion_and_continuation_events_keep_scope() {
                 "name": "completion_check",
                 "arguments": {
                     "scope_id": scope_id,
+                    "capability_secret": capability_secret.as_str(),
                     "require_task_plan": false,
                     "require_verification": false,
                     "require_changes": false,
@@ -700,6 +783,7 @@ async fn verification_completion_and_continuation_events_keep_scope() {
                 "name": "completion_check",
                 "arguments": {
                     "scope_id": scope_id,
+                    "capability_secret": capability_secret.as_str(),
                     "require_task_plan": true,
                     "require_verification": false,
                     "require_changes": false
@@ -728,7 +812,8 @@ async fn verification_completion_and_continuation_events_keep_scope() {
 #[tokio::test]
 async fn completion_check_accepts_result_json_string_fallback_smoke() {
     let dir = tempfile::tempdir().unwrap();
-    let (app, _, _, scope_id) = test_app(&dir);
+    let (app, _, mux, scope_id, _scope_home) = test_app(&dir);
+    let capability_secret = scope_capability_secret(&mux, &scope_id);
 
     // Start a delegation lifecycle so a structured result can be recorded.
     let readiness = rpc(
@@ -757,6 +842,7 @@ async fn completion_check_accepts_result_json_string_fallback_smoke() {
                 "name": "completion_check",
                 "arguments": {
                     "scope_id": scope_id,
+                    "capability_secret": capability_secret.as_str(),
                     "require_task_plan": false,
                     "require_verification": false,
                     "result_json": result_json
@@ -768,7 +854,11 @@ async fn completion_check_accepts_result_json_string_fallback_smoke() {
 
     assert_eq!(response["result"]["isError"], false);
     let nested = nested_tool_result(&response);
-    assert_eq!(nested["success"], true, "unexpected error: {:?}", nested["error"]);
+    assert_eq!(
+        nested["success"], true,
+        "unexpected error: {:?}",
+        nested["error"]
+    );
     let data = &nested["data"];
     assert_eq!(data["task_result"]["summary"], "Flat string transport");
     let blockers = data["blockers"].as_array().unwrap();

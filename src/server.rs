@@ -79,7 +79,8 @@ pub fn create_router(state: AppState) -> Router {
             axum::http::header::AUTHORIZATION,
             axum::http::header::CONTENT_TYPE,
             axum::http::header::ACCEPT,
-        ]);
+        ])
+        .allow_credentials(false);
 
     Router::new()
         .route("/", get(healthz_handler))
@@ -119,27 +120,27 @@ async fn log_http_request(req: Request, next: Next) -> Response {
 }
 
 fn is_allowed_origin(origin: &HeaderValue) -> bool {
-    let Ok(s) = origin.to_str() else {
+    let Ok(origin) = origin.to_str() else {
         return false;
     };
-    if let Ok(url) = url::Url::parse(s) {
-        if let Some(host) = url.host_str() {
-            if host == "127.0.0.1"
-                || host == "localhost"
-                || host == "::1"
-                || host == "[::1]"
-                || host == "chatgpt.com"
-                || host.ends_with(".chatgpt.com")
-                || host == "openai.com"
-                || host.ends_with(".openai.com")
-                || host == "code.checka.cc"
-                || host == "bridge.checka.cc"
-            {
-                return true;
-            }
-        }
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+
+    if url.scheme() == "http" && matches!(host, "127.0.0.1" | "localhost") {
+        return true;
     }
-    false
+
+    url.scheme() == "https"
+        && (host == "chatgpt.com"
+            || host.ends_with(".chatgpt.com")
+            || host == "openai.com"
+            || host.ends_with(".openai.com")
+            || host == "code.checka.cc"
+            || host == "bridge.checka.cc")
 }
 
 fn is_local_host(host: &str) -> bool {
@@ -208,20 +209,26 @@ async fn validate_host_header(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-async fn healthz_handler() -> impl IntoResponse {
-    Json(serde_json::json!({
+async fn healthz_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse> {
+    verify_auth(&state, &headers)?;
+    Ok(Json(serde_json::json!({
         "status": "ok",
         "service": "gpt2omo",
         "version": "0.7.0",
         "events": "/events",
         "workspace_mode": "multiplexed_scopes",
         "command_mode": "daemon_owned_async"
-    }))
+    })))
 }
 
 async fn mcp_sse_handler(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
+    verify_auth(&state, &headers)?;
     let endpoint_event = Event::default().event("endpoint").data("/mcp");
     let stream = stream::iter(vec![Ok(endpoint_event)]);
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
@@ -275,8 +282,10 @@ fn harness_event_to_sse(event: HarnessEvent) -> Event {
 
 async fn mcp_post_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<JsonRpcRequest>,
 ) -> Result<Json<JsonRpcResponse>> {
+    verify_auth(&state, &headers)?;
     let res = match req.method.as_str() {
         "initialize" => JsonRpcResponse {
             jsonrpc: "2.0".into(),
@@ -347,6 +356,10 @@ async fn mcp_post_handler(
             let started = Instant::now();
             let tool_res = if scope_id.is_empty() {
                 ToolCallResult::err("scope_id is required for every gpt2omo tool call")
+            } else if let Err(error) =
+                verify_capability_secret(&state.workspace, scope_id, tool_name, &arguments)
+            {
+                ToolCallResult::err(error)
             } else {
                 match state.workspace.resolve(scope_id) {
                     Ok(workspace) if tool_name == "query_subagent" => {
@@ -368,17 +381,24 @@ async fn mcp_post_handler(
                         let scope_id = scope_id.to_string();
                         let tool_name = tool_name.to_string();
                         let arguments = arguments.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            let _ = crate::tools::record_readiness_evidence(&workspace, &scope_id);
-                            dispatch_tool(
-                                &workspace, &cli, &commands, &scope_id, &tool_name, arguments,
-                            )
-                        })
-                        .await
-                        {
-                            Ok(res) => res,
-                            Err(err) => ToolCallResult::err(format!("Blocking task failed: {err}")),
+                        let readiness_workspace = workspace.clone();
+                        let readiness_scope = scope_id.clone();
+                        let outcome =
+                            dispatch_tool(workspace, cli, commands, scope_id, tool_name, arguments)
+                                .await;
+                        // Readiness is authoritative evidence, so only a tool call that actually
+                        // succeeded may establish it. Recording before dispatch let a failed or
+                        // unknown tool satisfy the gate (SC-2).
+                        if outcome.success {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                crate::tools::record_readiness_evidence(
+                                    &readiness_workspace,
+                                    &readiness_scope,
+                                )
+                            })
+                            .await;
                         }
+                        outcome
                     }
                     Err(error) => ToolCallResult::err(error.to_string()),
                 }
@@ -694,6 +714,11 @@ fn tool_definitions(subagent_enabled: bool, read_only: bool) -> Vec<Value> {
     }
 
     for tool in &mut tools {
+        let tool_name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else {
             continue;
         };
@@ -708,6 +733,15 @@ fn tool_definitions(subagent_enabled: bool, read_only: bool) -> Vec<Value> {
                     "description": "Per-delegation workspace scope id supplied by the OMO delegation prompt"
                 }),
             );
+            if tool_requires_capability_secret(&tool_name) {
+                properties.insert(
+                    "capability_secret".into(),
+                    serde_json::json!({
+                        "type": "string",
+                        "description": "Per-generation capability secret supplied by the OMO delegation prompt"
+                    }),
+                );
+            }
         }
         let required = schema
             .entry("required")
@@ -718,6 +752,13 @@ fn tool_definitions(subagent_enabled: bool, read_only: bool) -> Vec<Value> {
                 .any(|value| value.as_str() == Some("scope_id"))
             {
                 required.push(serde_json::json!("scope_id"));
+            }
+            if tool_requires_capability_secret(&tool_name)
+                && !required
+                    .iter()
+                    .any(|value| value.as_str() == Some("capability_secret"))
+            {
+                required.push(serde_json::json!("capability_secret"));
             }
         }
     }
@@ -733,6 +774,59 @@ fn is_read_only_denied_tool(name: &str) -> bool {
     matches!(name, "patch_file" | "run_command" | "cancel_command")
 }
 
+fn tool_requires_capability_secret(name: &str) -> bool {
+    matches!(
+        name,
+        "patch_file"
+            | "run_command"
+            | "cancel_command"
+            | "task_plan"
+            | "task_update"
+            | "completion_check"
+            | "query_subagent"
+    )
+}
+
+fn verify_capability_secret(
+    workspaces: &WorkspaceMux,
+    scope_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+) -> std::result::Result<(), String> {
+    let provided = arguments
+        .get("capability_secret")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty());
+    let required = tool_requires_capability_secret(tool_name);
+
+    if provided.is_none() && !required {
+        return Ok(());
+    }
+
+    let scope = workspaces
+        .lookup(scope_id)
+        .map_err(|error| format!("tool_rejected: {error}"))?;
+    let Some(expected) = scope.capability_secret.as_deref() else {
+        return Err(
+            "tool_rejected: scope has no capability_secret; resume/bootstrap the delegation to refresh capability_secret"
+                .into(),
+        );
+    };
+    let Some(provided) = provided else {
+        return Err(format!(
+            "tool_rejected: capability_secret is required for {tool_name}; pass the exact flat capability_secret field from the delegation prompt"
+        ));
+    };
+    if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        return Err(
+            "tool_rejected: invalid capability_secret; pass the exact flat capability_secret field from the delegation prompt"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let hash_a = Sha256::digest(a);
     let hash_b = Sha256::digest(b);
@@ -744,17 +838,24 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn verify_auth(state: &AppState, headers: &HeaderMap) -> Result<()> {
-    if let Some(expected_token) = &state.cli.token {
-        let auth_header = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|header| header.to_str().ok())
-            .unwrap_or("");
-        let expected = format!("Bearer {}", expected_token);
-        if !constant_time_eq(auth_header.as_bytes(), expected.as_bytes()) {
-            return Err(BridgeError::Security(
-                "Unauthorized: Invalid Bearer token".into(),
-            ));
+    let Some(expected_token) = state.cli.token.as_deref() else {
+        if state.cli.insecure_no_auth {
+            return Ok(());
         }
+        return Err(BridgeError::Security(
+            "Unauthorized: Bearer authentication is required".into(),
+        ));
+    };
+
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+        .unwrap_or("");
+    let expected = format!("Bearer {expected_token}");
+    if !constant_time_eq(auth_header.as_bytes(), expected.as_bytes()) {
+        return Err(BridgeError::Security(
+            "Unauthorized: Invalid Bearer token".into(),
+        ));
     }
     Ok(())
 }
@@ -892,7 +993,7 @@ fn publish_specialized_events(
             }),
         );
 
-        if !ready {
+        if !ready && result.success {
             let prompt = continuation_prompt(scope_id, &blockers);
             events.publish(
                 "continuation_required",
@@ -989,10 +1090,168 @@ pub fn sanitize_continuation_prompt(prompt: &str) -> String {
     }
 }
 
-fn dispatch_tool(
+async fn dispatch_tool(
+    ws: Workspace,
+    cli: Arc<Cli>,
+    commands: Arc<CommandManager>,
+    scope_id: String,
+    name: String,
+    args: Value,
+) -> ToolCallResult {
+    if cli.read_only && is_read_only_denied_tool(&name) {
+        return ToolCallResult::err(format!(
+            "tool {name} is disabled by the read-only shared connector policy; command cwd confinement is not an OS sandbox"
+        ));
+    }
+
+    let _tool_permit = commands.acquire_tool_permit(&scope_id).await;
+
+    match name.as_str() {
+        "ast_grep" => {
+            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+            let path = args.get("path").and_then(Value::as_str);
+            let language = args.get("language").and_then(Value::as_str);
+            let max_results = args
+                .get("max_results")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            handle_ast_grep(&ws, pattern, path, language, max_results).await
+        }
+        "lsp_diagnostics" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            let timeout = args.get("timeout_ms").and_then(Value::as_u64);
+            handle_lsp(&ws, LspOperation::Diagnostics, path, None, None, timeout).await
+        }
+        "lsp_definition" | "lsp_references" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            let line = args
+                .get("line")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            let character = args
+                .get("character")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            let timeout = args.get("timeout_ms").and_then(Value::as_u64);
+            let operation = if name == "lsp_definition" {
+                LspOperation::Definition
+            } else {
+                LspOperation::References
+            };
+            handle_lsp(&ws, operation, path, line, character, timeout).await
+        }
+        "lsp_symbols" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            let timeout = args.get("timeout_ms").and_then(Value::as_u64);
+            handle_lsp(&ws, LspOperation::Symbols, path, None, None, timeout).await
+        }
+        "patch_file" => {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let sha = args
+                .get("expected_sha256")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let content = args
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let ws_clone = ws.clone();
+            let scope_id_clone = scope_id.clone();
+            let mut result = tokio::task::spawn_blocking(move || {
+                let res = handle_patch_file(&ws_clone, &path, sha.as_deref(), &content);
+                if res.success {
+                    record_mutation(&ws_clone, &scope_id_clone, &path);
+                }
+                res
+            })
+            .await
+            .unwrap_or_else(|error| ToolCallResult::err(format!("Blocking task failed: {error}")));
+
+            if result.success {
+                let revision = commands.note_workspace_mutation(&scope_id).await;
+                if let Some(data) = result.data.as_mut().and_then(Value::as_object_mut) {
+                    data.insert("workspace_revision".into(), Value::from(revision));
+                }
+            }
+            result
+        }
+        "run_command" => {
+            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+            let requested_timeout = args
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(cli.command_timeout_ms);
+            let timeout = requested_timeout.clamp(1, cli.command_timeout_ms.max(1));
+            let client_request_id = args.get("client_request_id").and_then(Value::as_str);
+            commands
+                .run_command(&ws, &scope_id, command, timeout, client_request_id)
+                .await
+        }
+        "poll_command" => {
+            let command_id = args.get("command_id").and_then(Value::as_str).unwrap_or("");
+            let wait_timeout_ms = args.get("wait_timeout_ms").and_then(Value::as_u64);
+            commands
+                .poll_command(&ws, &scope_id, command_id, wait_timeout_ms)
+                .await
+        }
+        "list_commands" => commands.list_commands(&ws, &scope_id).await,
+        "cancel_command" => {
+            let command_id = args.get("command_id").and_then(Value::as_str).unwrap_or("");
+            commands.cancel_command(&ws, &scope_id, command_id).await
+        }
+        "git_status_diff" => {
+            let path = args.get("path").and_then(Value::as_str);
+            handle_git_status(&ws, path).await
+        }
+        "task_state" => {
+            commands.reconcile_scope(&ws, &scope_id).await;
+            let ws_clone = ws.clone();
+            let scope_id_clone = scope_id.clone();
+            tokio::task::spawn_blocking(move || handle_task_state(&ws_clone, &scope_id_clone))
+                .await
+                .unwrap_or_else(|error| {
+                    ToolCallResult::err(format!("Blocking task failed: {error}"))
+                })
+        }
+        "completion_check" => {
+            let require_task_plan = args.get("require_task_plan").and_then(Value::as_bool);
+            let require_verification = args.get("require_verification").and_then(Value::as_bool);
+            let require_changes = args.get("require_changes").and_then(Value::as_bool);
+            let result = match completion_result_from_args(&args) {
+                Ok(result) => result,
+                Err(error) => return error,
+            };
+            handle_completion_check_with_manager_and_result(
+                &ws,
+                &scope_id,
+                require_task_plan,
+                require_verification,
+                require_changes,
+                result,
+                &commands,
+            )
+            .await
+        }
+        _ => {
+            let cli = Arc::clone(&cli);
+            tokio::task::spawn_blocking(move || {
+                dispatch_tool_sync(&ws, &cli, &commands, &scope_id, &name, args)
+            })
+            .await
+            .unwrap_or_else(|error| ToolCallResult::err(format!("Blocking task failed: {error}")))
+        }
+    }
+}
+
+fn dispatch_tool_sync(
     ws: &Workspace,
     cli: &Cli,
-    commands: &CommandManager,
+    _commands: &CommandManager,
     scope_id: &str,
     name: &str,
     args: Value,
@@ -1038,88 +1297,14 @@ fn dispatch_tool(
             handle_search_text(ws, query, path, case_sensitive, max_results)
         }
         "ast_grep" => {
-            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-            let path = args.get("path").and_then(Value::as_str);
-            let language = args.get("language").and_then(Value::as_str);
-            let max_results = args
-                .get("max_results")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
-            handle_ast_grep(ws, pattern, path, language, max_results)
+            ToolCallResult::err("internal error: async-only tool reached synchronous dispatcher")
         }
-        "lsp_diagnostics" => {
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            let timeout = args.get("timeout_ms").and_then(Value::as_u64);
-            handle_lsp(ws, LspOperation::Diagnostics, path, None, None, timeout)
+        "lsp_diagnostics" | "lsp_definition" | "lsp_references" | "lsp_symbols" => {
+            ToolCallResult::err("internal error: async-only tool reached synchronous dispatcher")
         }
-        "lsp_definition" => {
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            let line = args
-                .get("line")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
-            let character = args
-                .get("character")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
-            let timeout = args.get("timeout_ms").and_then(Value::as_u64);
-            handle_lsp(ws, LspOperation::Definition, path, line, character, timeout)
-        }
-        "lsp_references" => {
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            let line = args
-                .get("line")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
-            let character = args
-                .get("character")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize);
-            let timeout = args.get("timeout_ms").and_then(Value::as_u64);
-            handle_lsp(ws, LspOperation::References, path, line, character, timeout)
-        }
-        "lsp_symbols" => {
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            let timeout = args.get("timeout_ms").and_then(Value::as_u64);
-            handle_lsp(ws, LspOperation::Symbols, path, None, None, timeout)
-        }
-        "patch_file" => {
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            let sha = args.get("expected_sha256").and_then(Value::as_str);
-            let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-            let mut result = handle_patch_file(ws, path, sha, content);
-            if result.success {
-                record_mutation(ws, scope_id, path);
-                let revision = commands.note_workspace_mutation(scope_id);
-                if let Some(data) = result.data.as_mut().and_then(Value::as_object_mut) {
-                    data.insert("workspace_revision".into(), Value::from(revision));
-                }
-            }
-            result
-        }
-        "run_command" => {
-            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
-            let requested_timeout = args
-                .get("timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(cli.command_timeout_ms);
-            let timeout = requested_timeout.clamp(1, cli.command_timeout_ms.max(1));
-            let client_request_id = args.get("client_request_id").and_then(Value::as_str);
-            commands.run_command(ws, scope_id, command, timeout, client_request_id)
-        }
-        "poll_command" => {
-            let command_id = args.get("command_id").and_then(Value::as_str).unwrap_or("");
-            let wait_timeout_ms = args.get("wait_timeout_ms").and_then(Value::as_u64);
-            commands.poll_command(ws, scope_id, command_id, wait_timeout_ms)
-        }
-        "list_commands" => commands.list_commands(ws, scope_id),
-        "cancel_command" => {
-            let command_id = args.get("command_id").and_then(Value::as_str).unwrap_or("");
-            commands.cancel_command(ws, scope_id, command_id)
-        }
-        "git_status_diff" => {
-            let path = args.get("path").and_then(Value::as_str);
-            handle_git_status(ws, path)
+        "patch_file" | "run_command" | "poll_command" | "list_commands" | "cancel_command"
+        | "git_status_diff" => {
+            ToolCallResult::err("internal error: async-only tool reached synchronous dispatcher")
         }
         "task_plan" => {
             let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
@@ -1141,27 +1326,8 @@ fn dispatch_tool(
             let note = args.get("note").and_then(Value::as_str);
             handle_task_update(ws, scope_id, item_id, status, note)
         }
-        "task_state" => {
-            commands.reconcile_scope(ws, scope_id);
-            handle_task_state(ws, scope_id)
-        }
-        "completion_check" => {
-            let require_task_plan = args.get("require_task_plan").and_then(Value::as_bool);
-            let require_verification = args.get("require_verification").and_then(Value::as_bool);
-            let require_changes = args.get("require_changes").and_then(Value::as_bool);
-            let result = match completion_result_from_args(&args) {
-                Ok(result) => result,
-                Err(error) => return error,
-            };
-            handle_completion_check_with_manager_and_result(
-                ws,
-                scope_id,
-                require_task_plan,
-                require_verification,
-                require_changes,
-                result,
-                commands,
-            )
+        "task_state" | "completion_check" => {
+            ToolCallResult::err("internal error: async-only tool reached synchronous dispatcher")
         }
         _ => ToolCallResult::err(format!("Unknown tool: {}", name)),
     }
@@ -1179,14 +1345,15 @@ fn completion_result_from_args(
     if raw.trim().is_empty() {
         return Err(ToolCallResult::err("result_json cannot be empty"));
     }
-    let parsed: Value = serde_json::from_str(raw).map_err(|error| {
-        ToolCallResult::err(format!("result_json is not valid JSON: {error}"))
-    })?;
-    parse_completion_result(Some(&parsed)).map_err(|error| ToolCallResult::err(format!(
-        "result_json {}: {}",
-        "invalid result object",
-        error.error.unwrap_or_else(|| "unknown error".into())
-    )))
+    let parsed: Value = serde_json::from_str(raw)
+        .map_err(|error| ToolCallResult::err(format!("result_json is not valid JSON: {error}")))?;
+    parse_completion_result(Some(&parsed)).map_err(|error| {
+        ToolCallResult::err(format!(
+            "result_json {}: {}",
+            "invalid result object",
+            error.error.unwrap_or_else(|| "unknown error".into())
+        ))
+    })
 }
 
 fn parse_completion_result(
@@ -1241,6 +1408,16 @@ impl IntoResponse for BridgeError {
 
 #[cfg(test)]
 mod tests {
+    /// Mount root for tests, kept INSIDE the TempDir so its sibling scope dir is reclaimed on drop.
+    ///
+    /// The scope control directory must not live under the mount root, so both are placed as
+    /// siblings under one TempDir instead of leaking a `*.scopes` directory next to it (TEST-1).
+    fn test_mount_root(temp_dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let root = temp_dir.path().join("mount-root");
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     #[test]
     fn read_only_tools_declare_readonly_annotations_for_connector_safety_scanners() {
         let tools = tool_definitions(false, false);
@@ -1329,6 +1506,90 @@ mod tests {
     }
 
     #[test]
+    fn capability_secret_is_schema_visible_only_for_state_changing_tools() {
+        let tools = tool_definitions(false, false);
+        for name in [
+            "patch_file",
+            "run_command",
+            "cancel_command",
+            "task_plan",
+            "task_update",
+            "completion_check",
+        ] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert!(tool["inputSchema"]["properties"]["capability_secret"].is_object());
+            let required = tool["inputSchema"]["required"].as_array().unwrap();
+            assert!(
+                required
+                    .iter()
+                    .any(|value| value.as_str() == Some("capability_secret")),
+                "{name} must require capability_secret"
+            );
+        }
+        for name in ["read_file", "poll_command", "git_status_diff", "task_state"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert!(tool["inputSchema"]["properties"]
+                .get("capability_secret")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn capability_secret_authorizes_mutations_and_validates_optional_read_only_values() {
+        let mount = tempfile::tempdir().unwrap();
+        let scopes = tempfile::tempdir().unwrap();
+        let mux = WorkspaceMux::new(mount.path(), scopes.path()).unwrap();
+        let scope = mux.register(mount.path(), None).unwrap();
+        let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
+        let secret = scope.capability_secret.as_deref().unwrap();
+
+        let missing =
+            verify_capability_secret(&mux, &scope.scope_id, "run_command", &serde_json::json!({}))
+                .unwrap_err();
+        assert!(missing.contains("tool_rejected"));
+        assert!(missing.contains("capability_secret"));
+
+        let wrong = verify_capability_secret(
+            &mux,
+            &scope.scope_id,
+            "run_command",
+            &serde_json::json!({"capability_secret": "wrong"}),
+        )
+        .unwrap_err();
+        assert!(wrong.contains("tool_rejected"));
+        assert!(wrong.contains("capability_secret"));
+
+        assert!(verify_capability_secret(
+            &mux,
+            &scope.scope_id,
+            "run_command",
+            &serde_json::json!({"capability_secret": secret}),
+        )
+        .is_ok());
+        assert!(verify_capability_secret(
+            &mux,
+            &scope.scope_id,
+            "read_file",
+            &serde_json::json!({}),
+        )
+        .is_ok());
+        assert!(verify_capability_secret(
+            &mux,
+            &scope.scope_id,
+            "read_file",
+            &serde_json::json!({"capability_secret": "wrong"}),
+        )
+        .is_err());
+        assert!(verify_capability_secret(
+            &mux,
+            &scope.scope_id,
+            "read_file",
+            &serde_json::json!({"capability_secret": secret}),
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn completion_result_accepts_flat_result_json_fallback() {
         let mut args = serde_json::json!({});
         assert!(completion_result_from_args(&args).unwrap().is_none());
@@ -1409,9 +1670,11 @@ mod tests {
             .expect("query_subagent should be advertised when enabled");
         assert!(tool["inputSchema"]["properties"]["prompt"].is_object());
         assert!(tool["inputSchema"]["properties"]["scope_id"].is_object());
+        assert!(tool["inputSchema"]["properties"]["capability_secret"].is_object());
         let required = tool["inputSchema"]["required"].as_array().unwrap();
         assert!(required.iter().any(|value| value == "prompt"));
         assert!(required.iter().any(|value| value == "scope_id"));
+        assert!(required.iter().any(|value| value == "capability_secret"));
     }
 
     #[test]
@@ -1476,6 +1739,30 @@ mod tests {
         assert!(prompt.contains("completion_check returns ready=true"));
     }
 
+    #[tokio::test]
+    async fn rejected_completion_does_not_publish_continuation() {
+        let events = EventBus::new("workspace");
+        let mut receiver = events.subscribe();
+        let result = ToolCallResult::err("capability_secret verification failed".to_string());
+
+        publish_specialized_events(
+            &events,
+            "44444444-4444-4444-8444-444444444444",
+            "completion_check",
+            &serde_json::json!({}),
+            &result,
+        );
+
+        let completion = receiver.recv().await.unwrap();
+        assert_eq!(completion.kind, "completion");
+        assert_eq!(completion.data["tool_success"], false);
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "a rejected completion_check must not publish an actionable continuation_required event"
+        );
+    }
+
     #[test]
     fn continuation_reason_is_bounded_and_removes_terminal_controls() {
         let reason = format!(
@@ -1514,13 +1801,13 @@ mod tests {
     fn verify_auth_enforces_bearer_token() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mux = Arc::new(
-            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
         );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
 
         let cli_with_token = Arc::new(Cli {
-            mount_root: temp_dir.path().to_path_buf(),
+            mount_root: test_mount_root(&temp_dir),
             scope_dir: None,
             bind: "127.0.0.1:0".into(),
             token: Some("secret123".into()),
@@ -1557,9 +1844,9 @@ mod tests {
         let headers_empty = HeaderMap::new();
         assert!(verify_auth(&state_with_token, &headers_empty).is_err());
 
-        // No token configured allows unauthenticated (capability scope_id model)
+        // Missing token is rejected unless the explicit insecure flag is set
         let cli_no_token = Arc::new(Cli {
-            mount_root: temp_dir.path().to_path_buf(),
+            mount_root: test_mount_root(&temp_dir),
             scope_dir: None,
             bind: "127.0.0.1:0".into(),
             token: None,
@@ -1580,11 +1867,11 @@ mod tests {
             events: events.clone(),
             commands: commands.clone(),
         };
-        assert!(verify_auth(&state_no_token, &headers_empty).is_ok());
+        assert!(verify_auth(&state_no_token, &headers_empty).is_err());
 
         // Insecure no-auth flag allows requests when no token configured
         let cli_insecure = Arc::new(Cli {
-            mount_root: temp_dir.path().to_path_buf(),
+            mount_root: test_mount_root(&temp_dir),
             scope_dir: None,
             bind: "127.0.0.1:0".into(),
             token: None,
@@ -1616,11 +1903,14 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let mux = Arc::new(
-            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
         );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
-        let cli = Arc::new(Cli::default());
+        let cli = Arc::new(Cli {
+            insecure_no_auth: true,
+            ..Cli::default()
+        });
 
         let app = create_router(AppState {
             workspace: mux,
@@ -1679,12 +1969,12 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let mux = Arc::new(
-            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
         );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
         let cli = Arc::new(Cli {
-            mount_root: temp_dir.path().to_path_buf(),
+            mount_root: test_mount_root(&temp_dir),
             scope_dir: None,
             bind: "127.0.0.1:0".into(),
             token: None,
@@ -1747,12 +2037,12 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let mux = Arc::new(
-            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
         );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
         let cli = Arc::new(Cli {
-            mount_root: temp_dir.path().to_path_buf(),
+            mount_root: test_mount_root(&temp_dir),
             scope_dir: None,
             bind: "127.0.0.1:0".into(),
             token: Some("secret-token".into()),
@@ -1805,6 +2095,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn healthz_requires_bearer_authentication() {
+        use http::Request;
+        use tower::ServiceExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mux = Arc::new(
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
+        );
+        let state = AppState {
+            workspace: mux,
+            cli: Arc::new(Cli {
+                mount_root: test_mount_root(&temp_dir),
+                scope_dir: None,
+                bind: "127.0.0.1:0".into(),
+                token: Some("health-token".into()),
+                token_file: None,
+                insecure_no_auth: false,
+                max_file_bytes: 1024,
+                command_timeout_ms: 5000,
+                subagent_endpoint: None,
+                subagent_api_key: None,
+                subagent_model: "deepseek-v4-flash-free".into(),
+                subagent_allow_remote: false,
+                allow_arbitrary_commands: false,
+                read_only: false,
+            }),
+            events: Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string())),
+            commands: Arc::new(CommandManager::new()),
+        };
+        let app = create_router(state);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header("host", "127.0.0.1:18800")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header("host", "127.0.0.1:18800")
+                    .header("authorization", "Bearer health-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_cross_origin_events_denies_without_scope_id_leakage() {
+        use axum::body::to_bytes;
+        use http::Request;
+        use tower::ServiceExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mux = Arc::new(
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
+        );
+        let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
+        let leaked_scope_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        events.publish(
+            "tool_started",
+            serde_json::json!({"scope_id": leaked_scope_id, "tool": "read_file"}),
+        );
+        let app = create_router(AppState {
+            workspace: mux,
+            cli: Arc::new(Cli {
+                mount_root: test_mount_root(&temp_dir),
+                scope_dir: None,
+                bind: "127.0.0.1:0".into(),
+                token: Some("events-token".into()),
+                token_file: None,
+                insecure_no_auth: false,
+                max_file_bytes: 1024,
+                command_timeout_ms: 5000,
+                subagent_endpoint: None,
+                subagent_api_key: None,
+                subagent_model: "deepseek-v4-flash-free".into(),
+                subagent_allow_remote: false,
+                allow_arbitrary_commands: false,
+                read_only: false,
+            }),
+            events,
+            commands: Arc::new(CommandManager::new()),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .header("host", "127.0.0.1:18800")
+                    .header("origin", "https://evil.attacker.example")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains(leaked_scope_id));
+        assert!(!body.contains("scope_id"));
+    }
+
+    #[tokio::test]
     async fn healthz_endpoint_does_not_leak_mount_root_or_filesystem_paths() {
         use axum::body::to_bytes;
         use http::Request;
@@ -1812,15 +2221,15 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let mux = Arc::new(
-            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
         );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
         let cli = Arc::new(Cli {
-            mount_root: temp_dir.path().to_path_buf(),
+            mount_root: test_mount_root(&temp_dir),
             scope_dir: None,
             bind: "127.0.0.1:0".into(),
-            token: None,
+            token: Some("health-secret".into()),
             token_file: None,
             insecure_no_auth: false,
             max_file_bytes: 1024,
@@ -1844,6 +2253,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/healthz")
+                    .header("authorization", "Bearer health-secret")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -1873,12 +2283,12 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let mux = Arc::new(
-            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
         );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
         let cli = Arc::new(Cli {
-            mount_root: temp_dir.path().to_path_buf(),
+            mount_root: test_mount_root(&temp_dir),
             scope_dir: None,
             bind: "127.0.0.1:0".into(),
             token: None,
@@ -1941,18 +2351,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_endpoint_uses_scope_capability_without_transport_bearer() {
+    async fn mcp_endpoint_requires_transport_bearer() {
         use http::Request;
         use tower::ServiceExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
         let mux = Arc::new(
-            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
         );
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::new());
         let cli = Arc::new(Cli {
-            mount_root: temp_dir.path().to_path_buf(),
+            mount_root: test_mount_root(&temp_dir),
             scope_dir: None,
             bind: "127.0.0.1:0".into(),
             token: Some("mcp-secret-token".into()),
@@ -1990,7 +2400,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
         let res = app
             .clone()
@@ -2022,7 +2432,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
         let res = app
             .oneshot(
@@ -2039,27 +2449,38 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn healthz_remains_responsive_under_concurrent_long_polling() {
         use http::Request;
         use tower::ServiceExt;
 
+        const POLLER_COUNT: usize = 40;
         let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            test_mount_root(&temp_dir).join("Makefile"),
+            "test:
+	@python3 -c 'import signal; signal.pause()'
+",
+        )
+        .unwrap();
         let mux = Arc::new(
-            WorkspaceMux::new(temp_dir.path(), temp_dir.path().with_extension("scopes")).unwrap(),
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
         );
         let scope = mux
-            .register(temp_dir.path(), Some("poll-test".into()))
+            .register(test_mount_root(&temp_dir), Some("poll-test".into()))
             .unwrap();
+        let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
+        let capability_secret = scope.capability_secret.clone().unwrap();
         let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
         let commands = Arc::new(CommandManager::with_allow_arbitrary(true));
         let cli = Arc::new(Cli {
-            mount_root: temp_dir.path().to_path_buf(),
+            mount_root: test_mount_root(&temp_dir),
             scope_dir: None,
             bind: "127.0.0.1:0".into(),
-            token: None,
+            token: Some("poll-health-token".into()),
             token_file: None,
-            insecure_no_auth: true,
+            insecure_no_auth: false,
             max_file_bytes: 1024,
             command_timeout_ms: 30000,
             subagent_endpoint: None,
@@ -2077,75 +2498,458 @@ mod tests {
             commands: commands.clone(),
         });
 
-        let ws = Workspace::open(temp_dir.path()).unwrap();
-        let run_res = commands.run_command(&ws, &scope.scope_id, "sleep 3", 10000, None);
-        assert!(run_res.success, "run_command failed: {:?}", run_res.error);
-        let command_id = run_res.data.unwrap()["command_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let ws = Workspace::open(test_mount_root(&temp_dir)).unwrap();
+        let run_manager = commands.clone();
+        let run_ws = ws.clone();
+        let run_scope_id = scope.scope_id.clone();
+        let run_task = tokio::spawn(async move {
+            run_manager
+                .run_command(&run_ws, &run_scope_id, "make test", 30000, None)
+                .await
+        });
 
-        let mut handles = Vec::new();
-        for _ in 0..4 {
-            let app_clone = app.clone();
-            let scope_id = scope.scope_id.clone();
-            let cmd_id = command_id.clone();
-            let handle = tokio::spawn(async move {
+        assert!(
+            commands
+                .wait_for_waiter_count_for_tests(1, Duration::from_secs(2))
+                .await,
+            "run_command never entered its asynchronous terminal wait"
+        );
+
+        let command_id = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let listed = commands.list_commands(&ws, &scope.scope_id).await;
+                let commands_json = listed
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("commands"))
+                    .and_then(Value::as_array)
+                    .unwrap();
+                if let Some(command_id) = commands_json
+                    .iter()
+                    .find(|entry| entry["status"] == "running")
+                    .and_then(|entry| entry["command_id"].as_str())
+                {
+                    break command_id.to_string();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("long-running command was not observable");
+
+        let mut pollers = Vec::with_capacity(POLLER_COUNT);
+        for index in 0..POLLER_COUNT {
+            let poll_app = app.clone();
+            let poll_scope_id = scope.scope_id.clone();
+            let poll_command_id = command_id.clone();
+            let poll_capability_secret = capability_secret.clone();
+            pollers.push(tokio::spawn(async move {
                 let body = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "id": 1,
+                    "id": index + 1,
                     "method": "tools/call",
                     "params": {
                         "name": "poll_command",
                         "arguments": {
-                            "scope_id": scope_id,
-                            "command_id": cmd_id,
-                            "wait_timeout_ms": 3000
+                            "scope_id": poll_scope_id,
+                            "capability_secret": poll_capability_secret,
+                            "command_id": poll_command_id,
+                            "wait_timeout_ms": 15000
                         }
                     }
                 });
-                app_clone
+                poll_app
                     .oneshot(
                         Request::builder()
                             .method("POST")
                             .uri("/mcp")
                             .header("host", "127.0.0.1:18800")
+                            .header("authorization", "Bearer poll-health-token")
                             .header("content-type", "application/json")
                             .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
                             .unwrap(),
                     )
                     .await
                     .unwrap()
-            });
-            handles.push(handle);
+            }));
+        }
+
+        assert!(
+            commands
+                .wait_for_waiter_count_for_tests(POLLER_COUNT + 1, Duration::from_secs(3))
+                .await,
+            "not all poll_command calls reached the async Notify wait"
+        );
+
+        let health_res = tokio::time::timeout(
+            Duration::from_millis(100),
+            app.clone().oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header("host", "127.0.0.1:18800")
+                    .header("authorization", "Bearer poll-health-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("healthz exceeded the 100ms responsiveness bound")
+        .unwrap();
+        assert_eq!(health_res.status(), StatusCode::OK);
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_secs(3),
+            commands.cancel_command(&ws, &scope.scope_id, &command_id),
+        )
+        .await
+        .expect("long-running command cancellation timed out");
+        assert!(cancelled.success, "cancel failed: {:?}", cancelled.error);
+
+        tokio::time::timeout(Duration::from_secs(3), run_task)
+            .await
+            .expect("run_command task did not finish after cancellation")
+            .unwrap();
+        for poller in pollers {
+            let response = tokio::time::timeout(Duration::from_secs(3), poller)
+                .await
+                .expect("poll_command waiter did not finish after cancellation")
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn healthz_remains_responsive_under_sync_tool_flood() {
+        use http::Request;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tower::ServiceExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mux = Arc::new(
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
+        );
+        let scope = mux
+            .register(test_mount_root(&temp_dir), Some("flood-test".into()))
+            .unwrap();
+        let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
+        let capability_secret = scope.capability_secret.clone().unwrap();
+        let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
+        let commands = Arc::new(CommandManager::with_allow_arbitrary(true));
+        let cli = Arc::new(Cli {
+            mount_root: test_mount_root(&temp_dir),
+            scope_dir: None,
+            bind: "127.0.0.1:0".into(),
+            token: Some("poll-health-token".into()),
+            token_file: None,
+            insecure_no_auth: false,
+            max_file_bytes: 1024 * 1024,
+            command_timeout_ms: 30000,
+            subagent_endpoint: None,
+            subagent_api_key: None,
+            subagent_model: "deepseek-v4-flash-free".into(),
+            subagent_allow_remote: false,
+            allow_arbitrary_commands: true,
+            read_only: false,
+        });
+
+        let app = create_router(AppState {
+            workspace: mux,
+            cli,
+            events,
+            commands: commands.clone(),
+        });
+
+        let ws = Workspace::open(test_mount_root(&temp_dir)).unwrap();
+        assert!(
+            crate::tools::task_state::handle_task_plan(
+                &ws,
+                &scope.scope_id,
+                "flood test goal",
+                vec!["step 1".into(), "step 2".into()]
+            )
+            .success
+        );
+
+        let running = Arc::new(AtomicBool::new(true));
+        const FLOODER_COUNT: usize = 32;
+        let mut flooders = Vec::with_capacity(FLOODER_COUNT);
+
+        for index in 0..FLOODER_COUNT {
+            let flood_app = app.clone();
+            let flood_scope_id = scope.scope_id.clone();
+            let flood_secret = capability_secret.clone();
+            let is_running = Arc::clone(&running);
+            flooders.push(tokio::spawn(async move {
+                let mut iter: usize = 0;
+                while is_running.load(Ordering::Relaxed) {
+                    iter += 1;
+                    let body = if (index + iter) % 2 == 0 {
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": iter,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "patch_file",
+                                "arguments": {
+                                    "scope_id": flood_scope_id,
+                                    "capability_secret": flood_secret,
+                                    "path": format!("flood_patch_{}_{}.txt", index, iter % 8),
+                                    "content": "synchronous filesystem write payload data\n".repeat(16)
+                                }
+                            }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": iter,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "task_state",
+                                "arguments": {
+                                    "scope_id": flood_scope_id,
+                                    "capability_secret": flood_secret
+                                }
+                            }
+                        })
+                    };
+                    let _ = flood_app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/mcp")
+                                .header("host", "127.0.0.1:18800")
+                                .header("authorization", "Bearer poll-health-token")
+                                .header("content-type", "application/json")
+                                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                                .unwrap(),
+                        )
+                        .await;
+                }
+            }));
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let start = Instant::now();
-        let health_res = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/healthz")
-                    .header("host", "127.0.0.1:18800")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let elapsed = start.elapsed();
+        const PROBE_COUNT: usize = 20;
+        let mut latencies: Vec<Duration> = Vec::with_capacity(PROBE_COUNT);
 
-        assert_eq!(health_res.status(), StatusCode::OK);
+        for _ in 0..PROBE_COUNT {
+            let probe_app = app.clone();
+            let start = Instant::now();
+            let probe_task = tokio::spawn(async move {
+                probe_app
+                    .oneshot(
+                        Request::builder()
+                            .uri("/healthz")
+                            .header("host", "127.0.0.1:18800")
+                            .header("authorization", "Bearer poll-health-token")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+            });
+
+            let response = tokio::time::timeout(Duration::from_secs(2), probe_task)
+                .await
+                .expect("healthz probe timed out")
+                .expect("healthz probe panicked")
+                .unwrap();
+            let latency = start.elapsed();
+            assert_eq!(response.status(), StatusCode::OK);
+            latencies.push(latency);
+
+            assert!(
+                latency <= Duration::from_millis(100),
+                "healthz latency {:?} exceeded 100ms bound during concurrent tool flood",
+                latency
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        running.store(false, Ordering::Relaxed);
+        for flooder in flooders {
+            let _ = tokio::time::timeout(Duration::from_secs(3), flooder).await;
+        }
+
+        latencies.sort();
+        let mean: Duration = latencies.iter().sum::<Duration>() / latencies.len() as u32;
+        let p99 = latencies[(latencies.len() as f64 * 0.99).floor() as usize];
+        println!(
+            "healthz latency under sync tool flood: mean = {:.2?}, p99 = {:.2?}",
+            mean, p99
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn healthz_remains_responsive_under_pending_verification_reconcile_flood() {
+        use http::Request;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tower::ServiceExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mux = Arc::new(
+            WorkspaceMux::new(test_mount_root(&temp_dir), temp_dir.path().join("scopes")).unwrap(),
+        );
+        let scope = mux
+            .register(test_mount_root(&temp_dir), Some("reconcile-flood-test".into()))
+            .unwrap();
+        let scope = mux.refresh_capability_secret(&scope.scope_id).unwrap();
+        let capability_secret = scope.capability_secret.clone().unwrap();
+        let events = Arc::new(EventBus::new(temp_dir.path().to_string_lossy().to_string()));
+        let commands = Arc::new(CommandManager::with_allow_arbitrary(true));
+        let cli = Arc::new(Cli {
+            mount_root: test_mount_root(&temp_dir),
+            scope_dir: None,
+            bind: "127.0.0.1:0".into(),
+            token: Some("poll-health-token".into()),
+            token_file: None,
+            insecure_no_auth: false,
+            max_file_bytes: 1024 * 1024,
+            command_timeout_ms: 30000,
+            subagent_endpoint: None,
+            subagent_api_key: None,
+            subagent_model: "deepseek-v4-flash-free".into(),
+            subagent_allow_remote: false,
+            allow_arbitrary_commands: true,
+            read_only: false,
+        });
+
+        let app = create_router(AppState {
+            workspace: mux,
+            cli,
+            events,
+            commands: commands.clone(),
+        });
+
+        let ws = Workspace::open(test_mount_root(&temp_dir)).unwrap();
         assert!(
-            elapsed < Duration::from_millis(200),
-            "healthz took too long: {:?}",
-            elapsed
+            crate::tools::task_state::handle_task_plan(
+                &ws,
+                &scope.scope_id,
+                "reconcile flood test goal",
+                vec!["step 1".into(), "step 2".into()]
+            )
+            .success
         );
 
-        let _ = commands.cancel_command(&ws, &scope.scope_id, &command_id);
-        for handle in handles {
-            let _ = handle.await;
+        // Seed >= 16 terminal verification commands pending recording for one scope
+        const PENDING_COMMANDS: usize = 16;
+        for i in 0..PENDING_COMMANDS {
+            commands
+                .seed_pending_verification_for_test(
+                    &scope.scope_id,
+                    1,
+                    &format!("cargo test --test pending_verify_{}", i),
+                    Some(0),
+                )
+                .await;
         }
+
+        let running = Arc::new(AtomicBool::new(true));
+        const FLOODER_COUNT: usize = 16;
+        let mut flooders = Vec::with_capacity(FLOODER_COUNT);
+
+        for iter_idx in 0..FLOODER_COUNT {
+            let flood_app = app.clone();
+            let flood_commands = commands.clone();
+            let flood_scope_id = scope.scope_id.clone();
+            let flood_secret = capability_secret.clone();
+            let is_running = Arc::clone(&running);
+            flooders.push(tokio::spawn(async move {
+                let mut iter: usize = 0;
+                while is_running.load(Ordering::Relaxed) {
+                    iter += 1;
+                    flood_commands
+                        .seed_pending_verification_for_test(
+                            &flood_scope_id,
+                            1,
+                            &format!("cargo test --test flood_{}_{}", iter_idx, iter),
+                            Some(0),
+                        )
+                        .await;
+                    let body = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("{}-{}", iter_idx, iter),
+                        "method": "tools/call",
+                        "params": {
+                            "name": "task_state",
+                            "arguments": {
+                                "scope_id": flood_scope_id,
+                                "capability_secret": flood_secret
+                            }
+                        }
+                    });
+                    let _ = flood_app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/mcp")
+                                .header("host", "127.0.0.1:18800")
+                                .header("authorization", "Bearer poll-health-token")
+                                .header("content-type", "application/json")
+                                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                                .unwrap(),
+                        )
+                        .await;
+                }
+            }));
+        }
+
+        const PROBE_COUNT: usize = 20;
+        let mut latencies: Vec<Duration> = Vec::with_capacity(PROBE_COUNT);
+
+        for _ in 0..PROBE_COUNT {
+            let probe_app = app.clone();
+            let start = Instant::now();
+            let probe_task = tokio::spawn(async move {
+                probe_app
+                    .oneshot(
+                        Request::builder()
+                            .uri("/healthz")
+                            .header("host", "127.0.0.1:18800")
+                            .header("authorization", "Bearer poll-health-token")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+            });
+
+            let response = tokio::time::timeout(Duration::from_secs(2), probe_task)
+                .await
+                .expect("healthz probe timed out")
+                .expect("healthz probe panicked")
+                .unwrap();
+            let latency = start.elapsed();
+            assert_eq!(response.status(), StatusCode::OK);
+            latencies.push(latency);
+
+            assert!(
+                latency <= Duration::from_millis(100),
+                "healthz latency {:?} exceeded 100ms bound during pending-verification reconcile flood",
+                latency
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        running.store(false, Ordering::Relaxed);
+        for flooder in flooders {
+            let _ = tokio::time::timeout(Duration::from_secs(3), flooder).await;
+        }
+
+        latencies.sort();
+        let mean: Duration = latencies.iter().sum::<Duration>() / latencies.len() as u32;
+        let p99 = latencies[(latencies.len() as f64 * 0.99).floor() as usize];
+        let task_state = crate::tools::task_state::load_task_state(&ws, &scope.scope_id)
+            .unwrap()
+            .unwrap();
+        println!(
+            "verifications count = {}, healthz latency under pending-verification reconcile flood: mean = {:.2?}, p99 = {:.2?}",
+            task_state.verifications.len(), mean, p99
+        );
+        assert!(task_state.verifications.len() >= PENDING_COMMANDS);
     }
 }

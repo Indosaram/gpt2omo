@@ -218,11 +218,16 @@ pub fn activate_pending_accounts_config(
             "cannot activate multi-account routing while legacy scopes remain: {details}"
         )));
     }
-    if !store
-        .load_account(LEGACY_ACCOUNT_ID)?
-        .reservations
-        .is_empty()
-    {
+    // A reservation left behind by a crashed worker would otherwise block activation forever.
+    // Reconcile expiries first (the owner's rule: cleanup is driven by lease expiry, never by
+    // guessing), then refuse only on reservations that are genuinely still live.
+    let mut legacy_state = store.load_account(LEGACY_ACCOUNT_ID)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    legacy_state.reconcile(now_ms, config.defaults.limits.window_ms());
+    if !legacy_state.reservations.is_empty() {
         return Err(BridgeError::Precondition(
             "cannot activate multi-account routing while a legacy account reservation remains"
                 .into(),

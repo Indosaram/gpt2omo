@@ -14,6 +14,9 @@ pub fn handle_read_file(
         Ok(path) => path,
         Err(e) => return ToolCallResult::err(e.to_string()),
     };
+    if let Err(e) = PathPolicy::ensure_resolved_target_allowed(ws.root(), &rel_path) {
+        return ToolCallResult::err(e.to_string());
+    }
     let dir = match ws.cap_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -140,6 +143,43 @@ mod tests {
         let res = handle_read_file(&ws, "large.txt", None, None, 4);
         assert!(!res.success);
         assert!(res.error.unwrap().contains("configured read limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_file_denies_symlink_alias_to_secret() {
+        use std::os::unix::fs::symlink;
+
+        let workspace_dir = tempdir().unwrap();
+        fs::write(workspace_dir.path().join(".env"), "API_KEY=supersecret").unwrap();
+        symlink(".env", workspace_dir.path().join("notes.txt")).unwrap();
+        let ws = Workspace::open(workspace_dir.path()).unwrap();
+
+        let res = handle_read_file(&ws, "notes.txt", None, None, 1024);
+        assert!(
+            !res.success,
+            "symlink alias notes.txt -> .env was allowed to read secret content: {:?}",
+            res.data
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_file_allows_symlink_to_ordinary_file() {
+        use std::os::unix::fs::symlink;
+
+        let workspace_dir = tempdir().unwrap();
+        fs::write(workspace_dir.path().join("real.txt"), "hello\n").unwrap();
+        symlink("real.txt", workspace_dir.path().join("alias.txt")).unwrap();
+        let ws = Workspace::open(workspace_dir.path()).unwrap();
+
+        let res = handle_read_file(&ws, "alias.txt", None, None, 1024);
+        assert!(
+            res.success,
+            "legitimate in-workspace symlink was denied: {:?}",
+            res.error
+        );
+        assert_eq!(res.data.unwrap()["content"], "hello");
     }
 
     #[cfg(unix)]

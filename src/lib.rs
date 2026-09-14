@@ -45,12 +45,39 @@ pub use security::{
 pub use server::{create_router, AppState};
 pub use web_session::{cleanup_expired_retained_sessions, recover_dead_browser_scopes};
 
+/// Security-critical settings that a dotenv file in the current working
+/// directory must never be able to supply: the daemon may be started inside an
+/// untrusted repository, and these keys control authentication, the command
+/// allowlist, and the workspace scope location.
+const DOTENV_DENIED_KEYS: &[&str] = &[
+    "OMO_BRIDGE_TOKEN",
+    "OMO_BRIDGE_TOKEN_FILE",
+    "OMO_BRIDGE_INSECURE_NO_AUTH",
+    "OMO_BRIDGE_ALLOW_ARBITRARY_COMMANDS",
+    "OMO_BRIDGE_READ_ONLY",
+    "OMO_SCOPE_DIR",
+    "OMO_ALLOWED_BINARIES",
+    "ALLOWED_BINARIES",
+];
+
+/// Pure predicate deciding whether a dotenv key may be imported into the
+/// process environment.
+fn dotenv_key_is_importable(key: &str) -> bool {
+    !DOTENV_DENIED_KEYS.contains(&key)
+}
+
 pub fn load_dotenv_if_present() {
     if let Ok(content) = std::fs::read_to_string(std::path::Path::new(".env")) {
         for line in content.lines() {
             let Some((key, value)) = parse_dotenv_assignment(line) else {
                 continue;
             };
+            if !dotenv_key_is_importable(key) {
+                eprintln!(
+                    "warning: ignoring security-critical key {key} from .env; set it in the real environment or pass the matching CLI flag"
+                );
+                continue;
+            }
             if std::env::var_os(key).is_none() {
                 std::env::set_var(key, value);
             }
@@ -86,7 +113,17 @@ fn parse_dotenv_assignment(line: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_dotenv_assignment;
+    use super::{dotenv_key_is_importable, parse_dotenv_assignment, DOTENV_DENIED_KEYS};
+
+    #[test]
+    fn dotenv_denies_security_critical_keys_and_allows_ordinary_omo_keys() {
+        assert!(!dotenv_key_is_importable("OMO_BRIDGE_INSECURE_NO_AUTH"));
+        for key in DOTENV_DENIED_KEYS {
+            assert!(!dotenv_key_is_importable(key), "{key} must stay denied");
+        }
+        assert!(dotenv_key_is_importable("OMO_SUBAGENT_MODEL"));
+        assert!(dotenv_key_is_importable("OMO_BRIDGE_URL"));
+    }
 
     #[test]
     fn dotenv_assignment_parses_plain_and_quoted_omo_values() {

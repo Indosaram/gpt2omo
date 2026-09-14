@@ -32,7 +32,14 @@ pub fn handle_patch_file(
                 }
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(expected) = expected_sha256 {
+                return ToolCallResult::err(format!(
+                    "Precondition failed: expected sha256 {}, but file does not exist",
+                    expected
+                ));
+            }
+        }
         Err(e) => {
             return ToolCallResult::err(format!(
                 "Failed to read existing file for precondition: {}",
@@ -94,6 +101,35 @@ mod tests {
         let res3 = handle_patch_file(&ws, "test.txt", Some("wrong_hash"), "should fail");
         assert!(!res3.success);
         assert!(res3.error.unwrap().contains("Precondition failed"));
+    }
+
+    #[test]
+    fn test_patch_file_precondition_rejects_create_of_missing_file() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::open(dir.path()).unwrap();
+
+        let hash_of_nothing = format!("{:x}", Sha256::digest(b""));
+        let res = handle_patch_file(&ws, "missing.txt", Some(&hash_of_nothing), "sneaky create");
+
+        assert!(
+            !res.success,
+            "expected_sha256 on a nonexistent file must fail the precondition, but the file was created"
+        );
+        assert!(
+            res.error.unwrap_or_default().contains("Precondition failed"),
+            "error must name the failed precondition"
+        );
+        assert!(
+            !dir.path().join("missing.txt").exists(),
+            "failed precondition must not leave a created file behind"
+        );
+
+        let create = handle_patch_file(&ws, "missing.txt", None, "legitimate create");
+        assert!(create.success, "create with no expected_sha256 must still succeed");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("missing.txt")).unwrap(),
+            "legitimate create"
+        );
     }
 
     #[cfg(unix)]

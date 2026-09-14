@@ -655,18 +655,10 @@ pub async fn verify_chatgpt_page(
     validate_chatgpt_page_probe(&value)
 }
 
-pub async fn send_chatgpt_prompt(
-    config: &BrowserDriverConfig,
-    page: &str,
-    prompt: &str,
-) -> Result<()> {
-    if prompt.trim().is_empty() {
-        return Err(anyhow!("ChatGPT Web prompt cannot be empty"));
-    }
-    wait_for_chatgpt_idle(config, page).await?;
-
+/// Builds the DOM expression that types `prompt` into the ChatGPT composer.
+fn chatgpt_insert_expression(prompt: &str) -> Result<String> {
     let prompt_json = serde_json::to_string(prompt)?;
-    let insert_expression = format!(
+    Ok(format!(
         r#"(() => {{
   const visible = (candidate) => {{
     if (!candidate || !(candidate instanceof Element)) return false;
@@ -683,8 +675,24 @@ pub async fn send_chatgpt_prompt(
   el.dispatchEvent(new Event('input', {{ bubbles: true }}));
   return {{ ok: true }};
 }})()"#
-    );
-    let inserted = eval_json(config, page, &insert_expression).await?;
+    ))
+}
+
+pub async fn send_chatgpt_prompt(
+    config: &BrowserDriverConfig,
+    page: &str,
+    prompt: &str,
+) -> Result<()> {
+    if prompt.trim().is_empty() {
+        return Err(anyhow!("ChatGPT Web prompt cannot be empty"));
+    }
+    // Resolve the secret-safe transport before waiting: a driver that cannot carry the
+    // capability-bearing payload privately must be refused now, not after the idle wait.
+    let (kind, bin) = resolve_eval_driver(config).await?;
+    let invocation = chatgpt_prompt_invocation(kind, page, prompt)?;
+    wait_for_chatgpt_idle(config, page).await?;
+
+    let inserted = run_eval_invocation(&bin, kind, &invocation).await?;
     if inserted.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(anyhow!("unable to fill ChatGPT prompt box: {inserted}"));
     }
@@ -780,26 +788,121 @@ fn validate_chatgpt_page_probe(value: &Value) -> Result<ChatgptPageProbe> {
     })
 }
 
-async fn eval_json(config: &BrowserDriverConfig, page: &str, expression: &str) -> Result<Value> {
-    let (kind, bin) = config.detect().await?;
+/// One browser-driver subprocess invocation: the argument vector plus an
+/// optional stdin payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriverInvocation {
+    pub args: Vec<String>,
+    pub stdin: Option<String>,
+}
+
+impl DriverInvocation {
+    fn argv<I, S>(args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            args: args.into_iter().map(Into::into).collect(),
+            stdin: None,
+        }
+    }
+}
+
+/// Builds the invocation that evaluates a non-confidential `expression`.
+pub fn eval_invocation(
+    kind: BrowserDriverKind,
+    page: &str,
+    expression: &str,
+) -> Result<DriverInvocation> {
     match kind {
         BrowserDriverKind::Chrome => Err(anyhow!(
             "the chrome driver requires browser.cdp_endpoint for direct CDP control"
         )),
+        BrowserDriverKind::Orca | BrowserDriverKind::Maho | BrowserDriverKind::Aside => {
+            Ok(DriverInvocation::argv([
+                "eval",
+                "--page",
+                page,
+                "--expression",
+                expression,
+                "--json",
+            ]))
+        }
+        BrowserDriverKind::AgentBrowser => Ok(DriverInvocation::argv([
+            "--session",
+            page,
+            "eval",
+            expression,
+            "--json",
+        ])),
+        BrowserDriverKind::Cmux => Ok(DriverInvocation::argv([
+            "--json", "browser", page, "eval", expression,
+        ])),
+    }
+}
+
+/// Builds the invocation that types a SECRET-BEARING prompt into the composer.
+///
+/// The delegation prompt embeds the per-scope `capability_secret`, so it must never reach the
+/// process table. Only drivers with a private stdin transport may carry it; every other driver is
+/// refused rather than silently downgraded to argv (DB-2 / WF-2 / OT-2).
+pub fn chatgpt_prompt_invocation(
+    kind: BrowserDriverKind,
+    page: &str,
+    prompt: &str,
+) -> Result<DriverInvocation> {
+    let expression = chatgpt_insert_expression(prompt)?;
+    match kind {
+        BrowserDriverKind::AgentBrowser => Ok(DriverInvocation {
+            args: ["--session", page, "eval", "--stdin", "--json"]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            stdin: Some(expression),
+        }),
+        // Refuse WITHOUT interpolating the payload: the diagnostic itself must not republish the
+        // secret that the refusal exists to protect.
+        other => Err(anyhow!(
+            "driver {other} has no stdin transport for capability-bearing prompts; it would expose the per-scope capability_secret in the process table. Configure an agent-browser driver for this account."
+        )),
+    }
+}
+
+/// Resolves the driver that actually performs DOM evaluation, mapping drivers
+/// without their own eval surface onto the orca compatibility binary.
+async fn resolve_eval_driver(config: &BrowserDriverConfig) -> Result<(BrowserDriverKind, PathBuf)> {
+    let (kind, bin) = config.detect().await?;
+    match kind {
+        BrowserDriverKind::Maho | BrowserDriverKind::Aside => {
+            if is_executable_in_path("orca").await {
+                Ok((BrowserDriverKind::Orca, PathBuf::from("orca")))
+            } else {
+                Err(anyhow!(
+                    "DOM evaluation is unsupported by this browser driver"
+                ))
+            }
+        }
+        other => Ok((other, bin)),
+    }
+}
+
+async fn run_eval_invocation(
+    bin: &PathBuf,
+    kind: BrowserDriverKind,
+    invocation: &DriverInvocation,
+) -> Result<Value> {
+    let args = invocation.args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = execute_command(bin, &args, invocation.stdin.as_deref()).await?;
+    let result = parse_command_json(bin, &args, output)?;
+    match kind {
         BrowserDriverKind::Orca => {
-            let result = run_command_json(
-                &bin,
-                &["eval", "--page", page, "--expression", expression, "--json"],
-            )
-            .await?;
             let raw = result
                 .pointer("/result/result")
                 .ok_or_else(|| anyhow!("orca eval returned no result"))?;
             decode_eval_value(raw)
         }
         BrowserDriverKind::AgentBrowser => {
-            let result =
-                run_command_json(&bin, &["--session", page, "eval", expression, "--json"]).await?;
             if let Some(val) = result.pointer("/data/result") {
                 return decode_eval_value(val);
             }
@@ -809,8 +912,6 @@ async fn eval_json(config: &BrowserDriverConfig, page: &str, expression: &str) -
             Err(anyhow!("agent-browser eval returned no result"))
         }
         BrowserDriverKind::Cmux => {
-            let result =
-                run_command_json(&bin, &["--json", "browser", page, "eval", expression]).await?;
             let raw = result
                 .pointer("/result")
                 .or_else(|| result.pointer("/value"))
@@ -818,24 +919,18 @@ async fn eval_json(config: &BrowserDriverConfig, page: &str, expression: &str) -
                 .ok_or_else(|| anyhow!("cmux browser eval returned no result: {result}"))?;
             decode_eval_value(raw)
         }
-        BrowserDriverKind::Maho | BrowserDriverKind::Aside => {
-            if is_executable_in_path("orca").await {
-                let result = run_command_json(
-                    &PathBuf::from("orca"),
-                    &["eval", "--page", page, "--expression", expression, "--json"],
-                )
-                .await?;
-                let raw = result
-                    .pointer("/result/result")
-                    .ok_or_else(|| anyhow!("orca eval compatibility path returned no result"))?;
-                return decode_eval_value(raw);
-            }
-            Err(anyhow!(
-                "DOM evaluation is unsupported by this browser driver"
-            ))
-        }
+        BrowserDriverKind::Chrome | BrowserDriverKind::Maho | BrowserDriverKind::Aside => Err(
+            anyhow!("DOM evaluation is unsupported by this browser driver"),
+        ),
     }
 }
+
+async fn eval_json(config: &BrowserDriverConfig, page: &str, expression: &str) -> Result<Value> {
+    let (kind, bin) = resolve_eval_driver(config).await?;
+    let invocation = eval_invocation(kind, page, expression)?;
+    run_eval_invocation(&bin, kind, &invocation).await
+}
+
 
 fn decode_eval_value(raw: &Value) -> Result<Value> {
     match raw {
@@ -1069,7 +1164,7 @@ async fn execute_command(
             Err(anyhow!(
                 "command {} {:?} timed out after {:?}",
                 bin.display(),
-                args,
+                redact_command_args(args),
                 COMMAND_TIMEOUT
             ))
         }
@@ -1132,6 +1227,29 @@ where
     }
 }
 
+/// Renders a driver invocation's arguments for diagnostics without echoing their payload.
+///
+/// `eval` expressions carry the delegation prompt, which embeds the per-scope capability secret.
+/// Interpolating the raw argument list into an error string republishes that secret into logs and
+/// into whatever surface reads the error, so long payload-bearing arguments are elided.
+fn redact_secret_bearing_expression(expression: &str) -> String {
+    const MAX_DIAGNOSTIC_CHARS: usize = 48;
+    if expression.chars().count() <= MAX_DIAGNOSTIC_CHARS {
+        return expression.to_string();
+    }
+    let head: String = expression.chars().take(MAX_DIAGNOSTIC_CHARS).collect();
+    format!(
+        "{head}... [{} chars elided: payload may contain a capability secret]",
+        expression.chars().count() - MAX_DIAGNOSTIC_CHARS
+    )
+}
+
+fn redact_command_args(args: &[&str]) -> Vec<String> {
+    args.iter()
+        .map(|arg| redact_secret_bearing_expression(arg))
+        .collect()
+}
+
 fn parse_command_json(bin: &Path, args: &[&str], output: std::process::Output) -> Result<Value> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
@@ -1139,7 +1257,7 @@ fn parse_command_json(bin: &Path, args: &[&str], output: std::process::Output) -
         return Err(anyhow!(
             "command {} {:?} failed ({}): {} {}",
             bin.display(),
-            args,
+            redact_command_args(args),
             output.status,
             stdout.trim(),
             stderr.trim()
@@ -1158,6 +1276,21 @@ fn parse_command_json(bin: &Path, args: &[&str], output: std::process::Output) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eval_argv_never_carries_the_prompt_payload() {
+        let secret = "cap_secret_do_not_leak_0123456789";
+        let expression = format!(
+            "document.execCommand('insertText', false, \"use capability_secret {secret}\");"
+        );
+
+        let redacted = redact_secret_bearing_expression(&expression);
+
+        assert!(
+            !redacted.contains(secret),
+            "a diagnostic rendering of an eval expression must not echo the capability secret, got: {redacted}"
+        );
+    }
 
     #[test]
     fn automatic_driver_priority_includes_chrome_before_cli_drivers() {

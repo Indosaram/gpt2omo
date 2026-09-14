@@ -214,8 +214,10 @@ fn validate_git_args(args: &[String]) -> std::result::Result<(), String> {
 
 /// Compatibility wrapper for in-process callers. The MCP server owns a single shared
 /// `CommandManager`; callers that need polling/cancellation should use that manager directly.
-pub fn handle_run_command(ws: &Workspace, cmd_str: &str, timeout_ms: u64) -> ToolCallResult {
-    CommandManager::new().run_command(ws, LEGACY_SCOPE_ID, cmd_str, timeout_ms, None)
+pub async fn handle_run_command(ws: &Workspace, cmd_str: &str, timeout_ms: u64) -> ToolCallResult {
+    CommandManager::new()
+        .run_command(ws, LEGACY_SCOPE_ID, cmd_str, timeout_ms, None)
+        .await
 }
 
 // Command line parsing
@@ -333,12 +335,12 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_run_command_execution() {
+    #[tokio::test]
+    async fn test_run_command_execution() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
 
-        let ok_res = handle_run_command(&ws, "git --version", 5000);
+        let ok_res = handle_run_command(&ws, "git --version", 5000).await;
         assert!(ok_res.success);
         assert!(ok_res.data.unwrap()["command_success"].as_bool().unwrap());
     }
@@ -391,12 +393,12 @@ mod tests {
         assert!(result.unwrap_err().contains("Parent-directory traversal"));
     }
 
-    #[test]
-    fn test_timeout_is_enforced() {
+    #[tokio::test]
+    async fn test_timeout_is_enforced() {
         let dir = tempdir().unwrap();
         let ws = Workspace::open(dir.path()).unwrap();
         fs::write(dir.path().join("Makefile"), "test:\n\t@sleep 1\n").unwrap();
-        let result = handle_run_command(&ws, "make test", 50);
+        let result = handle_run_command(&ws, "make test", 50).await;
         assert!(result.success);
         let data = result.data.unwrap();
         assert_eq!(data["timed_out"], true);

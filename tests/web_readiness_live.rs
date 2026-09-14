@@ -20,6 +20,7 @@ static LIVE_SMOKE_LOCK: Mutex<()> = Mutex::const_new(());
 #[derive(Debug)]
 struct LiveWorker {
     scope_id: String,
+    capability_secret: String,
     browser_page_id: String,
     generation: u64,
     generation_started_ms: u64,
@@ -42,13 +43,19 @@ fn live_orca_config() -> OrcaConfig {
     )
 }
 
-fn readiness_bootstrap(scope_id: &str, workspace: &Path, generation: u64) -> String {
+fn readiness_bootstrap(
+    scope_id: &str,
+    capability_secret: &str,
+    workspace: &Path,
+    generation: u64,
+) -> String {
     format!(
         "[GPT2OMO READINESS BOOTSTRAP]\n\
 SCOPE_ID: {scope_id}\n\
+CAPABILITY_SECRET: {capability_secret}\n\
 WORKSPACE: {}\n\
 GENERATION: {generation}\n\n\
-This is a readiness handshake for a fresh ChatGPT Web worker. The actual coding task for this generation has NOT been sent yet. Your only allowed readiness action now is to call the gpt2omo MCP tool task_state with exactly scope_id={scope_id}. If the task_state tool schema is not loaded yet, you may perform only the minimal connector/tool discovery required to expose that exact task_state tool, then call it immediately. Do not inspect files, edit, run commands, delegate, or start coding.\n\n\
+This is a readiness handshake for a fresh ChatGPT Web worker. The actual coding task for this generation has NOT been sent yet. Keep CAPABILITY_SECRET private and include it as the flat capability_secret field on every state-changing gpt2omo tool call. Your only allowed readiness action now is to call the gpt2omo MCP tool task_state with exactly scope_id={scope_id}. If the task_state tool schema is not loaded yet, you may perform only the minimal connector/tool discovery required to expose that exact task_state tool, then call it immediately. Do not inspect files, edit, run commands, delegate, or start coding.\n\n\
 A textual READY/OK/complete message is ignored and provides no readiness evidence. Readiness exists only if the scoped task_state MCP call succeeds and the bridge records it for this generation. After that successful tool call, stop and wait for the actual task prompt.",
         workspace.display(),
     )
@@ -87,6 +94,15 @@ async fn stage_workers(
                 return Err(error.into());
             }
         };
+        let scope = match mux.refresh_capability_secret(&scope.scope_id) {
+            Ok(scope) => scope,
+            Err(error) => {
+                let _ = close_browser_page(orca, &page).await;
+                let _ = mux.remove(&scope.scope_id);
+                cleanup_workers(mux, orca, &workers).await;
+                return Err(error.into());
+            }
+        };
         let scoped_workspace = match mux.resolve(&scope.scope_id) {
             Ok(workspace) => workspace,
             Err(error) => {
@@ -107,6 +123,9 @@ async fn stage_workers(
         };
         workers.push(LiveWorker {
             scope_id: scope.scope_id,
+            capability_secret: scope
+                .capability_secret
+                .expect("refreshed live scope secret"),
             browser_page_id: page,
             generation: lifecycle.generation,
             generation_started_ms: lifecycle.generation_started_ms,
@@ -122,7 +141,14 @@ async fn dispatch_bootstraps(
 ) -> Result<()> {
     let prompts = workers
         .iter()
-        .map(|worker| readiness_bootstrap(&worker.scope_id, workspace, worker.generation))
+        .map(|worker| {
+            readiness_bootstrap(
+                &worker.scope_id,
+                &worker.capability_secret,
+                workspace,
+                worker.generation,
+            )
+        })
         .collect::<Vec<_>>();
     let results = join_all(
         workers
