@@ -4,9 +4,9 @@ use crate::accounts::{
 };
 use crate::error::{BridgeError, Result as BridgeResult};
 use crate::orca::{
-    close_browser_page, create_chatgpt_tab, probe_chatgpt_ui_condition, send_chatgpt_prompt,
-    verify_chatgpt_page, BrowserDriverConfig, BrowserDriverKind, ChatgptPageProbe,
-    ChatgptRateLimitReason, ChatgptUiCondition,
+    CHATGPT_CLICK_RETRY_EXPRESSION, click_chatgpt_retry, close_browser_page, create_chatgpt_tab,
+    probe_chatgpt_ui_condition, send_chatgpt_prompt, verify_chatgpt_page, BrowserDriverConfig,
+    BrowserDriverKind, ChatgptPageProbe, ChatgptRateLimitReason, ChatgptUiCondition,
 };
 use crate::security::BrowserBinding;
 use anyhow::{anyhow, Context, Result};
@@ -916,13 +916,35 @@ impl BrowserPool {
   const reset=(t)=>{const m=t.match(/(?:try again|reset(?:s)?|available again|wait)[^0-9]{0,48}(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)/i);if(!m)return null;const n=Number(m[1]),u=m[2].toLowerCase(),k=u.startsWith('min')?60:(u.startsWith('hour')||u.startsWith('hr'))?3600:u.startsWith('day')?86400:1,s=Math.ceil(n*k);return Number.isSafeInteger(s)&&s>=1&&s<=2678400?s:null};
   let rr=null,rs=null; for(const t of texts){rr=rate(t);if(rr){rs=reset(t);break}}
   const auth=texts.some(t=>/\b(log in|login|sign in|authentication required|session expired|please authenticate)\b/.test(t));
-  const delivery=texts.find(t=>/\b(something went wrong|error generating|network error|failed to send|message failed|unable to load conversation|delivery failed)\b/.test(t))||null;
+  const lastTurnEl=Array.from(document.querySelectorAll('[data-message-author-role]')).filter(visible).pop();
+  const lastTurn=lastTurnEl?((lastTurnEl.innerText||'').toLowerCase().slice(-4000)):'';
+  const DELIV=/\b(something went wrong|error generating|network error|failed to send|message failed|unable to load conversation|delivery failed|delivery timed out)\b/;
+  const delivery=[...texts, lastTurn].find(t=>DELIV.test(t))||null;
   return {ready:!!composer,generating:!!stop&&visible(stop),rate_limited:rr!==null,rate_limit_reason:rr,reset_after_seconds:rs,delivery_error:delivery!==null,delivery_recoverable:!!delivery&&/retry|try again|network|temporary/.test(delivery),authentication_required:auth};
 })()"#;
         match self.cdp_eval(target, page_id, expression).await {
             Ok(value) => classify_ui(&value),
             Err(_) => ChatgptUiCondition::Unknown,
         }
+    }
+
+    /// Clicks a visible delivery-error "Retry" button on the bound page.
+    /// Returns `false` when no retry button is present so the observe loop can
+    /// keep polling; `Err` means the browser itself could not be reached.
+    pub async fn click_retry(&self, binding: &BrowserBinding) -> Result<bool> {
+        let target = self.target_for_binding(binding).await?;
+        if target.cdp_endpoint.is_none() {
+            return Ok(
+                click_chatgpt_retry(&self.driver_config(&target), &binding.page_id).await
+            );
+        }
+        if self.ensure_profile_lease(&target).is_err() {
+            return Ok(false);
+        }
+        let value = self
+            .cdp_eval(&target, &binding.page_id, CHATGPT_CLICK_RETRY_EXPRESSION)
+            .await?;
+        Ok(value.get("clicked").and_then(Value::as_bool).unwrap_or(false))
     }
 
     async fn cdp_inspect(&self, target: &BrowserTarget, page_id: &str) -> Result<PageInspection> {
@@ -975,7 +997,7 @@ impl BrowserPool {
   }
 
   const auth = /sign in|log in|session expired|authentication required/.test(texts);
-  const delivery = /(something went wrong|error generating|network error|failed to send|unable to load conversation)/.test(texts);
+  const delivery = /(something went wrong|error generating|network error|failed to send|message failed|delivery failed|delivery timed out|unable to load conversation)/.test(texts);
 
   return {
     url,

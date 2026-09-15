@@ -342,7 +342,7 @@ const CHATGPT_UI_PROBE_EXPRESSION: &str = r#"(() => {
     /\b(?:log in|login|sign in|authentication required|session expired|please authenticate)\b/.test(text)
   );
   const deliveryText = systemTexts.find((text) =>
-    /\b(?:something went wrong|error generating|network error|failed to send|message failed|unable to load conversation|delivery failed)\b/.test(text)
+    /\b(?:something went wrong|error generating|network error|failed to send|message failed|unable to load conversation|delivery failed|delivery timed out)\b/.test(text)
   ) || null;
   const deliveryRecoverable = !!deliveryText && /\b(?:retry|try again|network|temporary|temporarily)\b/.test(deliveryText);
 
@@ -372,6 +372,22 @@ const CHATGPT_SEND_EXPRESSION: &str = r#"(() => {
   return { ok: true };
 })()"#;
 
+pub(crate) const CHATGPT_CLICK_RETRY_EXPRESSION: &str = r#"(() => {
+  const isVisible = (el) => {
+    if (!el || !(el instanceof Element)) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+  };
+  const buttons = Array.from(document.querySelectorAll('button')).filter((el) =>
+    isVisible(el) && /\b(?:retry|resend|try again)\b/i.test((el.innerText || el.textContent || '').trim())
+  );
+  const target = buttons[buttons.length - 1];
+  if (!target) return { clicked: false };
+  target.click();
+  return { clicked: true };
+})()"#;
+
 pub async fn probe_chatgpt_ui_condition(
     config: &BrowserDriverConfig,
     page: &str,
@@ -389,6 +405,29 @@ pub async fn probe_chatgpt_ui_condition(
         return ChatgptUiCondition::Unknown;
     };
     classify_chatgpt_ui_snapshot(&value)
+}
+
+/// Clicks a visible delivery-error "Retry" button on the live conversation
+/// page. Returns `false` without error when no retry button is present, so the
+/// observe loop keeps polling; only a missing/unsupported driver suppresses
+/// the attempt the same way as the UI probe.
+pub async fn click_chatgpt_retry(config: &BrowserDriverConfig, page: &str) -> bool {
+    if page.trim().is_empty() {
+        return false;
+    }
+    let Ok((kind, _)) = config.detect().await else {
+        return false;
+    };
+    if !kind.supports_chatgpt_dom_probe() {
+        return false;
+    }
+    let Ok(value) = eval_json(config, page, CHATGPT_CLICK_RETRY_EXPRESSION).await else {
+        return false;
+    };
+    value
+        .get("clicked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn classify_chatgpt_ui_snapshot(value: &Value) -> ChatgptUiCondition {

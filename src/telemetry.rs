@@ -38,6 +38,7 @@ pub enum TelemetryEventType {
     Dispatched,
     RateLimited,
     DeliveryError,
+    DeliveryRetryAttempted,
     AuthenticationRequired,
     ProbeUnsupported,
     ProbeUnknown,
