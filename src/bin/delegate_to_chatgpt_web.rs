@@ -5,8 +5,8 @@ use gpt2omo::fresh_dispatch::{
     FreshDispatchClaim, FreshDispatchClaimGuard, FreshDispatchClaims, FreshDispatchDecision,
 };
 use gpt2omo::orca::{
-    close_browser_page, probe_chatgpt_ui_condition, send_chatgpt_prompt, verify_chatgpt_page,
-    BrowserDriverKind, ChatgptRateLimitReason, ChatgptUiCondition, OrcaConfig,
+    click_chatgpt_retry, close_browser_page, probe_chatgpt_ui_condition, send_chatgpt_prompt,
+    verify_chatgpt_page, BrowserDriverKind, ChatgptRateLimitReason, ChatgptUiCondition, OrcaConfig,
 };
 use gpt2omo::telemetry::{
     append_best_effort, TelemetryErrorCode, TelemetryEvent, TelemetryEventInput,
@@ -49,6 +49,9 @@ const READINESS_FRESHNESS_MS: u64 = 240_000;
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const OBSERVE_SCOPE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const UI_PROBE_INTERVAL: Duration = Duration::from_millis(1_500);
+const DELIVERY_RETRY_MAX_ATTEMPTS: u32 = 5;
+const DELIVERY_RETRY_BACKOFF: Duration = Duration::from_secs(45);
+const OBSERVE_HEARTBEAT: Duration = Duration::from_secs(120);
 const DEFAULT_SESSION_TTL_MINUTES: u64 = 120;
 const STALE_BOOTSTRAP_RECOVERY_MS: u64 = 60_000;
 const STALE_BOOTSTRAP_RECOVERY_DETAIL: &str =
@@ -569,9 +572,15 @@ async fn main() -> Result<()> {
 
     emit_dispatched_progress(&cli, bridge_url, &staged, &actual_sent);
 
-    let terminal = wait_for_terminal_states(&mux, &orca, &staged, |index, item, observation| {
-        emit_terminal_progress(&cli, bridge_url, index, item, observation)
-    })
+    let terminal = wait_for_terminal_states(
+        &mux,
+        &orca,
+        &staged,
+        ObserveProgress::from_cli(&cli),
+        |index, item, observation| {
+            emit_terminal_progress(&cli, bridge_url, index, item, observation)
+        },
+    )
     .await;
     drop(scope_locks);
     let sessions = finalize_terminal_sessions(
@@ -2503,6 +2512,7 @@ async fn wait_for_terminal_states<F>(
     mux: &WorkspaceMux,
     orca: &OrcaConfig,
     staged: &[StagedDelegation],
+    mut progress: ObserveProgress,
     mut on_terminal: F,
 ) -> Vec<TerminalObservation>
 where
@@ -2558,6 +2568,23 @@ where
             }
             next_ui_probe[index] = Instant::now() + UI_PROBE_INTERVAL;
             let condition = probe_item_condition(orca, item).await;
+            progress.observe(index, item, &condition);
+            if matches!(
+                &condition,
+                ChatgptUiCondition::DeliveryError { recoverable: true }
+            ) && should_attempt_delivery_retry(&progress.delivery_retry[index], Instant::now())
+            {
+                progress.delivery_retry[index].attempts += 1;
+                progress.delivery_retry[index].last_attempt = Some(Instant::now());
+                let clicked = click_item_retry(orca, item).await;
+                emit_telemetry(
+                    item,
+                    TelemetryEventType::DeliveryRetryAttempted,
+                    None,
+                    TelemetryErrorCode::DeliveryError,
+                );
+                progress.observe_retry(index, item, clicked);
+            }
             match apply_ui_condition(mux, item, condition) {
                 Ok(UiProbeAction::Continue) => {}
                 Ok(UiProbeAction::Disable) => probe_disabled[index] = true,
@@ -2586,6 +2613,7 @@ where
         if observed.iter().all(Option::is_some) {
             break;
         }
+        progress.heartbeat(staged);
         sleep(LIFECYCLE_POLL_INTERVAL).await;
     }
 
@@ -2780,6 +2808,212 @@ async fn probe_item_condition(orca: &OrcaConfig, item: &StagedDelegation) -> Cha
         pool.probe(binding).await
     } else {
         probe_chatgpt_ui_condition(orca, item.browser_page_id.as_deref().unwrap_or_default()).await
+    }
+}
+
+async fn click_item_retry(orca: &OrcaConfig, item: &StagedDelegation) -> bool {
+    if let (Some(pool), Some(binding)) = (item.browser_pool.as_ref(), item.browser_binding.as_ref())
+    {
+        pool.click_retry(binding).await.unwrap_or(false)
+    } else {
+        click_chatgpt_retry(orca, item.browser_page_id.as_deref().unwrap_or_default()).await
+    }
+}
+
+/// Live observe-loop progress reporter: emits human-readable stderr lines on
+/// worker state transitions plus periodic heartbeats so a long review never
+/// looks like a hung CLI, and structured stdout events under `--progress-json`.
+struct ObserveProgress {
+    enabled: bool,
+    json: bool,
+    start: Instant,
+    last_heartbeat: Instant,
+    last_signature: Vec<Option<String>>,
+    delivery_retry: Vec<DeliveryRetryState>,
+}
+
+impl ObserveProgress {
+    fn new(json: bool) -> Self {
+        Self {
+            enabled: true,
+            json,
+            start: Instant::now(),
+            last_heartbeat: Instant::now(),
+            last_signature: Vec::new(),
+            delivery_retry: Vec::new(),
+        }
+    }
+
+    fn from_cli(cli: &Cli) -> Self {
+        Self::new(cli.progress_json)
+    }
+
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            json: false,
+            start: Instant::now(),
+            last_heartbeat: Instant::now(),
+            last_signature: Vec::new(),
+            delivery_retry: Vec::new(),
+        }
+    }
+
+    fn emit(&self, event: serde_json::Value, human: String) {
+        if !self.enabled {
+            return;
+        }
+        if self.json {
+            emit_progress_event(&event);
+        }
+        eprintln!("{human}");
+    }
+
+    fn ensure_slots(&mut self, worker_count: usize) {
+        if self.last_signature.len() < worker_count {
+            self.last_signature.resize(worker_count, None);
+        }
+        if self.delivery_retry.len() < worker_count {
+            self.delivery_retry
+                .resize(worker_count, DeliveryRetryState::default());
+        }
+    }
+
+    fn observe(&mut self, index: usize, item: &StagedDelegation, condition: &ChatgptUiCondition) {
+        if !self.enabled {
+            return;
+        }
+        self.ensure_slots(index + 1);
+        let signature = observe_signature(condition);
+        if self.last_signature[index].as_ref() == Some(&signature) {
+            return;
+        }
+        let elapsed = self.start.elapsed();
+        self.last_signature[index] = Some(signature.clone());
+        let worker = index + 1;
+        self.emit(
+            serde_json::json!({
+                "event": "observe",
+                "index": worker,
+                "label": item.label,
+                "scope_id": item.scope_id,
+                "condition": signature,
+                "elapsed_s": elapsed.as_secs(),
+            }),
+            format!(
+                "[observe] #{worker} {}: {} (elapsed {}m{:02}s)",
+                item.label.as_deref().unwrap_or("(unlabeled)"),
+                signature,
+                elapsed.as_secs() / 60,
+                elapsed.as_secs() % 60
+            ),
+        );
+    }
+
+    fn observe_retry(&self, index: usize, item: &StagedDelegation, clicked: bool) {
+        if !self.enabled {
+            return;
+        }
+        let worker = index + 1;
+        let attempt = self.delivery_retry[index].attempts;
+        let elapsed = self.start.elapsed();
+        self.emit(
+            serde_json::json!({
+                "event": "delivery_retry",
+                "index": worker,
+                "label": item.label,
+                "attempt": attempt,
+                "max_attempts": DELIVERY_RETRY_MAX_ATTEMPTS,
+                "clicked": clicked,
+                "elapsed_s": elapsed.as_secs(),
+            }),
+            format!(
+                "[observe] #{worker} {}: delivery error banner; retry button {} (attempt {attempt}/{}; elapsed {}m{:02}s)",
+                item.label.as_deref().unwrap_or("(unlabeled)"),
+                if clicked {
+                    "clicked"
+                } else {
+                    "not found; continuing to poll"
+                },
+                DELIVERY_RETRY_MAX_ATTEMPTS,
+                elapsed.as_secs() / 60,
+                elapsed.as_secs() % 60
+            ),
+        );
+    }
+
+    fn heartbeat(&mut self, staged: &[StagedDelegation]) {
+        if !self.enabled
+            || self.last_heartbeat.elapsed() < OBSERVE_HEARTBEAT
+            || self.last_signature.len() < staged.len()
+        {
+            return;
+        }
+        self.last_heartbeat = Instant::now();
+        let elapsed = self.start.elapsed();
+        let workers: Vec<serde_json::Value> = staged
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                serde_json::json!({
+                    "index": index + 1,
+                    "label": item.label,
+                    "condition": self.last_signature[index]
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                })
+            })
+            .collect();
+        let summary = workers
+            .iter()
+            .map(|worker| {
+                format!(
+                    "#{} {}: {}",
+                    worker["index"], worker["label"], worker["condition"]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        eprintln!(
+            "[observe] still waiting, elapsed {}m{:02}s — {summary}",
+            elapsed.as_secs() / 60,
+            elapsed.as_secs() % 60
+        );
+        if self.json {
+            emit_progress_event(&serde_json::json!({
+                "event": "observe_heartbeat",
+                "elapsed_s": elapsed.as_secs(),
+                "workers": workers,
+            }));
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct DeliveryRetryState {
+    attempts: u32,
+    last_attempt: Option<Instant>,
+}
+
+fn should_attempt_delivery_retry(state: &DeliveryRetryState, now: Instant) -> bool {
+    state.attempts < DELIVERY_RETRY_MAX_ATTEMPTS
+        && state
+            .last_attempt
+            .is_none_or(|last| now.duration_since(last) >= DELIVERY_RETRY_BACKOFF)
+}
+
+fn observe_signature(condition: &ChatgptUiCondition) -> String {
+    match condition {
+        ChatgptUiCondition::Healthy => "healthy; awaiting completion_check".to_string(),
+        ChatgptUiCondition::Generating => "generating".to_string(),
+        ChatgptUiCondition::RateLimited { reason, .. } => format!("rate_limited:{reason:?}"),
+        ChatgptUiCondition::DeliveryError { recoverable } => {
+            format!("delivery_error recoverable={recoverable}")
+        }
+        ChatgptUiCondition::AuthenticationRequired => "authentication_required".to_string(),
+        ChatgptUiCondition::Unsupported => "probe unsupported".to_string(),
+        ChatgptUiCondition::Unknown => "unknown".to_string(),
     }
 }
 
@@ -3738,6 +3972,23 @@ mod tests {
     }
 
     #[test]
+    fn delivery_retry_backoff_caps_attempts_and_respects_spacing() {
+        let mut state = DeliveryRetryState::default();
+        let now = Instant::now();
+        assert!(should_attempt_delivery_retry(&state, now));
+
+        state.attempts = DELIVERY_RETRY_MAX_ATTEMPTS;
+        assert!(!should_attempt_delivery_retry(&state, now));
+
+        state.attempts = DELIVERY_RETRY_MAX_ATTEMPTS - 1;
+        state.last_attempt = Some(now);
+        assert!(!should_attempt_delivery_retry(&state, now));
+
+        state.last_attempt = Some(now - DELIVERY_RETRY_BACKOFF);
+        assert!(should_attempt_delivery_retry(&state, now));
+    }
+
+    #[test]
     fn stale_recovery_control_mode_rejects_new_work_inputs() {
         let cli = Cli::try_parse_from([
             "delegate_to_chatgpt_web",
@@ -4293,7 +4544,9 @@ mod tests {
         assert_eq!(result.data.unwrap()["ready"], true);
 
         let orca = unsupported_probe_config();
-        let terminal = wait_for_terminal_states(&mux, &orca, &staged, |_, _, _| {}).await;
+        let terminal =
+            wait_for_terminal_states(&mux, &orca, &staged, ObserveProgress::disabled(), |_, _, _| {})
+                .await;
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0].state, DelegationTerminalState::Completed);
         assert_eq!(
@@ -4339,7 +4592,9 @@ mod tests {
         );
 
         let orca = unsupported_probe_config();
-        let terminal = wait_for_terminal_states(&mux, &orca, &staged, |_, _, _| {}).await;
+        let terminal =
+            wait_for_terminal_states(&mux, &orca, &staged, ObserveProgress::disabled(), |_, _, _| {})
+                .await;
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0].state, DelegationTerminalState::Blocked);
     }
@@ -4416,6 +4671,7 @@ mod tests {
             &mux,
             &unsupported_probe_config(),
             &staged,
+            ObserveProgress::disabled(),
             |index, item, observation| {
                 notified.push((
                     index,
