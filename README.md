@@ -72,13 +72,23 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                      CHATGPT WEB WORKERS (1 to 3 Max)                       │
 │            - Sole coding agents for their delegated workspaces              │
+│            - Dispatched via Chrome CDP (accounts.json / browser pool)       │
 │            - Optional query_subagent second opinion when configured         │
 └─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │ JSON-RPC MCP Calls
+                                  │ JSON-RPC MCP via Secure MCP Tunnel (TLS)
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│            OUTBOUND SECURE MCP TUNNEL CLIENTS (LaunchAgents)                │
+│  - Long-polls OpenAI control plane over outbound HTTPS (zero inbound ports) │
+│  - Dedicated daemon and profile per account / Platform organization         │
+│  - Automatically injects Authorization: Bearer <token> into loopback MCP    │
+└─────────────────────────────────┬───────────────────────────────────────────┘
+                                  │ Authenticated Loopback HTTP (127.0.0.1:18800/mcp)
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          GPT2OMO DAEMON (Rust)                              │
 │  18 standard sandboxed tools + optional query_subagent                      │
+│  - Mandatory Bearer Token Authentication + Capability Secrets               │
 │  - File I/O / Search / AST / LSP / Verification / Task lifecycle            │
 │  - Daemon-owned CommandManager with bounded streaming output                │
 │  - Capability sandboxing and generation/revision-indexed evidence           │
@@ -90,6 +100,9 @@ Delegating coding tasks to external web-based LLMs presents critical coordinatio
 
 ## Key Features
 
+- **Outbound Secure MCP Tunnel Architecture**: Zero open inbound internet ports. Web workers connect through OpenAI's outbound Secure MCP Tunnel (`tunnel-client`), long-polling the control plane over TLS and eliminating public exposure.
+- **Two-Layer Security Defense**: Mandatory Bearer token authentication at the transport layer (`--token-file`) blocks unauthorized network traffic, while capability-based session sandboxing (`scope_id` + `capability_secret`) confines file mutations and command execution to verified, active worker lifecycles.
+- **Dedicated Multi-Account Tunnel Supervision**: Isolated `tunnel-client` daemons run under `launchd` per account/organization, honoring OpenAI Platform's org-boundary constraints with restricted runtime keys (`Tunnels: Read + Use` only, stored in `0600` secret files).
 - **Zero-Escape Capability Sandboxing**: Built on `cap-std` capability-based security. Filesystem operations are strictly confined to the scoped workspace directory.
 - **Authoritative Readiness Handshake**: Workers must prove operational readiness by successfully calling MCP `task_state(scope_id=...)`. Purely textual "READY" responses are rejected.
 - **Revision-Fresh Terminal Verification**: `COMPLETED` status is granted only when `completion_check.ready=true`, and all verification evidence must match the current workspace revision and lifecycle generation.
@@ -185,37 +198,37 @@ Compiled binaries in `target/release/`:
 
 ### 2. Keep the Daemon Local and Connect Secure MCP Tunnel
 
+Start the bridge locally with mandatory token authentication enabled:
+
 ```bash
-# Local development only (default bind is 127.0.0.1:18800; default mount-root resolves the current git worktree root, then HOME, then .):
-./target/release/gpt2omo
+# Generate a secret token file if not present:
+mkdir -p ~/.omo/bridge
+head -c 32 /dev/urandom | xxd -p > ~/.omo/bridge/token
+chmod 600 ~/.omo/bridge/token
+
+# Run daemon with mandatory Bearer token authentication:
+./target/release/gpt2omo --token-file ~/.omo/bridge/token
 ```
 
 For shared infrastructure, use the [launchd supervision guide](docs/local-bridge-supervision.md)
 and keep the bridge's local authentication enabled. **Never expose the bridge publicly
 without authentication.** Transport Bearer token authentication is mandatory across all
-bridge endpoints. Mutating tools further require a valid `scope_id` plus its matching
-`capability_secret`, so network reachability alone won't authorize writes or commands.
+bridge endpoints (`curl /healthz` returns `401 Unauthorized` without token, `200 OK` with Bearer token).
+Mutating tools further require a valid `scope_id` plus its matching `capability_secret`,
+so network reachability alone won't authorize writes or commands.
 
-Follow the [Secure MCP Tunnel operator runbook](docs/secure-mcp-tunnel.md): create a
-Platform tunnel, issue a **Restricted runtime key with only Tunnels Read + Use
-(never Manage)**, and pin the latest official `tunnel-client` release. Initialize an
-HTTP profile targeting `http://127.0.0.1:18800/mcp`, run doctor, and supervise it with
-[`com.omo.gpt2omo.tunnel`](examples/com.omo.gpt2omo.tunnel.plist). Keep credentials
-in 0600 files outside the repository; never commit API keys or tunnel credentials.
-
-Associate the tunnel with **all target ChatGPT workspaces**, including those used
-by `remote-chrome` and `remote-chrome-2`, then create a developer-mode app with
-**Connection = Tunnel** in each workspace. The client long-polls OpenAI over
-outbound HTTPS; no inbound internet ports or public bridge URL are needed. Verify
-the client admin UI, `/healthz`, `/readyz`, and both accounts' tool round-trips before
-cutover. Scope isolation and capability secrets provide an additional layer of defense.
+Follow the [Secure MCP Tunnel operator runbook](docs/secure-mcp-tunnel.md):
+1. **Outbound Architecture**: The legacy inbound Cloudflare tunnel (`code.checka.cc`) is fully retired (`530 Origin Error`, 0 open inbound ports). Traffic is handled via OpenAI's official outbound `tunnel-client`, which long-polls OpenAI over outbound HTTPS.
+2. **Multi-Account & Multi-Tunnel Isolation**: OpenAI Platform restricts tunnel-workspace associations to workspaces within the same organization. When using multiple accounts across distinct organizations, run dedicated `tunnel-client` daemons:
+   - **Account 1 (`remote-chrome`, CDP port 9353)**: Supervised by `com.omo.gpt2omo.tunnel` (health port `18810`), bound to Account 1's Platform tunnel with restricted key `~/.config/gpt2omo-tunnel/secrets/runtime-api-key` (mode `0600`).
+   - **Account 2 (`account2`, CDP port 9354)**: Supervised by `com.omo.gpt2omo.tunnel-account2` (health port `18811`), bound to Account 2's Platform tunnel with restricted key `~/.config/gpt2omo-tunnel/secrets/runtime-api-key-account2` (mode `0600`).
+   - Both tunnel clients automatically inject `Authorization: Bearer <token>` into local loopback requests to `http://127.0.0.1:18800/mcp`.
+3. **Restricted Runtime Keys**: Each account's API key is granted only `Tunnels: Read + Use` (never `Manage`/admin), preventing administrative misuse. Keys are stored in `0600` files outside git; never commit secrets.
+4. **ChatGPT Web Developer App**: In each account's `chatgpt.com/plugins`, create a developer app named `gpt2omo-tunnel` with **Connection = Tunnel** and **Authentication = No Auth** (since authentication is securely offloaded to the local tunnel client). Both accounts automatically discover all 18 standard sandboxed tools.
 
 Cloudflared remains the documented [authenticated rollback](docs/secure-mcp-tunnel.md#10-rollback); preserve its configuration.
 
-The following helper commands run on the bridge host and therefore use its loopback
-URL; ChatGPT uses the selected Tunnel app. Do not replace `--bridge-url` with a
-`tunnel_id` or an OpenAI-hosted tunnel endpoint. The local relay's `/events` path
-remains local, with its existing control authentication.
+The helper commands run on the bridge host and use its loopback URL (`http://127.0.0.1:18800`); ChatGPT uses the selected Tunnel app. Do not replace `--bridge-url` with a `tunnel_id` or an OpenAI-hosted tunnel endpoint. The local relay's `/events` path remains local with `--token-file` authentication.
 
 ### 3. Dispatch a Web Delegation
 
