@@ -1048,7 +1048,8 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    static SESSION_POOL_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    static SESSION_POOL_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     #[test]
     fn stderr_trim_never_splits_a_multibyte_character() {
@@ -1149,11 +1150,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pool_acquire_and_release_lifecycle() {
-        let _pool_lock = SESSION_POOL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    #[tokio::test]
+    async fn pool_acquire_and_release_lifecycle() {
+        let _pool_lock = SESSION_POOL_TEST_LOCK.lock().await;
         shutdown_lsp_pool();
         assert_eq!(lsp_pool_size(), 0);
 
@@ -1172,9 +1171,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_stores_and_terminates_spawned_session() {
-        let _pool_lock = SESSION_POOL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _pool_lock = SESSION_POOL_TEST_LOCK.lock().await;
         shutdown_lsp_pool();
         let temp_dir = tempfile::tempdir().unwrap();
         let ws_path = dunce::canonicalize(temp_dir.path()).unwrap();
@@ -1216,9 +1213,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_idle_reaping_and_shutdown() {
-        let _pool_lock = SESSION_POOL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _pool_lock = SESSION_POOL_TEST_LOCK.lock().await;
         shutdown_lsp_pool();
         let temp_dir = tempfile::tempdir().unwrap();
         let ws_path = dunce::canonicalize(temp_dir.path()).unwrap();
@@ -1254,9 +1249,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_queue_flooding_idle_session_stays_bounded() {
-        let _pool_lock = SESSION_POOL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _pool_lock = SESSION_POOL_TEST_LOCK.lock().await;
         shutdown_lsp_pool();
         let temp_dir = tempfile::tempdir().unwrap();
         let ws_path = dunce::canonicalize(temp_dir.path()).unwrap();
@@ -1296,9 +1289,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_reap_triggered_via_production_sweep() {
-        let _pool_lock = SESSION_POOL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _pool_lock = SESSION_POOL_TEST_LOCK.lock().await;
         shutdown_lsp_pool();
         let temp_dir = tempfile::tempdir().unwrap();
         let ws_path = dunce::canonicalize(temp_dir.path()).unwrap();
@@ -1339,9 +1330,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_queue_preserves_awaited_responses_under_flood() {
-        let _pool_lock = SESSION_POOL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _pool_lock = SESSION_POOL_TEST_LOCK.lock().await;
         shutdown_lsp_pool();
         let temp_dir = tempfile::tempdir().unwrap();
         let ws_path = dunce::canonicalize(temp_dir.path()).unwrap();
@@ -1371,9 +1360,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_reap_triggered_on_release_session() {
-        let _pool_lock = SESSION_POOL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _pool_lock = SESSION_POOL_TEST_LOCK.lock().await;
         shutdown_lsp_pool();
         let temp_dir = tempfile::tempdir().unwrap();
         let ws_path = dunce::canonicalize(temp_dir.path()).unwrap();
@@ -1413,9 +1400,7 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_idle_lsp_explicit_trigger() {
-        let _pool_lock = SESSION_POOL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _pool_lock = SESSION_POOL_TEST_LOCK.lock().await;
         shutdown_lsp_pool();
         let temp_dir = tempfile::tempdir().unwrap();
         let ws_path = dunce::canonicalize(temp_dir.path()).unwrap();

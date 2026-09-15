@@ -2684,7 +2684,7 @@ mod tests {
                 let mut iter: usize = 0;
                 while is_running.load(Ordering::Relaxed) {
                     iter += 1;
-                    let body = if (index + iter) % 2 == 0 {
+                    let body = if (index + iter).is_multiple_of(2) {
                         serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": iter,
