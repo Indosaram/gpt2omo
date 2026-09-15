@@ -582,6 +582,82 @@ gates, authenticated rollback readiness, cutover result, and reboot/login persis
 check (or an explicit pending maintenance check). No registration, service lifecycle
 operation, or live migration result is implied by a documentation-only change.
 
+## 12. Execution record — 2026-09-15 cutover (completed)
+
+The cutover described above was executed end-to-end on 2026-09-15 KST evening
+(UTC ~15:51Z) and is complete. This section records what actually happened,
+the defects found during execution, and the evidence, so future operators do
+not repeat the failures. Tunnel IDs, tokens, and key material stay out of the
+repository; only the two per-account tunnel clients and their loopback admin
+ports (18810 and 18811) are referenced.
+
+### 12.1 Resulting posture
+
+- Bridge `127.0.0.1:18800` runs token-authenticated (`--token-file`); anonymous
+  requests receive **401**, authorized requests **200**.
+- Both tunnel clients healthy (`/readyz` 200) with the corrected header file.
+- The legacy public route `code.checka.cc` is retired: cloudflared bootout,
+  plist/config preserved for rollback, public URL returns 530.
+- The local continuation relay keeps running on loopback only.
+
+### 12.2 Defects found and fixed during execution
+
+1. **Tunnel injected-token mismatch (pre-existing, third stale value).**
+   `secrets/mcp-auth-header` and `secrets/bridge-curl-config` carried tokens
+   that no longer matched `~/.omo/bridge/token`. Regenerate both from the
+   bridge token file before flipping authentication, then `launchctl kickstart
+   -k` both tunnel agents; `/readyz` 200 alone does **not** prove the injected
+   header is correct.
+2. **Header-file shape.** The profile's `extra_headers.Authorization` is a
+   `file:` reference to the header **value**. The file must contain exactly
+   `Bearer <token>` — writing `Authorization: Bearer …` into it produces a
+   doubled header and the bridge 401s every tunnel call with `auth="present"`.
+   Symptom: bridge log shows `POST /mcp … auth="present" … 401` right after
+   cutover while local curl probes succeed.
+3. **Helper environment pinning.** The desktop launcher injects
+   `OMO_BRIDGE_URL=https://code.checka.cc` into agent sessions, so dispatches
+   hit the retired public URL after retirement (530). `~/.zshenv` now exports
+   `OMO_BRIDGE_URL=http://127.0.0.1:18800` and
+   `OMO_BRIDGE_TOKEN=$(cat "$HOME/.omo/bridge/token")` for fresh shells;
+   long-lived processes (running eval kernels, daemons) keep the stale env and
+   must be invoked with the explicit env prefix. The launcher's own env config
+   should be corrected at the source.
+
+### 12.3 Acceptance evidence
+
+- **Tool round-trips (gate 1):** a tunnel-only acceptance worker executed the
+  full lifecycle with 28/28 tool calls through the tunnel — `task_state`,
+  `read_file`, `run_command`, detached `run_command` + `poll_command`,
+  `git_status_diff`, `list_commands`, `task_plan`, `task_update`, and
+  `completion_check`.
+- **Latency (gate 2):** 148 tunnel `/mcp` responses: median 3 ms, p95 257 ms,
+  max 334 ms against the 60 s connector budget, zero timeouts.
+- **Large output (gate 3):** executed via direct loopback MCP because OpenAI's
+  execution gateway rejects the synthetic generator command from the chat side
+  regardless of transport. Result matched the runbook contract: first page
+  32,768 B with `stdout_truncated`, ring `dropped_before` ≈ 10.2 MB, seven
+  bounded `poll_command` drains to `TUNNEL_LARGE_OUTPUT_DONE`, no timeout or
+  deadlock.
+- **No remote SSE dependency (gate 4):** the relay stayed loopback-only
+  throughout; nothing in the tunnel path consults `/events`.
+- **Post-cutover:** dispatched workers' tool calls arrived with
+  `host="127.0.0.1:18800" … auth="present" … 200` in the bridge log.
+
+### 12.4 Operational notes and residuals
+
+- ChatGPT in-chat **"Always allow"** on a tool prompt grants the plugin's
+  permission account-wide; after one grant the tunnel app shows
+  "Allow all actions" and per-conversation consent stalls disappear.
+- OpenAI's execution gateway intermittently rejects `run_command`/
+  `task_plan`/`completion_check` for synthetic patterns on **both** routes
+  (transport-independent). Workers record this honestly as `BLOCKED`; retry
+  later rather than weakening the workspace instructions.
+- A duplicate `delegate_to_chatgpt_web` dispatch on an owned workspace fails
+  with `DUPLICATE_ACTIVE_DISPATCH`; close the stale scope with `--close-scope`
+  instead of force-restarting anything.
+- The relay launchd log grows unbounded (320 MB after the day's fleet work);
+  add rotation at the next maintenance window.
+
 ## Official references
 
 Recheck these sources and the chosen binary's help before each operator upgrade;
