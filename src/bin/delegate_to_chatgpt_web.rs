@@ -2394,11 +2394,12 @@ async fn wait_for_all_ready(
                     let condition = probe_item_condition(orca, item).await;
                     let action = apply_ui_condition(mux, item, condition);
                     let authoritative_terminal = matches!(action, Ok(UiProbeAction::Terminal(_)));
-                    emit_telemetry(
+                    emit_telemetry_with_detail(
                         item,
                         TelemetryEventType::ReadinessBootstrapFailed,
                         None,
                         TelemetryErrorCode::BootstrapFailed,
+                        Some(&format!("{error:#}")),
                     );
                     failures.push(format!(
                         "worker {}: {}; retry observation left scope {}",
@@ -2482,25 +2483,44 @@ async fn dispatch_actual_tasks(
             let workspace = mux.resolve(&item.scope_id)?;
             record_actual_dispatch_evidence(&workspace, &item.scope_id, item.generation)
                 .map_err(anyhow::Error::msg)?;
-            send_item_prompt(orca, item, prompt).await
+            let mut last_error = None;
+            for attempt in 0..ACTUAL_DISPATCH_SEND_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        ACTUAL_DISPATCH_RETRY_DELAY_MS,
+                    ))
+                    .await;
+                }
+                match send_item_prompt(orca, item, prompt).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => last_error = Some(format!("{error:#}")),
+                }
+            }
+            Err(anyhow!(
+                last_error.unwrap_or_else(|| "prompt send failed".to_string())
+            ))
         });
     let results = join_all(futures).await;
     let mut sent = vec![false; staged.len()];
     for (index, result) in results.into_iter().enumerate() {
         match result {
             Ok(()) => sent[index] = true,
-            Err(_) => {
+            Err(error) => {
                 let item = &staged[index];
+                let send_error = format!("{error:#}");
                 let condition = probe_item_condition(orca, item).await;
                 let _ = apply_ui_condition(mux, item, condition);
-                let detail =
-                    structured_terminal_detail(StructuredTerminalCode::ActualDispatchFailed);
+                let detail = structured_terminal_detail_with_error(
+                    StructuredTerminalCode::ActualDispatchFailed,
+                    Some(&send_error),
+                );
                 let _ = record_helper_terminal(mux, item, DelegationTerminalState::Failed, &detail);
-                emit_telemetry(
+                emit_telemetry_with_detail(
                     item,
                     TelemetryEventType::DispatchFailed,
                     None,
                     TelemetryErrorCode::DispatchFailed,
+                    Some(&send_error),
                 );
             }
         }
@@ -2748,6 +2768,20 @@ fn structured_terminal_detail(code: StructuredTerminalCode) -> String {
     serde_json::json!({ "code": code.as_str() }).to_string()
 }
 
+fn structured_terminal_detail_with_error(
+    code: StructuredTerminalCode,
+    error: Option<&str>,
+) -> String {
+    match error {
+        Some(error) => serde_json::json!({ "code": code.as_str(), "send_error": error })
+            .to_string(),
+        None => structured_terminal_detail(code),
+    }
+}
+
+const ACTUAL_DISPATCH_SEND_ATTEMPTS: usize = 3;
+const ACTUAL_DISPATCH_RETRY_DELAY_MS: u64 = 1_500;
+
 fn rate_limit_terminal_detail(
     reason: ChatgptRateLimitReason,
     reset_after_seconds: Option<u64>,
@@ -2766,6 +2800,16 @@ fn emit_telemetry(
     reset_after_seconds: Option<u64>,
     error_code: TelemetryErrorCode,
 ) {
+    emit_telemetry_with_detail(item, event_type, reset_after_seconds, error_code, None);
+}
+
+fn emit_telemetry_with_detail(
+    item: &StagedDelegation,
+    event_type: TelemetryEventType,
+    reset_after_seconds: Option<u64>,
+    error_code: TelemetryErrorCode,
+    error_detail: Option<&str>,
+) {
     if let Some(event) = TelemetryEvent::from_input(TelemetryEventInput {
         scope_id: &item.scope_id,
         generation: item.generation,
@@ -2779,6 +2823,7 @@ fn emit_telemetry(
         event_type,
         reset_after_seconds,
         error_code,
+        error_detail,
     }) {
         let _ = append_best_effort(&event);
     }

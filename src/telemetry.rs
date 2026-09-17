@@ -78,6 +78,8 @@ pub struct TelemetryEvent {
     event_type: TelemetryEventType,
     reset_after_seconds: Option<u64>,
     error_code: TelemetryErrorCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_detail: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,6 +92,7 @@ pub struct TelemetryEventInput<'a> {
     pub event_type: TelemetryEventType,
     pub reset_after_seconds: Option<u64>,
     pub error_code: TelemetryErrorCode,
+    pub error_detail: Option<&'a str>,
 }
 
 impl TelemetryEvent {
@@ -111,6 +114,7 @@ impl TelemetryEvent {
             event_type,
             reset_after_seconds,
             error_code,
+            error_detail: None,
         })
     }
 
@@ -133,6 +137,10 @@ impl TelemetryEvent {
                 .reset_after_seconds
                 .and_then(validate_reset_after_seconds),
             error_code: input.error_code,
+            error_detail: input
+                .error_detail
+                .filter(|detail| !detail.is_empty())
+                .map(str::to_string),
         })
     }
 }
@@ -587,6 +595,7 @@ mod tests {
             event_type: TelemetryEventType::Dispatched,
             reset_after_seconds: None,
             error_code: TelemetryErrorCode::Dispatched,
+            error_detail: None,
         })
         .unwrap();
         let value = serde_json::to_value(event).unwrap();
