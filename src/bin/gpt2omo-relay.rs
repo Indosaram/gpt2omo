@@ -6,7 +6,9 @@ use gpt2omo::orca::{
     BrowserDriverKind, OrcaConfig,
 };
 use gpt2omo::server::sanitize_continuation_prompt;
-use gpt2omo::web_session::{cleanup_expired_retained_sessions, recover_dead_browser_scopes};
+use gpt2omo::web_session::{
+    cleanup_expired_retained_sessions, reconcile_delegation_ledger, recover_dead_browser_scopes,
+};
 use gpt2omo::{
     default_bridge_base_dir, default_scope_dir, BrowserInstanceConfig, BrowserPool,
     LegacyAccountConfig, WorkspaceMux,
@@ -243,6 +245,29 @@ fn spawn_session_janitor(
 }
 
 async fn run_session_gc(mux: &WorkspaceMux, browsers: &BrowserPool, ttl_ms: u64) {
+    match reconcile_delegation_ledger(mux, epoch_ms()) {
+        Ok(report) => {
+            for scope_id in &report.terminalized_lifecycle {
+                info!(
+                    scope_id = %scope_id,
+                    "reconciled orphaned delegation lifecycle entry to terminal"
+                );
+            }
+            for scope_id in &report.cleared_pending_continuations {
+                info!(
+                    scope_id = %scope_id,
+                    "cleared stale pending continuation for terminal scope"
+                );
+            }
+            for scope_id in &report.removed_stale_scopes {
+                info!(
+                    scope_id = %scope_id,
+                    "removed stale unresolvable scope metadata"
+                );
+            }
+        }
+        Err(error) => warn!(error = %error, "delegation ledger reconciliation failed"),
+    }
     if let Ok(dead) = recover_dead_browser_scopes(mux, browsers).await {
         for scope_id in dead {
             info!(scope_id = %scope_id, "reaped dead active scope whose browser tab was closed");
@@ -251,7 +276,14 @@ async fn run_session_gc(mux: &WorkspaceMux, browsers: &BrowserPool, ttl_ms: u64)
     match cleanup_expired_retained_sessions(mux, browsers, epoch_ms(), ttl_ms, None).await {
         Ok(cleaned) => {
             for session in cleaned {
-                if let Some(error) = session.close_error {
+                if session.scope_removed {
+                    info!(
+                        scope_id = %session.scope_id,
+                        account_id = ?session.account_id,
+                        close_error = ?session.close_error,
+                        "removed expired retained scope after definitive close failure or workspace loss"
+                    );
+                } else if let Some(error) = session.close_error {
                     warn!(
                         scope_id = %session.scope_id,
                         account_id = ?session.account_id,

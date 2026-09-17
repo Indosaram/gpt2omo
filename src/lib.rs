@@ -43,7 +43,9 @@ pub use security::{
     WorkspaceScope, WorkspaceScopeLock,
 };
 pub use server::{create_router, AppState};
-pub use web_session::{cleanup_expired_retained_sessions, recover_dead_browser_scopes};
+pub use web_session::{
+    cleanup_expired_retained_sessions, reconcile_delegation_ledger, recover_dead_browser_scopes,
+};
 
 /// Security-critical settings that a dotenv file in the current working
 /// directory must never be able to supply: the daemon may be started inside an
