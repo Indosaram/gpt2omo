@@ -314,6 +314,20 @@ mod tests {
 
     #[test]
     fn loads_token_from_file_when_token_is_none() {
+        // The runner's environment may carry a real OMO_BRIDGE_TOKEN (launchd
+        // export); isolate it so the file-fallback behavior is actually tested.
+        struct EnvRestore(Option<String>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("OMO_BRIDGE_TOKEN", value),
+                    None => std::env::remove_var("OMO_BRIDGE_TOKEN"),
+                }
+            }
+        }
+        let _env_guard = EnvRestore(std::env::var("OMO_BRIDGE_TOKEN").ok());
+        std::env::remove_var("OMO_BRIDGE_TOKEN");
+
         let temp_dir = tempfile::tempdir().unwrap();
         let token_path = temp_dir.path().join("token.txt");
         std::fs::write(&token_path, "  secret-token-123 \n\n").unwrap();
